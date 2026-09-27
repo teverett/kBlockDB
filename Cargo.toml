@@ -1,0 +1,16 @@
+[package]
+name = "kdb"
+version = "0.1.0"
+edition = "2021"
+
+# Zero external dependencies on purpose: the whole point of this prototype is a
+# compact, hand-rolled binary chunk format. `cargo build --release` (or plain
+# `rustc`) needs nothing from crates.io.
+
+[[bin]]
+name = "kdb"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = 3
+lto = true
