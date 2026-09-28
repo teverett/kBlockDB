@@ -1,5 +1,7 @@
 mod chunk;
+mod coord;
 mod logger;
+mod params;
 mod schema;
 mod value;
 mod world;
@@ -8,7 +10,7 @@ use std::io;
 use std::path::Path;
 use std::time::Instant;
 use value::Value;
-use world::World;
+use world::{Coord, World};
 
 fn main() -> io::Result<()> {
     let result = run();
@@ -16,6 +18,30 @@ fn main() -> io::Result<()> {
         logger::error(format!("fatal: {e}"));
     }
     result
+}
+
+/// A distinct, large, odd-ish multiplier per axis, so scattering an index
+/// `i` through every axis (`i.wrapping_mul(axis_multiplier(a)) %
+/// world_dim`) spreads points across the whole volume instead of
+/// clustering, no matter how many axes the world has.
+fn axis_multiplier(axis: usize) -> u32 {
+    const HAND_PICKED: [u32; 8] = [
+        4_001, 7_919, 104_729, 15_485_863, 32_452_843, 49_979_687, 67_867_967, 86_028_121,
+    ];
+    HAND_PICKED
+        .get(axis)
+        .copied()
+        .unwrap_or_else(|| 1_000_003u32.wrapping_mul(axis as u32 + 1) | 1)
+}
+
+/// `base^axes` as a string: an exact integer when it fits in a `u128`,
+/// scientific notation otherwise (`world_dim^axes` overflows a `u128` well
+/// before `axes` gets exotic -- e.g. 10,000^10 already doesn't fit).
+fn pow_axes_display(base: u32, axes: usize) -> String {
+    match (base as u128).checked_pow(axes as u32) {
+        Some(n) => n.to_string(),
+        None => format!("{:.3e}", f64::from(base).powi(axes as i32)),
+    }
 }
 
 fn run() -> io::Result<()> {
@@ -28,43 +54,48 @@ fn run() -> io::Result<()> {
         logger::LOG_FILE_NAME
     ));
 
-    let total_cells = (world::WORLD_DIM as u128).pow(3);
-    let total_chunks = (world::CHUNKS_PER_AXIS as u128).pow(3);
+    // World::create both initializes a brand-new world (first run against
+    // this data dir) and validates an existing one (every later run): if
+    // `root/world.txt` already holds different axes/world_dim, this fails
+    // loudly instead of silently reinterpreting whatever's on disk.
+    let mut w = World::create(&root, world::AXES, world::WORLD_DIM)?;
+    let axes = w.axes();
+    let world_dim = w.world_dim();
 
     println!("kdb prototype -- chunked columnar key/value cell storage\n");
     println!(
-        "world:  {0}x{0}x{0} cells  ({1} cells total)",
-        world::WORLD_DIM,
-        total_cells
+        "world:  {0}^{1} cells  ({2} cells total)",
+        world_dim,
+        axes,
+        pow_axes_display(world_dim, axes)
     );
     println!(
-        "chunk:  {0}x{0}x{0} cells  ({1} cells/chunk)",
+        "chunk:  {0}^{1} cells  ({2} cells/chunk)",
         chunk::CHUNK_DIM,
-        chunk::CHUNK_CELLS
+        axes,
+        chunk::chunk_cells(axes)
     );
     println!(
-        "grid:   {0}x{0}x{0} chunks ({1} chunks total, if every one were populated)",
-        world::CHUNKS_PER_AXIS,
-        total_chunks
+        "grid:   {0}^{1} chunks ({2} chunks total, if every one were populated)",
+        w.chunks_per_axis(),
+        axes,
+        pow_axes_display(w.chunks_per_axis(), axes)
     );
     println!("data dir: {root}\n");
 
-    let mut w = World::open(&root)?;
-
     // --- write a scattered set of cells, the way a sparse simulation would ---
-    // Large odd multipliers spread these across the whole 10,000^3 volume
-    // instead of clustering in one corner / one chunk.
+    // A distinct large multiplier per axis (see axis_multiplier) spreads
+    // these across the whole world_dim^axes volume instead of clustering in
+    // one corner / one chunk.
     let t0 = Instant::now();
     let n = 5_000u32;
     for i in 0..n {
-        let x = (i.wrapping_mul(4_001)) % world::WORLD_DIM;
-        let y = (i.wrapping_mul(7_919)) % world::WORLD_DIM;
-        let z = (i.wrapping_mul(104_729)) % world::WORLD_DIM;
+        let coord: Coord = (0..axes)
+            .map(|a| i.wrapping_mul(axis_multiplier(a)) % world_dim)
+            .collect();
 
         w.set(
-            x,
-            y,
-            z,
+            &coord,
             "material",
             Value::Str(if i % 3 == 0 {
                 "stone".into()
@@ -73,19 +104,17 @@ fn run() -> io::Result<()> {
             }),
         )?;
         w.set(
-            x,
-            y,
-            z,
+            &coord,
             "temperature",
             Value::F64(15.0 + f64::from(i) * 0.01),
         )?;
-        w.set(x, y, z, "density", Value::F64(2.6))?;
+        w.set(&coord, "density", Value::F64(2.6))?;
 
         if i % 50 == 0 {
             // A rare, cell-specific key. Because columns are created lazily
             // per chunk, this doesn't cost anything in chunks that never see
             // a "label" key.
-            w.set(x, y, z, "label", Value::Str(format!("poi-{i}")))?;
+            w.set(&coord, "label", Value::Str(format!("poi-{i}")))?;
         }
     }
     w.flush()?;
@@ -104,25 +133,22 @@ fn run() -> io::Result<()> {
     ));
 
     // A couple of hand-picked cells to demonstrate reads, including a miss.
-    let (x0, y0, z0) = (0, 0, 0);
-    w.set(x0, y0, z0, "material", Value::Str("bedrock".into()))?;
-    w.set(x0, y0, z0, "hardness", Value::I64(10))?;
+    let origin: Coord = Coord::zeros(axes);
+    w.set(&origin, "material", Value::Str("bedrock".into()))?;
+    w.set(&origin, "hardness", Value::I64(10))?;
     w.flush()?;
 
-    let (x1, y1, z1) = (
-        4_001 % world::WORLD_DIM,
-        7_919 % world::WORLD_DIM,
-        104_729 % world::WORLD_DIM,
-    );
+    // The i=1 case of the scatter loop above.
+    let sample: Coord = (0..axes).map(|a| axis_multiplier(a) % world_dim).collect();
 
     // Demonstrate removal: this cell had a "temperature" key set in the loop
     // above; clear it so the sample read below shows it as <not set>.
-    w.remove(x1, y1, z1, "temperature")?;
+    w.remove(&sample, "temperature")?;
     w.flush()?;
 
     println!("\nsample reads:");
-    for &(x, y, z) in &[(x0, y0, z0), (x1, y1, z1)] {
-        println!("  cell ({x}, {y}, {z}):");
+    for coord in [&origin, &sample] {
+        println!("  cell {coord:?}:");
         for key in [
             "material",
             "temperature",
@@ -131,7 +157,7 @@ fn run() -> io::Result<()> {
             "label",
             "nonexistent_key",
         ] {
-            match w.get(x, y, z, key)? {
+            match w.get(coord, key)? {
                 Some(v) => println!("    {key:<16} = {v:?}"),
                 None => println!("    {key:<16} = <not set>"),
             }
@@ -139,17 +165,17 @@ fn run() -> io::Result<()> {
     }
 
     // --- demonstrate region operations, spanning a chunk boundary ---
-    // Starts 3 cells before a chunk boundary and runs 8 cells wide, so this
-    // box covers the tail of one chunk and the head of the next on every
-    // axis -- get/set/remove_region resolve each cell through the same
-    // chunk/local-index split as the single-cell ops above, so there's
-    // nothing extra to do at the seam.
+    // Starts 3 cells before a chunk boundary and runs 8 cells wide on every
+    // axis, so this box covers the tail of one chunk and the head of the
+    // next on every axis -- get/set/remove_region resolve each cell through
+    // the same chunk/local-index split as the single-cell ops above, so
+    // there's nothing extra to do at the seam.
     // set_region takes one value per cell (not a single fill value), so a
-    // vein can vary cell-to-cell in one call: every 4th cell along x is
-    // "ore", the rest are "stone".
+    // vein can vary cell-to-cell in one call: every 4th cell is "ore", the
+    // rest are "stone".
     let r = chunk::CHUNK_DIM - 3;
     let d = 8;
-    let region = world::Region::new(r, r, r, d, d, d);
+    let region = world::Region::new(vec![r; axes], vec![d; axes]);
     let vein_values: Vec<Value> = (0..region.volume())
         .map(|i| {
             if i % 4 == 0 {
@@ -159,21 +185,21 @@ fn run() -> io::Result<()> {
             }
         })
         .collect();
-    w.set_region(region, "material", &vein_values)?;
-    let vein = w.get_region(region, "material")?;
+    w.set_region(&region, "material", &vein_values)?;
+    let vein = w.get_region(&region, "material")?;
     let ore_cells = vein
         .iter()
         .filter(|v| **v == Some(Value::Str("ore".into())))
         .count();
-    w.remove_region(region, "material")?;
-    let after_removal = w.get_region(region, "material")?;
+    w.remove_region(&region, "material")?;
+    let after_removal = w.get_region(&region, "material")?;
     let remaining = after_removal.iter().filter(|v| v.is_some()).count();
     w.flush()?;
 
     println!(
-        "\nregion ops: filled an {d}x{d}x{d} \"ore\" vein straddling a chunk boundary \
-         at ({r}, {r}, {r}) -- {ore_cells}/{} cells set, {remaining}/{} left after \
-         remove_region",
+        "\nregion ops: filled a {d}^{axes} \"ore\" vein straddling a chunk boundary at \
+         {:?} -- {ore_cells}/{} cells set, {remaining}/{} left after remove_region",
+        region.origin,
         region.volume(),
         region.volume()
     );
@@ -197,6 +223,20 @@ fn run() -> io::Result<()> {
     println!(
         "\nre-run this binary again (same data dir) and it will load the existing \
          chunks/schema instead of starting empty."
+    );
+
+    // Drop this handle and reopen with World::open (not create): world.txt
+    // is what makes that safe -- open reads the world's real shape back
+    // from disk rather than assuming any default, so it's guaranteed to
+    // match what create wrote above even if world::AXES/WORLD_DIM change
+    // in a future build of this binary.
+    drop(w);
+    let w = World::open(&root)?;
+    println!(
+        "reopened via World::open: axes={}, world_dim={} (read back from world.txt, \
+         not recompiled in)",
+        w.axes(),
+        w.world_dim()
     );
 
     logger::info("kdb finished successfully");

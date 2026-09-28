@@ -35,9 +35,20 @@ access and `rustc` alone could compile it if you inlined the modules.
   process addressing a trillion-cell world only ever holds tens of MB in
   RAM.
 
-- **Directory nesting.** Chunk files live at `<root>/<cx>/<cy>/<cz>.chunk`,
-  which keeps any one directory to at most 313 entries no matter how large
-  the world gets.
+- **Directory nesting.** Chunk files live at `<root>/<c0>/<c1>/.../<cn>.chunk`
+  (one path segment per axis), which keeps any one directory to at most
+  `chunks_per_axis()` entries no matter how large the world gets.
+
+- **Axis count and per-axis size are a world property, not a build-time
+  constant.** A world can have any number of axes (2D, 3D, 4D, ...) and any
+  `world_dim`; both are chosen once, when the world is created
+  (`World::create(root, axes, world_dim)`), and persisted to `world.txt` at
+  the world root. `World::open` reads them back from that file rather than
+  assuming a default, and a later `World::create` against the same
+  directory must pass matching numbers or it fails with `InvalidInput`
+  *without touching anything* -- a world's shape can't silently change out
+  from under data already written for it. `world::AXES`/`world::WORLD_DIM`
+  are only the defaults `main`'s demo happens to call `create` with.
 
 ## A real trade-off this prototype makes visible
 
@@ -78,12 +89,23 @@ cargo test               # unit tests for the chunk binary format and World
 ## Layout
 
 - `src/value.rs`  -- the `Value` enum (Str/F64/I64) and its type tags.
+- `src/coord.rs`  -- `Coord`, a small-vec-style `u32` sequence (inline up
+  to 8 axes, heap beyond that) used for coordinates and chunk keys. A
+  world's axis count is a runtime value (see `params.rs`), so a coordinate
+  can't be a fixed-size array the way a single-world-shape version of this
+  prototype could use -- `Coord` avoids a `Vec<u32>`-per-coordinate heap
+  allocation for the common case (a handful of axes) without adding a
+  `smallvec` dependency.
+- `src/params.rs` -- `WorldParams` (axes, world_dim), read/written as
+  `world.txt` at the world root.
 - `src/schema.rs` -- global key-string <-> id registry (`schema.txt`).
 - `src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
-  serialization, unit tests.
-- `src/world.rs`  -- coordinate -> chunk mapping, chunk file paths, the
-  bounded LRU-ish cache, `get`/`set`/`remove`/`flush`, and their
-  `*_region` counterparts for arbitrary axis-aligned boxes of cells
-  (`Region`) that may span or partially cover any number of chunks.
+  serialization, unit tests. Its cell count (`chunk_cells(axes)`) is
+  computed at runtime from the owning world's axis count.
+- `src/world.rs`  -- `World::create`/`open`, coordinate -> chunk mapping,
+  chunk file paths, the bounded LRU-ish cache, `get`/`set`/`remove`/
+  `flush`, and their `*_region` counterparts for arbitrary axis-aligned
+  boxes of cells (`Region`) that may span or partially cover any number of
+  chunks.
 - `src/logger.rs` -- minimal dependency-free logger, appends to `kdb.log`.
 - `src/main.rs`   -- demo/benchmark driver.

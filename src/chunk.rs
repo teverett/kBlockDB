@@ -2,22 +2,35 @@ use crate::value::Value;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-/// Cells per axis within one chunk. 32^3 = 32,768 cells/chunk.
+/// Cells per axis within one chunk. With the default 3 axes, that's
+/// 32^3 = 32,768 cells/chunk. The *number* of axes is a per-world runtime
+/// parameter (see `world::WorldParams`/`World::create`), so a chunk's total
+/// cell count -- `chunk_cells(axes)` -- is a runtime value too, not a
+/// compile-time constant.
 pub const CHUNK_DIM: u32 = 32;
-pub const CHUNK_CELLS: usize = (CHUNK_DIM * CHUNK_DIM * CHUNK_DIM) as usize;
-const PRESENCE_BYTES: usize = CHUNK_CELLS / 8; // 4096 bytes = one bit per cell
 
-/// A fixed-size bitmap: one bit per cell in the chunk, marking whether that
-/// cell has a value in a given column.
+/// Cells in one chunk, for a world with `axes` axes: `CHUNK_DIM^axes`.
+pub fn chunk_cells(axes: usize) -> usize {
+    (CHUNK_DIM as usize).pow(axes as u32)
+}
+
+/// A bitmap, one bit per cell in the chunk, marking whether that cell has a
+/// value in a given column. Sized at construction from the owning world's
+/// `chunk_cells(axes)` -- `axes` isn't known until a `World` is opened, so
+/// this can't be a fixed-size array the way a single-world-shape version of
+/// this prototype could use.
 #[derive(Clone)]
 struct Bitset {
-    bits: Box<[u8; PRESENCE_BYTES]>,
+    bits: Vec<u8>,
 }
 
 impl Bitset {
-    fn new() -> Self {
+    /// `byte_len` must be `cell_count / 8` for whatever `cell_count` this
+    /// bitmap is meant to cover (always a whole number for `CHUNK_DIM`'s
+    /// power-of-two cell counts).
+    fn new(byte_len: usize) -> Self {
         Bitset {
-            bits: Box::new([0u8; PRESENCE_BYTES]),
+            bits: vec![0u8; byte_len],
         }
     }
 
@@ -68,19 +81,27 @@ struct Column {
     data: ColumnData,
 }
 
-/// A CHUNK_DIM^3 block of cells, stored columnarly: one sparse array per key
-/// that actually appears *somewhere in this chunk*, rather than one hashmap
-/// per cell. Columns are created lazily on first write, so a chunk that only
-/// ever sees 2 distinct keys allocates exactly 2 columns, no matter how many
-/// keys exist elsewhere in the world.
+/// A `chunk_cells(axes)`-cell block of cells, stored columnarly: one sparse
+/// array per key that actually appears *somewhere in this chunk*, rather
+/// than one hashmap per cell. Columns are created lazily on first write, so
+/// a chunk that only ever sees 2 distinct keys allocates exactly 2 columns,
+/// no matter how many keys exist elsewhere in the world.
+///
+/// `Chunk` itself doesn't know the world's coordinate system -- `local_idx`
+/// is an opaque flat cell index within `[0, chunk_cells(axes))`;
+/// `World::split` is what maps a coordinate to one. It does need to know
+/// `axes` indirectly, though: `presence_bytes` (`chunk_cells(axes) / 8`) is
+/// how big a newly-created column's presence bitmap must be.
 pub struct Chunk {
     columns: HashMap<u32, Column>,
+    presence_bytes: usize,
 }
 
 impl Chunk {
-    pub fn new() -> Self {
+    pub fn new(cell_count: usize) -> Self {
         Chunk {
             columns: HashMap::new(),
+            presence_bytes: cell_count / 8,
         }
     }
 
@@ -98,8 +119,9 @@ impl Chunk {
     }
 
     pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value) {
+        let presence_bytes = self.presence_bytes;
         let col = self.columns.entry(key_id).or_insert_with(|| Column {
-            presence: Bitset::new(),
+            presence: Bitset::new(presence_bytes),
             data: match &value {
                 Value::F64(_) => ColumnData::F64(Vec::new()),
                 Value::I64(_) => ColumnData::I64(Vec::new()),
@@ -187,21 +209,21 @@ impl Chunk {
             match &col.data {
                 ColumnData::F64(v) => {
                     w.write_all(&[Value::TAG_F64])?;
-                    w.write_all(&*col.presence.bits)?;
+                    w.write_all(&col.presence.bits)?;
                     for x in v {
                         w.write_all(&x.to_le_bytes())?;
                     }
                 }
                 ColumnData::I64(v) => {
                     w.write_all(&[Value::TAG_I64])?;
-                    w.write_all(&*col.presence.bits)?;
+                    w.write_all(&col.presence.bits)?;
                     for x in v {
                         w.write_all(&x.to_le_bytes())?;
                     }
                 }
                 ColumnData::Str(v) => {
                     w.write_all(&[Value::TAG_STR])?;
-                    w.write_all(&*col.presence.bits)?;
+                    w.write_all(&col.presence.bits)?;
                     for s in v {
                         let bytes = s.as_bytes();
                         w.write_all(&(bytes.len() as u32).to_le_bytes())?;
@@ -213,7 +235,11 @@ impl Chunk {
         Ok(())
     }
 
-    pub fn read_from<R: Read>(r: &mut R) -> io::Result<Self> {
+    /// `cell_count` must be the owning world's `chunk_cells(axes)` -- the
+    /// caller (`World`) knows this from its own `axes`, persisted in
+    /// `world.txt`, so it isn't stored redundantly in every chunk file.
+    pub fn read_from<R: Read>(r: &mut R, cell_count: usize) -> io::Result<Self> {
+        let presence_bytes = cell_count / 8;
         let num_columns = read_u32(r)?;
         let mut columns = HashMap::with_capacity(num_columns as usize);
 
@@ -223,8 +249,8 @@ impl Chunk {
             let mut tag = [0u8; 1];
             r.read_exact(&mut tag)?;
 
-            let mut bits = Box::new([0u8; PRESENCE_BYTES]);
-            r.read_exact(&mut *bits)?;
+            let mut bits = vec![0u8; presence_bytes];
+            r.read_exact(&mut bits)?;
             let presence = Bitset { bits };
             let count = presence.count();
 
@@ -267,7 +293,10 @@ impl Chunk {
             columns.insert(key_id, Column { presence, data });
         }
 
-        Ok(Chunk { columns })
+        Ok(Chunk {
+            columns,
+            presence_bytes,
+        })
     }
 
     /// Exact on-disk size in bytes, for reporting/benchmarking.
@@ -275,7 +304,7 @@ impl Chunk {
     pub fn byte_len(&self) -> usize {
         let mut n = 4;
         for col in self.columns.values() {
-            n += 4 + 1 + PRESENCE_BYTES;
+            n += 4 + 1 + self.presence_bytes;
             n += match &col.data {
                 ColumnData::F64(v) => v.len() * 8,
                 ColumnData::I64(v) => v.len() * 8,
@@ -306,9 +335,13 @@ fn read_arr8<R: Read>(r: &mut R) -> io::Result<[u8; 8]> {
 mod tests {
     use super::*;
 
+    /// A default-shaped chunk's cell count (3 axes, `CHUNK_DIM = 32`): the
+    /// tests below use cell indices that only need to fit within this.
+    const CELLS: usize = 32 * 32 * 32;
+
     #[test]
     fn roundtrip_and_sparsity() {
-        let mut c = Chunk::new();
+        let mut c = Chunk::new(CELLS);
         assert!(c.is_empty());
 
         c.set(0, 10, Value::Str("stone".into()));
@@ -328,7 +361,7 @@ mod tests {
         c.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), c.byte_len());
 
-        let c2 = Chunk::read_from(&mut &buf[..]).unwrap();
+        let c2 = Chunk::read_from(&mut &buf[..], CELLS).unwrap();
         assert_eq!(c2.get(0, 10), Some(Value::Str("stone".into())));
         assert_eq!(c2.get(5, 10), Some(Value::Str("air".into())));
         assert_eq!(c2.get(0, 11), Some(Value::F64(3.5)));
@@ -337,7 +370,7 @@ mod tests {
 
     #[test]
     fn overwrite_and_remove() {
-        let mut c = Chunk::new();
+        let mut c = Chunk::new(CELLS);
         c.set(100, 1, Value::I64(1));
         c.set(100, 1, Value::I64(2)); // overwrite same cell/key
         assert_eq!(c.get(100, 1), Some(Value::I64(2)));
@@ -345,5 +378,19 @@ mod tests {
         c.remove(100, 1);
         assert_eq!(c.get(100, 1), None);
         assert!(c.is_empty());
+    }
+
+    #[test]
+    fn different_axis_counts_get_different_sized_chunks() {
+        // 2 axes: 32^2 = 1024 cells/chunk, a much smaller presence bitmap
+        // than the 3-axis default.
+        let mut c = Chunk::new(chunk_cells(2));
+        c.set(0, 0, Value::I64(1));
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), c.byte_len());
+
+        let c2 = Chunk::read_from(&mut &buf[..], chunk_cells(2)).unwrap();
+        assert_eq!(c2.get(0, 0), Some(Value::I64(1)));
     }
 }
