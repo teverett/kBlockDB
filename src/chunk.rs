@@ -271,6 +271,7 @@ impl Chunk {
     }
 
     /// Exact on-disk size in bytes, for reporting/benchmarking.
+    #[cfg(test)]
     pub fn byte_len(&self) -> usize {
         let mut n = 4;
         for col in self.columns.values() {

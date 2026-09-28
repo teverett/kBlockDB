@@ -75,6 +75,11 @@ fn main() -> io::Result<()> {
         104_729 % world::WORLD_DIM,
     );
 
+    // Demonstrate removal: this cell had a "temperature" key set in the loop
+    // above; clear it so the sample read below shows it as <not set>.
+    w.remove(x1, y1, z1, "temperature")?;
+    w.flush()?;
+
     println!("\nsample reads:");
     for &(x, y, z) in &[(x0, y0, z0), (x1, y1, z1)] {
         println!("  cell ({x}, {y}, {z}):");

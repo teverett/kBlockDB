@@ -174,10 +174,6 @@ impl World {
         self.dirty.insert(ckey);
         Ok(())
     }
-
-    pub fn cached_chunk_count(&self) -> usize {
-        self.cache.len()
-    }
 }
 
 impl Drop for World {
@@ -185,5 +181,198 @@ impl Drop for World {
         // Best-effort: make sure a `World` that goes out of scope without an
         // explicit flush() doesn't silently lose writes.
         let _ = self.flush();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A scratch directory under the OS temp dir, unique per test, removed
+    /// when it goes out of scope.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "kdb-world-test-{tag}-{}-{n}",
+                std::process::id()
+            ));
+            TempDir(path)
+        }
+    }
+
+    impl AsRef<Path> for TempDir {
+        fn as_ref(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn get_on_untouched_world_is_none() {
+        let dir = TempDir::new("untouched");
+        let mut w = World::open(&dir).unwrap();
+
+        // Key never interned anywhere in the world.
+        assert_eq!(w.get(0, 0, 0, "material").unwrap(), None);
+        assert_eq!(w.schema_len(), 0);
+    }
+
+    #[test]
+    fn set_then_get_roundtrips_each_value_type() {
+        let dir = TempDir::new("set-get-types");
+        let mut w = World::open(&dir).unwrap();
+
+        w.set(1, 2, 3, "material", Value::Str("stone".into())).unwrap();
+        w.set(1, 2, 3, "density", Value::F64(2.5)).unwrap();
+        w.set(1, 2, 3, "hardness", Value::I64(7)).unwrap();
+
+        assert_eq!(w.get(1, 2, 3, "material").unwrap(), Some(Value::Str("stone".into())));
+        assert_eq!(w.get(1, 2, 3, "density").unwrap(), Some(Value::F64(2.5)));
+        assert_eq!(w.get(1, 2, 3, "hardness").unwrap(), Some(Value::I64(7)));
+    }
+
+    #[test]
+    fn set_overwrites_previous_value_at_same_cell_and_key() {
+        let dir = TempDir::new("overwrite");
+        let mut w = World::open(&dir).unwrap();
+
+        w.set(9, 9, 9, "material", Value::Str("stone".into())).unwrap();
+        w.set(9, 9, 9, "material", Value::Str("air".into())).unwrap();
+
+        assert_eq!(w.get(9, 9, 9, "material").unwrap(), Some(Value::Str("air".into())));
+    }
+
+    #[test]
+    fn set_on_one_cell_does_not_affect_neighbors_or_other_keys() {
+        let dir = TempDir::new("isolation");
+        let mut w = World::open(&dir).unwrap();
+
+        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+
+        // Same key, different cell in the same chunk: untouched.
+        assert_eq!(w.get(1, 0, 0, "material").unwrap(), None);
+        // Same cell, different key: untouched.
+        assert_eq!(w.get(0, 0, 0, "density").unwrap(), None);
+    }
+
+    #[test]
+    fn set_across_multiple_chunks() {
+        let dir = TempDir::new("multi-chunk");
+        let mut w = World::open(&dir).unwrap();
+
+        // CHUNK_DIM cells apart in x guarantees these land in different chunks.
+        let far = CHUNK_DIM;
+        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+        w.set(far, 0, 0, "material", Value::Str("air".into())).unwrap();
+
+        assert_eq!(w.get(0, 0, 0, "material").unwrap(), Some(Value::Str("stone".into())));
+        assert_eq!(w.get(far, 0, 0, "material").unwrap(), Some(Value::Str("air".into())));
+    }
+
+    #[test]
+    fn interning_a_new_key_grows_the_schema() {
+        let dir = TempDir::new("schema-growth");
+        let mut w = World::open(&dir).unwrap();
+        assert_eq!(w.schema_len(), 0);
+
+        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+        assert_eq!(w.schema_len(), 1);
+
+        // Reusing the same key does not add another schema entry.
+        w.set(1, 1, 1, "material", Value::Str("air".into())).unwrap();
+        assert_eq!(w.schema_len(), 1);
+
+        w.set(0, 0, 0, "density", Value::F64(1.0)).unwrap();
+        assert_eq!(w.schema_len(), 2);
+    }
+
+    #[test]
+    fn set_persists_across_flush_and_reopen() {
+        let dir = TempDir::new("set-persist");
+        {
+            let mut w = World::open(&dir).unwrap();
+            w.set(100, 200, 300, "material", Value::Str("stone".into())).unwrap();
+            w.set(100, 200, 300, "density", Value::F64(2.5)).unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut w = World::open(&dir).unwrap();
+        assert_eq!(w.get(100, 200, 300, "material").unwrap(), Some(Value::Str("stone".into())));
+        assert_eq!(w.get(100, 200, 300, "density").unwrap(), Some(Value::F64(2.5)));
+        // The schema (key registry) is durable too.
+        assert_eq!(w.schema_len(), 2);
+    }
+
+    #[test]
+    fn remove_clears_cell_in_same_session() {
+        let dir = TempDir::new("same-session");
+        let mut w = World::open(&dir).unwrap();
+
+        w.set(1, 2, 3, "material", Value::Str("stone".into())).unwrap();
+        assert_eq!(w.get(1, 2, 3, "material").unwrap(), Some(Value::Str("stone".into())));
+
+        w.remove(1, 2, 3, "material").unwrap();
+        assert_eq!(w.get(1, 2, 3, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn remove_of_unset_key_is_a_harmless_noop() {
+        let dir = TempDir::new("noop");
+        let mut w = World::open(&dir).unwrap();
+
+        // Key was never interned anywhere in the world.
+        w.remove(4, 5, 6, "nonexistent").unwrap();
+        assert_eq!(w.get(4, 5, 6, "nonexistent").unwrap(), None);
+
+        // Key exists in the schema, but not on this particular cell.
+        w.set(4, 5, 6, "material", Value::I64(1)).unwrap();
+        w.remove(7, 8, 9, "material").unwrap();
+        assert_eq!(w.get(4, 5, 6, "material").unwrap(), Some(Value::I64(1)));
+    }
+
+    #[test]
+    fn remove_persists_across_flush_and_reopen() {
+        let dir = TempDir::new("persist");
+        {
+            let mut w = World::open(&dir).unwrap();
+            w.set(100, 200, 300, "material", Value::Str("stone".into())).unwrap();
+            w.remove(100, 200, 300, "material").unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut w = World::open(&dir).unwrap();
+        assert_eq!(w.get(100, 200, 300, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn removing_every_cell_in_a_chunk_deletes_its_file() {
+        let dir = TempDir::new("empty-chunk-gc");
+        {
+            let mut w = World::open(&dir).unwrap();
+            w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+            w.flush().unwrap();
+        }
+        let (ckey, _) = World::split(0, 0, 0);
+        let chunk_path;
+        {
+            let w = World::open(&dir).unwrap();
+            chunk_path = w.chunk_path(ckey);
+        }
+        assert!(chunk_path.exists(), "chunk file should exist once populated");
+
+        let mut w = World::open(&dir).unwrap();
+        w.remove(0, 0, 0, "material").unwrap();
+        w.flush().unwrap();
+        assert!(!chunk_path.exists(), "emptied chunk file should be cleaned up");
     }
 }

@@ -56,10 +56,6 @@ impl Schema {
         self.key_to_id.get(key).copied()
     }
 
-    pub fn key_for_id(&self, id: u32) -> &str {
-        &self.id_to_key[id as usize]
-    }
-
     pub fn len(&self) -> usize {
         self.id_to_key.len()
     }
