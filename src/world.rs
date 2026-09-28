@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 /// Cells per axis for the whole simulated volume.
 pub const WORLD_DIM: u32 = 10_000;
 /// Chunks per axis needed to cover WORLD_DIM cells (313, since 313*32 = 10,016).
-pub const CHUNKS_PER_AXIS: u32 = (WORLD_DIM + CHUNK_DIM - 1) / CHUNK_DIM;
+pub const CHUNKS_PER_AXIS: u32 = WORLD_DIM.div_ceil(CHUNK_DIM);
 
 type ChunkKey = (u32, u32, u32);
 
@@ -62,7 +62,10 @@ impl World {
     }
 
     fn split(x: u32, y: u32, z: u32) -> (ChunkKey, usize) {
-        debug_assert!(x < WORLD_DIM && y < WORLD_DIM && z < WORLD_DIM, "coordinate out of range");
+        debug_assert!(
+            x < WORLD_DIM && y < WORLD_DIM && z < WORLD_DIM,
+            "coordinate out of range"
+        );
         let (cx, lx) = (x / CHUNK_DIM, x % CHUNK_DIM);
         let (cy, ly) = (y / CHUNK_DIM, y % CHUNK_DIM);
         let (cz, lz) = (z / CHUNK_DIM, z % CHUNK_DIM);
@@ -158,7 +161,10 @@ impl World {
         let key_id = self.schema.intern(key)?;
         let (ckey, local_idx) = Self::split(x, y, z);
         self.load_chunk(ckey)?;
-        self.cache.get_mut(&ckey).unwrap().set(local_idx, key_id, value);
+        self.cache
+            .get_mut(&ckey)
+            .unwrap()
+            .set(local_idx, key_id, value);
         self.dirty.insert(ckey);
         Ok(())
     }
@@ -197,10 +203,8 @@ mod tests {
         fn new(tag: &str) -> Self {
             static COUNTER: AtomicU64 = AtomicU64::new(0);
             let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "kdb-world-test-{tag}-{}-{n}",
-                std::process::id()
-            ));
+            let path = std::env::temp_dir()
+                .join(format!("kdb-world-test-{tag}-{}-{n}", std::process::id()));
             TempDir(path)
         }
     }
@@ -232,11 +236,15 @@ mod tests {
         let dir = TempDir::new("set-get-types");
         let mut w = World::open(&dir).unwrap();
 
-        w.set(1, 2, 3, "material", Value::Str("stone".into())).unwrap();
+        w.set(1, 2, 3, "material", Value::Str("stone".into()))
+            .unwrap();
         w.set(1, 2, 3, "density", Value::F64(2.5)).unwrap();
         w.set(1, 2, 3, "hardness", Value::I64(7)).unwrap();
 
-        assert_eq!(w.get(1, 2, 3, "material").unwrap(), Some(Value::Str("stone".into())));
+        assert_eq!(
+            w.get(1, 2, 3, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
         assert_eq!(w.get(1, 2, 3, "density").unwrap(), Some(Value::F64(2.5)));
         assert_eq!(w.get(1, 2, 3, "hardness").unwrap(), Some(Value::I64(7)));
     }
@@ -246,10 +254,15 @@ mod tests {
         let dir = TempDir::new("overwrite");
         let mut w = World::open(&dir).unwrap();
 
-        w.set(9, 9, 9, "material", Value::Str("stone".into())).unwrap();
-        w.set(9, 9, 9, "material", Value::Str("air".into())).unwrap();
+        w.set(9, 9, 9, "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(9, 9, 9, "material", Value::Str("air".into()))
+            .unwrap();
 
-        assert_eq!(w.get(9, 9, 9, "material").unwrap(), Some(Value::Str("air".into())));
+        assert_eq!(
+            w.get(9, 9, 9, "material").unwrap(),
+            Some(Value::Str("air".into()))
+        );
     }
 
     #[test]
@@ -257,7 +270,8 @@ mod tests {
         let dir = TempDir::new("isolation");
         let mut w = World::open(&dir).unwrap();
 
-        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+        w.set(0, 0, 0, "material", Value::Str("stone".into()))
+            .unwrap();
 
         // Same key, different cell in the same chunk: untouched.
         assert_eq!(w.get(1, 0, 0, "material").unwrap(), None);
@@ -272,11 +286,19 @@ mod tests {
 
         // CHUNK_DIM cells apart in x guarantees these land in different chunks.
         let far = CHUNK_DIM;
-        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
-        w.set(far, 0, 0, "material", Value::Str("air".into())).unwrap();
+        w.set(0, 0, 0, "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(far, 0, 0, "material", Value::Str("air".into()))
+            .unwrap();
 
-        assert_eq!(w.get(0, 0, 0, "material").unwrap(), Some(Value::Str("stone".into())));
-        assert_eq!(w.get(far, 0, 0, "material").unwrap(), Some(Value::Str("air".into())));
+        assert_eq!(
+            w.get(0, 0, 0, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(
+            w.get(far, 0, 0, "material").unwrap(),
+            Some(Value::Str("air".into()))
+        );
     }
 
     #[test]
@@ -285,11 +307,13 @@ mod tests {
         let mut w = World::open(&dir).unwrap();
         assert_eq!(w.schema_len(), 0);
 
-        w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+        w.set(0, 0, 0, "material", Value::Str("stone".into()))
+            .unwrap();
         assert_eq!(w.schema_len(), 1);
 
         // Reusing the same key does not add another schema entry.
-        w.set(1, 1, 1, "material", Value::Str("air".into())).unwrap();
+        w.set(1, 1, 1, "material", Value::Str("air".into()))
+            .unwrap();
         assert_eq!(w.schema_len(), 1);
 
         w.set(0, 0, 0, "density", Value::F64(1.0)).unwrap();
@@ -301,14 +325,21 @@ mod tests {
         let dir = TempDir::new("set-persist");
         {
             let mut w = World::open(&dir).unwrap();
-            w.set(100, 200, 300, "material", Value::Str("stone".into())).unwrap();
+            w.set(100, 200, 300, "material", Value::Str("stone".into()))
+                .unwrap();
             w.set(100, 200, 300, "density", Value::F64(2.5)).unwrap();
             w.flush().unwrap();
         }
 
         let mut w = World::open(&dir).unwrap();
-        assert_eq!(w.get(100, 200, 300, "material").unwrap(), Some(Value::Str("stone".into())));
-        assert_eq!(w.get(100, 200, 300, "density").unwrap(), Some(Value::F64(2.5)));
+        assert_eq!(
+            w.get(100, 200, 300, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(
+            w.get(100, 200, 300, "density").unwrap(),
+            Some(Value::F64(2.5))
+        );
         // The schema (key registry) is durable too.
         assert_eq!(w.schema_len(), 2);
     }
@@ -318,8 +349,12 @@ mod tests {
         let dir = TempDir::new("same-session");
         let mut w = World::open(&dir).unwrap();
 
-        w.set(1, 2, 3, "material", Value::Str("stone".into())).unwrap();
-        assert_eq!(w.get(1, 2, 3, "material").unwrap(), Some(Value::Str("stone".into())));
+        w.set(1, 2, 3, "material", Value::Str("stone".into()))
+            .unwrap();
+        assert_eq!(
+            w.get(1, 2, 3, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
 
         w.remove(1, 2, 3, "material").unwrap();
         assert_eq!(w.get(1, 2, 3, "material").unwrap(), None);
@@ -345,7 +380,8 @@ mod tests {
         let dir = TempDir::new("persist");
         {
             let mut w = World::open(&dir).unwrap();
-            w.set(100, 200, 300, "material", Value::Str("stone".into())).unwrap();
+            w.set(100, 200, 300, "material", Value::Str("stone".into()))
+                .unwrap();
             w.remove(100, 200, 300, "material").unwrap();
             w.flush().unwrap();
         }
@@ -359,7 +395,8 @@ mod tests {
         let dir = TempDir::new("empty-chunk-gc");
         {
             let mut w = World::open(&dir).unwrap();
-            w.set(0, 0, 0, "material", Value::Str("stone".into())).unwrap();
+            w.set(0, 0, 0, "material", Value::Str("stone".into()))
+                .unwrap();
             w.flush().unwrap();
         }
         let (ckey, _) = World::split(0, 0, 0);
@@ -368,11 +405,17 @@ mod tests {
             let w = World::open(&dir).unwrap();
             chunk_path = w.chunk_path(ckey);
         }
-        assert!(chunk_path.exists(), "chunk file should exist once populated");
+        assert!(
+            chunk_path.exists(),
+            "chunk file should exist once populated"
+        );
 
         let mut w = World::open(&dir).unwrap();
         w.remove(0, 0, 0, "material").unwrap();
         w.flush().unwrap();
-        assert!(!chunk_path.exists(), "emptied chunk file should be cleaned up");
+        assert!(
+            !chunk_path.exists(),
+            "emptied chunk file should be cleaned up"
+        );
     }
 }

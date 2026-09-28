@@ -10,7 +10,9 @@ use value::Value;
 use world::World;
 
 fn main() -> io::Result<()> {
-    let root = std::env::args().nth(1).unwrap_or_else(|| "./data".to_string());
+    let root = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "./data".to_string());
 
     let total_cells = (world::WORLD_DIM as u128).pow(3);
     let total_chunks = (world::CHUNKS_PER_AXIS as u128).pow(3);
@@ -18,15 +20,18 @@ fn main() -> io::Result<()> {
     println!("kdb prototype -- chunked columnar key/value cell storage\n");
     println!(
         "world:  {0}x{0}x{0} cells  ({1} cells total)",
-        world::WORLD_DIM, total_cells
+        world::WORLD_DIM,
+        total_cells
     );
     println!(
         "chunk:  {0}x{0}x{0} cells  ({1} cells/chunk)",
-        chunk::CHUNK_DIM, chunk::CHUNK_CELLS
+        chunk::CHUNK_DIM,
+        chunk::CHUNK_CELLS
     );
     println!(
         "grid:   {0}x{0}x{0} chunks ({1} chunks total, if every one were populated)",
-        world::CHUNKS_PER_AXIS, total_chunks
+        world::CHUNKS_PER_AXIS,
+        total_chunks
     );
     println!("data dir: {root}\n");
 
@@ -42,8 +47,24 @@ fn main() -> io::Result<()> {
         let y = (i.wrapping_mul(7_919)) % world::WORLD_DIM;
         let z = (i.wrapping_mul(104_729)) % world::WORLD_DIM;
 
-        w.set(x, y, z, "material", Value::Str(if i % 3 == 0 { "stone".into() } else { "air".into() }))?;
-        w.set(x, y, z, "temperature", Value::F64(15.0 + f64::from(i) * 0.01))?;
+        w.set(
+            x,
+            y,
+            z,
+            "material",
+            Value::Str(if i % 3 == 0 {
+                "stone".into()
+            } else {
+                "air".into()
+            }),
+        )?;
+        w.set(
+            x,
+            y,
+            z,
+            "temperature",
+            Value::F64(15.0 + f64::from(i) * 0.01),
+        )?;
         w.set(x, y, z, "density", Value::F64(2.6))?;
 
         if i % 50 == 0 {
@@ -83,7 +104,14 @@ fn main() -> io::Result<()> {
     println!("\nsample reads:");
     for &(x, y, z) in &[(x0, y0, z0), (x1, y1, z1)] {
         println!("  cell ({x}, {y}, {z}):");
-        for key in ["material", "temperature", "density", "hardness", "label", "nonexistent_key"] {
+        for key in [
+            "material",
+            "temperature",
+            "density",
+            "hardness",
+            "label",
+            "nonexistent_key",
+        ] {
             match w.get(x, y, z, key)? {
                 Some(v) => println!("    {key:<16} = {v:?}"),
                 None => println!("    {key:<16} = <not set>"),
