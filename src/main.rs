@@ -138,6 +138,46 @@ fn run() -> io::Result<()> {
         }
     }
 
+    // --- demonstrate region operations, spanning a chunk boundary ---
+    // Starts 3 cells before a chunk boundary and runs 8 cells wide, so this
+    // box covers the tail of one chunk and the head of the next on every
+    // axis -- get/set/remove_region resolve each cell through the same
+    // chunk/local-index split as the single-cell ops above, so there's
+    // nothing extra to do at the seam.
+    // set_region takes one value per cell (not a single fill value), so a
+    // vein can vary cell-to-cell in one call: every 4th cell along x is
+    // "ore", the rest are "stone".
+    let r = chunk::CHUNK_DIM - 3;
+    let d = 8;
+    let region = world::Region::new(r, r, r, d, d, d);
+    let vein_values: Vec<Value> = (0..region.volume())
+        .map(|i| {
+            if i % 4 == 0 {
+                Value::Str("ore".into())
+            } else {
+                Value::Str("stone".into())
+            }
+        })
+        .collect();
+    w.set_region(region, "material", &vein_values)?;
+    let vein = w.get_region(region, "material")?;
+    let ore_cells = vein
+        .iter()
+        .filter(|v| **v == Some(Value::Str("ore".into())))
+        .count();
+    w.remove_region(region, "material")?;
+    let after_removal = w.get_region(region, "material")?;
+    let remaining = after_removal.iter().filter(|v| v.is_some()).count();
+    w.flush()?;
+
+    println!(
+        "\nregion ops: filled an {d}x{d}x{d} \"ore\" vein straddling a chunk boundary \
+         at ({r}, {r}, {r}) -- {ore_cells}/{} cells set, {remaining}/{} left after \
+         remove_region",
+        region.volume(),
+        region.volume()
+    );
+
     // --- report the actual on-disk footprint ---
     let (file_count, total_bytes) = disk_usage(Path::new(&root))?;
     let naive_json_estimate = u64::from(n) * 120; // ~120 bytes/cell for a hand-written JSON object

@@ -68,7 +68,7 @@ mechanism clearly, not for the last byte of density.
 
 ```sh
 cargo build --release
-cargo test               # a couple of unit tests for the chunk binary format
+cargo test               # unit tests for the chunk binary format and World
 ./target/release/kdb ./data   # runs a small demo: writes ~5000 scattered
                                # cells, reads some back, reports disk usage.
                                # Re-run with the same data dir and it loads
@@ -82,5 +82,8 @@ cargo test               # a couple of unit tests for the chunk binary format
 - `src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
   serialization, unit tests.
 - `src/world.rs`  -- coordinate -> chunk mapping, chunk file paths, the
-  bounded LRU-ish cache, `get`/`set`/`remove`/`flush`.
+  bounded LRU-ish cache, `get`/`set`/`remove`/`flush`, and their
+  `*_region` counterparts for arbitrary axis-aligned boxes of cells
+  (`Region`) that may span or partially cover any number of chunks.
+- `src/logger.rs` -- minimal dependency-free logger, appends to `kdb.log`.
 - `src/main.rs`   -- demo/benchmark driver.

@@ -13,6 +13,38 @@ pub const CHUNKS_PER_AXIS: u32 = WORLD_DIM.div_ceil(CHUNK_DIM);
 
 type ChunkKey = (u32, u32, u32);
 
+/// An axis-aligned box of cells: origin `(x, y, z)` plus extent
+/// `(dx, dy, dz)`, i.e. `[x, x+dx) x [y, y+dy) x [z, z+dz)`. Bundles what
+/// would otherwise be six separate parameters on every `*_region` method,
+/// and may span or partially cover any number of chunks -- see
+/// `World::get_region`/`set_region`/`remove_region`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Region {
+    pub x: u32,
+    pub y: u32,
+    pub z: u32,
+    pub dx: u32,
+    pub dy: u32,
+    pub dz: u32,
+}
+
+impl Region {
+    pub fn new(x: u32, y: u32, z: u32, dx: u32, dy: u32, dz: u32) -> Self {
+        Region {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+        }
+    }
+
+    pub fn volume(&self) -> u64 {
+        u64::from(self.dx) * u64::from(self.dy) * u64::from(self.dz)
+    }
+}
+
 /// The on-disk, chunked, columnar key-value world.
 ///
 /// Layout on disk under `root`:
@@ -198,11 +230,169 @@ impl World {
                 return Ok(());
             }
         };
+        self.remove_cell(x, y, z, key_id)?;
+        crate::logger::info(format!("removed key '{key}' at ({x}, {y}, {z})"));
+        Ok(())
+    }
+
+    /// Core of `remove`/`remove_region`, without the per-call logging --
+    /// `remove_region` logs one summary line for the whole box instead of
+    /// one per cell.
+    fn remove_cell(&mut self, x: u32, y: u32, z: u32, key_id: u32) -> io::Result<()> {
         let (ckey, local_idx) = Self::split(x, y, z);
         self.load_chunk(ckey)?;
         self.cache.get_mut(&ckey).unwrap().remove(local_idx, key_id);
         self.dirty.insert(ckey);
-        crate::logger::info(format!("removed key '{key}' at ({x}, {y}, {z})"));
+        Ok(())
+    }
+
+    /// Checks that `region` fits inside the world without overflowing `u32`
+    /// along the way.
+    fn check_region(region: Region) -> io::Result<()> {
+        let Region {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+        } = region;
+        let in_range = |lo: u32, len: u32| lo.checked_add(len).is_some_and(|hi| hi <= WORLD_DIM);
+        if in_range(x, dx) && in_range(y, dy) && in_range(z, dz) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "region {region:?} doesn't fit in a {0}x{0}x{0} world",
+                    WORLD_DIM
+                ),
+            ))
+        }
+    }
+
+    /// Reads `key` for every cell in `region`. The box may span any number
+    /// of chunks and cover only part of a chunk along any face -- each cell
+    /// is resolved independently through the same chunk/local-index split
+    /// as a single-cell `get`, so chunk boundaries need no special-casing
+    /// here.
+    ///
+    /// Results come back in `dx*dy*dz` order, x-fastest then y then z:
+    /// `result[rx + ry*region.dx + rz*region.dx*region.dy]` is cell
+    /// `(region.x+rx, region.y+ry, region.z+rz)`.
+    pub fn get_region(&mut self, region: Region, key: &str) -> io::Result<Vec<Option<Value>>> {
+        Self::check_region(region)?;
+        let Region {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+        } = region;
+        let mut out = Vec::with_capacity(region.volume() as usize);
+        for rz in 0..dz {
+            for ry in 0..dy {
+                for rx in 0..dx {
+                    out.push(self.get(x + rx, y + ry, z + rz, key)?);
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Sets `key` on every cell in `region` from `values`, spanning chunks
+    /// and partial chunks exactly like `get_region`. `values` holds one
+    /// value per cell, in the same `dx*dy*dz`, x-fastest/y/z order as
+    /// `get_region`'s result -- `values[rx + ry*region.dx +
+    /// rz*region.dx*region.dy]` is written to cell `(region.x+rx,
+    /// region.y+ry, region.z+rz)` -- and its length must equal
+    /// `region.volume()` exactly, or this returns an `InvalidInput` error
+    /// without writing anything. A no-op region (any of `dx`/`dy`/`dz`
+    /// zero, so `values` must be empty too) doesn't even intern `key`.
+    pub fn set_region(&mut self, region: Region, key: &str, values: &[Value]) -> io::Result<()> {
+        Self::check_region(region)?;
+        let volume = region.volume() as usize;
+        if values.len() != volume {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "set_region: region {region:?} holds {volume} cells but {} values were given",
+                    values.len()
+                ),
+            ));
+        }
+        if volume == 0 {
+            return Ok(());
+        }
+        let Region {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+        } = region;
+        let key_id = self.schema.intern(key)?;
+        let mut i = 0;
+        for rz in 0..dz {
+            for ry in 0..dy {
+                for rx in 0..dx {
+                    let (ckey, local_idx) = Self::split(x + rx, y + ry, z + rz);
+                    self.load_chunk(ckey)?;
+                    self.cache
+                        .get_mut(&ckey)
+                        .unwrap()
+                        .set(local_idx, key_id, values[i].clone());
+                    self.dirty.insert(ckey);
+                    i += 1;
+                }
+            }
+        }
+        crate::logger::info(format!(
+            "set region {region:?} key '{key}' from {volume} per-cell values"
+        ));
+        Ok(())
+    }
+
+    /// Removes `key` from every cell in `region`, spanning chunks and
+    /// partial chunks exactly like `get_region`. Unlike the single-cell
+    /// `remove`, this logs one summary line for the whole region rather
+    /// than one line per cell, so clearing a large region doesn't flood
+    /// `kdb.log`.
+    pub fn remove_region(&mut self, region: Region, key: &str) -> io::Result<()> {
+        Self::check_region(region)?;
+        if region.volume() == 0 {
+            return Ok(());
+        }
+        let key_id = match self.schema.id_for_key(key) {
+            Some(id) => id,
+            None => {
+                crate::logger::warn(format!(
+                    "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
+                ));
+                return Ok(());
+            }
+        };
+        let Region {
+            x,
+            y,
+            z,
+            dx,
+            dy,
+            dz,
+        } = region;
+        for rz in 0..dz {
+            for ry in 0..dy {
+                for rx in 0..dx {
+                    self.remove_cell(x + rx, y + ry, z + rz, key_id)?;
+                }
+            }
+        }
+        crate::logger::info(format!(
+            "removed region {region:?} key '{key}' ({} cells)",
+            region.volume()
+        ));
         Ok(())
     }
 }
@@ -442,5 +632,255 @@ mod tests {
             !chunk_path.exists(),
             "emptied chunk file should be cleaned up"
         );
+    }
+
+    /// `n` copies of `value`, for tests that don't care about per-cell
+    /// variation and just want to fill a region uniformly.
+    fn fill(region: Region, value: Value) -> Vec<Value> {
+        vec![value; region.volume() as usize]
+    }
+
+    #[test]
+    fn get_region_on_untouched_world_is_all_none() {
+        let dir = TempDir::new("region-untouched");
+        let mut w = World::open(&dir).unwrap();
+
+        let region = Region::new(5, 5, 5, 3, 2, 2);
+        let got = w.get_region(region, "material").unwrap();
+        assert_eq!(got.len(), 3 * 2 * 2);
+        assert!(got.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn set_region_then_get_region_roundtrips_within_one_chunk() {
+        let dir = TempDir::new("region-roundtrip");
+        let mut w = World::open(&dir).unwrap();
+
+        let region = Region::new(1, 1, 1, 4, 3, 2);
+        w.set_region(
+            region,
+            "material",
+            &fill(region, Value::Str("stone".into())),
+        )
+        .unwrap();
+
+        let got = w.get_region(region, "material").unwrap();
+        assert_eq!(got.len(), 4 * 3 * 2);
+        assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
+    }
+
+    #[test]
+    fn set_region_writes_distinct_per_cell_values() {
+        let dir = TempDir::new("region-per-cell");
+        let mut w = World::open(&dir).unwrap();
+
+        let region = Region::new(10, 20, 30, 3, 2, 2);
+        let values: Vec<Value> = (0..region.volume())
+            .map(|i| Value::I64(i as i64 * 7))
+            .collect();
+        w.set_region(region, "n", &values).unwrap();
+
+        let got = w.get_region(region, "n").unwrap();
+        for (i, v) in values.iter().enumerate() {
+            assert_eq!(got[i], Some(v.clone()));
+        }
+    }
+
+    #[test]
+    fn set_region_rejects_a_mismatched_value_count() {
+        let dir = TempDir::new("region-bad-count");
+        let mut w = World::open(&dir).unwrap();
+
+        let region = Region::new(0, 0, 0, 2, 2, 2); // volume 8
+        let too_few = vec![Value::I64(0); 7];
+        let err = w.set_region(region, "n", &too_few).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // The rejected call must not have written anything.
+        let got = w.get_region(region, "n").unwrap();
+        assert!(got.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn set_region_does_not_leak_outside_its_bounds() {
+        let dir = TempDir::new("region-bounds");
+        let mut w = World::open(&dir).unwrap();
+
+        let region = Region::new(10, 10, 10, 2, 2, 2);
+        w.set_region(
+            region,
+            "material",
+            &fill(region, Value::Str("stone".into())),
+        )
+        .unwrap();
+
+        // One past the region on each axis: untouched.
+        assert_eq!(w.get(12, 10, 10, "material").unwrap(), None);
+        assert_eq!(w.get(10, 12, 10, "material").unwrap(), None);
+        assert_eq!(w.get(10, 10, 12, "material").unwrap(), None);
+        // Just inside on each axis: set.
+        assert_eq!(
+            w.get(11, 10, 10, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+    }
+
+    #[test]
+    fn get_region_orders_results_x_fastest_then_y_then_z() {
+        let dir = TempDir::new("region-order");
+        let mut w = World::open(&dir).unwrap();
+
+        let (x0, y0, z0) = (10, 20, 30);
+        let (dx, dy, dz) = (3u32, 2u32, 2u32);
+        for rz in 0..dz {
+            for ry in 0..dy {
+                for rx in 0..dx {
+                    let v = (rx as i64) + (ry as i64) * 100 + (rz as i64) * 10_000;
+                    w.set(x0 + rx, y0 + ry, z0 + rz, "n", Value::I64(v))
+                        .unwrap();
+                }
+            }
+        }
+
+        let got = w
+            .get_region(Region::new(x0, y0, z0, dx, dy, dz), "n")
+            .unwrap();
+        for rz in 0..dz {
+            for ry in 0..dy {
+                for rx in 0..dx {
+                    let idx = (rx + ry * dx + rz * dx * dy) as usize;
+                    let expected = (rx as i64) + (ry as i64) * 100 + (rz as i64) * 10_000;
+                    assert_eq!(got[idx], Some(Value::I64(expected)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn region_spans_chunks_including_partial_chunks() {
+        let dir = TempDir::new("region-span-chunks");
+        let mut w = World::open(&dir).unwrap();
+
+        // Starts 5 cells before a chunk boundary and ends 5 cells past the
+        // next one, on every axis: covers the tail of one chunk, all of a
+        // second, and the head of a third, on each axis.
+        let x0 = CHUNK_DIM - 5;
+        let d = CHUNK_DIM + 10;
+        let region = Region::new(x0, x0, x0, d, d, d);
+
+        w.set_region(
+            region,
+            "material",
+            &fill(region, Value::Str("stone".into())),
+        )
+        .unwrap();
+        w.flush().unwrap();
+
+        // Reopen so the read exercises chunks freshly loaded from disk, not
+        // just what's still resident in cache.
+        let mut w = World::open(&dir).unwrap();
+        let got = w.get_region(region, "material").unwrap();
+        assert_eq!(got.len(), d as usize * d as usize * d as usize);
+        assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
+
+        // Just outside the region on the low and high corners: untouched.
+        assert_eq!(w.get(x0 - 1, x0 - 1, x0 - 1, "material").unwrap(), None);
+        assert_eq!(w.get(x0 + d, x0 + d, x0 + d, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn remove_region_clears_key_across_chunks_without_touching_others() {
+        let dir = TempDir::new("region-remove");
+        let mut w = World::open(&dir).unwrap();
+
+        let x0 = CHUNK_DIM - 2;
+        let region = Region::new(x0, 0, 0, 5, 5, 5);
+        w.set_region(
+            region,
+            "material",
+            &fill(region, Value::Str("stone".into())),
+        )
+        .unwrap();
+        w.set_region(region, "density", &fill(region, Value::F64(2.6)))
+            .unwrap();
+
+        w.remove_region(region, "material").unwrap();
+
+        let material = w.get_region(region, "material").unwrap();
+        assert!(material.iter().all(Option::is_none));
+        // A different key on the same cells is untouched by the removal.
+        let density = w.get_region(region, "density").unwrap();
+        assert!(density.iter().all(|v| *v == Some(Value::F64(2.6))));
+    }
+
+    #[test]
+    fn remove_region_of_unknown_key_is_a_harmless_noop() {
+        let dir = TempDir::new("region-remove-unknown");
+        let mut w = World::open(&dir).unwrap();
+        // Should not error even though "material" has never been interned.
+        w.remove_region(Region::new(0, 0, 0, 4, 4, 4), "material")
+            .unwrap();
+    }
+
+    #[test]
+    fn zero_sized_region_is_a_harmless_noop() {
+        let dir = TempDir::new("region-zero");
+        let mut w = World::open(&dir).unwrap();
+
+        assert_eq!(
+            w.get_region(Region::new(0, 0, 0, 0, 5, 5), "material")
+                .unwrap(),
+            vec![]
+        );
+        w.set_region(Region::new(0, 0, 0, 5, 0, 5), "material", &[])
+            .unwrap();
+        // A no-op set_region shouldn't even intern the key.
+        assert_eq!(w.schema_len(), 0);
+        w.remove_region(Region::new(0, 0, 0, 5, 5, 0), "material")
+            .unwrap();
+    }
+
+    #[test]
+    fn region_out_of_world_bounds_is_an_error() {
+        let dir = TempDir::new("region-oob");
+        let mut w = World::open(&dir).unwrap();
+
+        assert_eq!(
+            w.get_region(Region::new(WORLD_DIM - 1, 0, 0, 2, 1, 1), "material")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Overflowing u32 entirely must not panic or wrap around.
+        assert_eq!(
+            w.set_region(
+                Region::new(u32::MAX - 1, 0, 0, 5, 1, 1),
+                "material",
+                &vec![Value::I64(0); 5],
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn set_region_persists_across_flush_and_reopen() {
+        let dir = TempDir::new("region-persist");
+        let region = Region::new(100, 100, 100, 3, 3, 3);
+        {
+            let mut w = World::open(&dir).unwrap();
+            w.set_region(
+                region,
+                "material",
+                &fill(region, Value::Str("stone".into())),
+            )
+            .unwrap();
+            w.flush().unwrap();
+        }
+
+        let mut w = World::open(&dir).unwrap();
+        let got = w.get_region(region, "material").unwrap();
+        assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
     }
 }
