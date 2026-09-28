@@ -1,4 +1,5 @@
 mod chunk;
+mod logger;
 mod schema;
 mod value;
 mod world;
@@ -10,9 +11,22 @@ use value::Value;
 use world::World;
 
 fn main() -> io::Result<()> {
+    let result = run();
+    if let Err(e) = &result {
+        logger::error(format!("fatal: {e}"));
+    }
+    result
+}
+
+fn run() -> io::Result<()> {
     let root = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "./data".to_string());
+
+    logger::info(format!(
+        "kdb starting -- data dir: {root} (logging to {})",
+        logger::LOG_FILE_NAME
+    ));
 
     let total_cells = (world::WORLD_DIM as u128).pow(3);
     let total_chunks = (world::CHUNKS_PER_AXIS as u128).pow(3);
@@ -83,6 +97,11 @@ fn main() -> io::Result<()> {
         w.chunks_written_to_disk,
         w.schema_len()
     );
+    logger::info(format!(
+        "wrote {n} cells in {write_elapsed:?} ({} chunk files written, {} keys interned)",
+        w.chunks_written_to_disk,
+        w.schema_len()
+    ));
 
     // A couple of hand-picked cells to demonstrate reads, including a miss.
     let (x0, y0, z0) = (0, 0, 0);
@@ -131,12 +150,16 @@ fn main() -> io::Result<()> {
          would already run to roughly {naive_json_estimate} bytes, before even \
          touching the trillion-cell filesystem-metadata problem of one file per cell"
     );
+    logger::info(format!(
+        "on-disk footprint: {file_count} files, {total_bytes} bytes"
+    ));
 
     println!(
         "\nre-run this binary again (same data dir) and it will load the existing \
          chunks/schema instead of starting empty."
     );
 
+    logger::info("kdb finished successfully");
     Ok(())
 }
 

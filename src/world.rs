@@ -39,6 +39,11 @@ impl World {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
         let schema = Schema::open(&root)?;
+        crate::logger::info(format!(
+            "world opened at {} ({} keys already interned)",
+            root.display(),
+            schema.len()
+        ));
         Ok(World {
             root,
             schema,
@@ -109,6 +114,13 @@ impl World {
             .copied()
             .or_else(|| self.cache.keys().next().copied());
         if let Some(k) = victim {
+            // Routine, not a problem: this is how the bounded cache stays
+            // bounded. Not WARN-level -- a world touching more chunks than
+            // fit in cache is the expected case, not an error condition.
+            crate::logger::info(format!(
+                "chunk cache at capacity ({}); evicting {k:?}",
+                self.cache_capacity
+            ));
             self.flush_one(k)?;
             self.cache.remove(&k);
         }
@@ -141,6 +153,9 @@ impl World {
     /// Write every dirty chunk currently in the cache back to disk.
     pub fn flush(&mut self) -> io::Result<()> {
         let keys: Vec<_> = self.dirty.iter().copied().collect();
+        if !keys.is_empty() {
+            crate::logger::info(format!("flushing {} dirty chunk(s)", keys.len()));
+        }
         for k in keys {
             self.flush_one(k)?;
         }
@@ -172,12 +187,22 @@ impl World {
     pub fn remove(&mut self, x: u32, y: u32, z: u32, key: &str) -> io::Result<()> {
         let key_id = match self.schema.id_for_key(key) {
             Some(id) => id,
-            None => return Ok(()),
+            None => {
+                // Distinct from "key exists but isn't set on this cell"
+                // (routine, logged as INFO below): this key has never been
+                // interned anywhere in the world, which more likely means a
+                // typo than a deliberate no-op.
+                crate::logger::warn(format!(
+                    "remove() called with unknown key '{key}' at ({x}, {y}, {z}) -- no-op"
+                ));
+                return Ok(());
+            }
         };
         let (ckey, local_idx) = Self::split(x, y, z);
         self.load_chunk(ckey)?;
         self.cache.get_mut(&ckey).unwrap().remove(local_idx, key_id);
         self.dirty.insert(ckey);
+        crate::logger::info(format!("removed key '{key}' at ({x}, {y}, {z})"));
         Ok(())
     }
 }
