@@ -44,10 +44,14 @@ kdbserver/   the REST server (binary `kdbserver`, depends on kdb)
   root (append-only, so ids never change). Chunks store columns by id, not
   by string.
 
-- **Bounded in-memory cache.** `World` keeps at most a couple hundred
-  chunks resident and evicts (flushing dirty ones) beyond that, so the
-  process addressing a trillion-cell world only ever holds tens of MB in
-  RAM.
+- **No client-side cache -- every operation is durable and lock-guarded on
+  its own.** `get`/`set`/`remove` lock (shared for a read, exclusive for a
+  write), read, apply, and (for writes) write back exactly the chunk
+  file(s) they touch, then release, all before returning -- see
+  "Concurrency" below. A `set` is durable the instant its call returns;
+  there's nothing to evict or flush, and a process addressing a
+  trillion-cell world only ever holds the one or two chunks a given call
+  actually needs in memory.
 
 - **Directory nesting.** Chunk files live at `<root>/<c0>/<c1>/.../<cn>.chunk`
   (one path segment per axis), which keeps any one directory to at most
@@ -63,6 +67,45 @@ kdbserver/   the REST server (binary `kdbserver`, depends on kdb)
   *without touching anything* -- a world's shape can't silently change out
   from under data already written for it. `world::AXES`/`world::WORLD_DIM`
   are only the defaults `main`'s demo happens to call `create` with.
+
+### Concurrency
+
+Any number of processes -- multiple `kdbserver` instances included -- can
+safely share one world directory. There's no in-process cache to go stale
+or to lose an update on eviction: every `get`/`set`/`remove` (and, at chunk
+granularity, every `*_region` call) takes an OS-level advisory lock
+(`kdb/src/lock.rs`, via `std::fs::File::lock`/`lock_shared` -- stable in
+`std`, so this needs no dependency either) on exactly the chunk file(s) it
+touches, shared for a read and exclusive for a write, reads that chunk's
+*current* on-disk contents fresh, applies the change, and (for a write)
+writes it straight back before releasing the lock and returning. The
+schema (`schema.txt`) gets the same treatment: interning a new key takes an
+exclusive lock and re-reads the file first, so two processes racing to
+intern two *different* new keys can't collide on the same id (which used
+to be able to corrupt `schema.txt` badly enough that even reopening the
+world later would fail). `World::create` is similarly race-free: two
+processes racing to create the very same fresh directory, possibly with
+*different* `axes`/`world_dim`, resolve safely -- one creates it, the other
+sees what was just created and is validated against it like any other
+pre-existing world, under one exclusive lock around the whole
+check-then-maybe-write sequence.
+
+What this does *not* give you is cross-call atomicity: a `get` immediately
+followed by a `set` from the same caller is two separate locked
+operations, not one transaction, so another process's write can land in
+between them -- same as most simple key/value stores without an explicit
+read-modify-write or transaction API.
+
+The cost of dropping the in-process cache is that every single-cell
+operation is now its own disk round trip (a chunk touched by four `set`
+calls in a row, even for four different keys on the same cell, is four
+separate chunk-file rewrites, not one batched one) -- correctness across
+processes traded away the free win a private, unsynchronized cache used to
+give a single process. `get_region`/`set_region`/`remove_region` claw part
+of that back for the common case where a region spans far fewer chunks
+than cells: they group a region's cells by chunk first, so each chunk a
+region touches is still locked, read, and (for a write) written back
+exactly once, no matter how many of the region's cells land in it.
 
 ### A real trade-off this prototype makes visible
 
@@ -99,22 +142,29 @@ mechanism clearly, not for the last byte of density.
   prototype could use -- `Coord` avoids a `Vec<u32>`-per-coordinate heap
   allocation for the common case (a handful of axes) without adding a
   `smallvec` dependency.
+- `kdb/src/lock.rs`   -- `FileLock`, the RAII wrapper around
+  `std::fs::File::lock`/`lock_shared` everything else in this list uses for
+  cross-process locking (see "Concurrency" above). Private to the crate --
+  an implementation detail, not part of the public API.
 - `kdb/src/params.rs` -- `WorldParams` (axes, world_dim), read/written as
-  `world.txt` at the world root.
-- `kdb/src/schema.rs` -- global key-string <-> id registry (`schema.txt`).
+  `world.txt` at the world root, and `create_or_validate`, the one
+  lock-guarded operation `World::create` needs.
+- `kdb/src/schema.rs` -- global key-string <-> id registry (`schema.txt`),
+  lock-guarded so concurrent interning of different new keys can't collide.
 - `kdb/src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
   serialization, unit tests. Its cell count (`chunk_cells(axes)`) is
   computed at runtime from the owning world's axis count.
 - `kdb/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
-  mapping, chunk file paths, the bounded LRU-ish cache, `get`/`set`/
-  `remove`/`flush`, and their `*_region` counterparts for arbitrary
-  axis-aligned boxes of cells (`Region`) that may span or partially cover
-  any number of chunks. `get`/`set`/`remove` always validate the
-  coordinate itself before consulting anything else (key existence,
-  schema, ...) -- this crate is a library other code (like `kdbserver`)
-  calls with unvalidated/attacker-controlled input, so a malformed
-  coordinate is always rejected the same way rather than sometimes being
-  silently absorbed by an unrelated short-circuit.
+  mapping, chunk file paths, `with_chunk` (the lock-read-apply-write cycle
+  every operation goes through), `get`/`set`/`remove`/`flush`, and their
+  `*_region` counterparts for arbitrary axis-aligned boxes of cells
+  (`Region`) that may span or partially cover any number of chunks.
+  `get`/`set`/`remove` always validate the coordinate itself before
+  consulting anything else (key existence, schema, ...) -- this crate is a
+  library other code (like `kdbserver`) calls with unvalidated/
+  attacker-controlled input, so a malformed coordinate is always rejected
+  the same way rather than sometimes being silently absorbed by an
+  unrelated short-circuit.
 - `kdb/src/logger.rs` -- minimal dependency-free logger, appends to
   `kdb.log` in the working directory.
 - `kdb/src/main.rs`   -- demo/benchmark driver (the `kdb` binary).
@@ -143,6 +193,12 @@ OPTIONS:
 `--axes`/`--world-dim` only matter the *first* time a world is created at
 `--data-dir` (via `World::create`); reopening an existing one reads its
 real shape back from its `world.txt` and ignores these flags.
+
+**Multiple `kdbserver` instances can safely point `--data-dir` at the same
+directory** -- e.g. several instances behind a load balancer -- and read
+and write concurrently without corrupting anything. `kdb` itself is what
+makes that safe (see its "Concurrency" section above); this server doesn't
+need to know or do anything special.
 
 ### REST API
 

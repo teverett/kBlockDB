@@ -10,6 +10,7 @@
 
 pub mod chunk;
 pub mod coord;
+mod lock;
 pub mod logger;
 pub mod params;
 pub mod schema;

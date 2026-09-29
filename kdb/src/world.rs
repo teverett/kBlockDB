@@ -1,12 +1,21 @@
 use crate::chunk::{self, Chunk, CHUNK_DIM};
 pub use crate::coord::Coord;
+use crate::lock::FileLock;
 use crate::params::WorldParams;
 use crate::schema::Schema;
 use crate::value::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+
+/// Whether a `World::with_chunk` call means to only read a chunk or to
+/// (possibly) write it -- see that method.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Access {
+    Read,
+    Write,
+}
 
 /// Default number of spatial axes for a *new* world, i.e. what `main`'s demo
 /// calls `World::create` with. This is only a default: a world's real axis
@@ -121,26 +130,51 @@ impl Iterator for RegionIter {
 /// The on-disk, chunked, columnar key-value world.
 ///
 /// Layout on disk under `root`:
-///   root/world.txt                  -- this world's axes/world_dim (see params.rs)
-///   root/schema.txt                 -- key string <-> id registry (see schema.rs)
-///   root/<c0>/<c1>/.../<c_n-1>.chunk -- one file per non-empty chunk,
-///                                        nested axes-1 directories deep
+///   root/world.txt                       -- this world's axes/world_dim (see params.rs)
+///   root/schema.txt                      -- key string <-> id registry (see schema.rs)
+///   root/<c0>/<c1>/.../<c_n-1>.chunk      -- one file per non-empty chunk,
+///                                            nested axes-1 directories deep
+///   root/<c0>/<c1>/.../<c_n-1>.chunk.lock -- that chunk's lock file (see below)
 ///
-/// That nesting keeps any single directory to at most `chunks_per_axis()`
-/// entries no matter how large the world gets, and chunks with no data in
-/// them are simply never written -- a 10,000^3 world (1 trillion cells)
-/// that's mostly empty costs disk space proportional to how much of it is
-/// actually populated, not to its nominal size.
+/// The directory nesting keeps any single directory to at most
+/// `chunks_per_axis()` entries no matter how large the world gets, and
+/// chunks with no data in them are simply never written -- a 10,000^3
+/// world (1 trillion cells) that's mostly empty costs disk space
+/// proportional to how much of it is actually populated, not to its
+/// nominal size.
+///
+/// **Concurrency.** Any number of processes (e.g. multiple `kdbserver`
+/// instances) can safely open the same `root` at once: every operation
+/// locks (via `crate::lock::FileLock`) exactly the chunk file(s) it
+/// touches -- shared for a read, exclusive for a write -- reads that
+/// chunk's *current* on-disk contents fresh, applies the change, and
+/// writes it straight back before releasing the lock, all before
+/// returning. There is no in-process cache of chunk contents to go stale
+/// or to lose an update on eviction: every `set`/`remove` is durable the
+/// moment its call returns, and every `get` sees whatever the last writer
+/// actually wrote, never a stale or partially-written copy. The schema
+/// (`schema.rs`) gets the same treatment: interning a new key takes an
+/// exclusive lock on `schema.txt` and re-reads it first, so two processes
+/// racing to intern two *different* new keys can't collide on the same
+/// id. What this does *not* give you is cross-call atomicity: a `get`
+/// immediately followed by a `set` from the same caller is two separate
+/// locked operations, not one transaction, so another process's write can
+/// land in between them -- same as most simple key/value stores without
+/// an explicit read-modify-write or transaction API.
 pub struct World {
     root: PathBuf,
     axes: usize,
     world_dim: u32,
     chunk_cells: usize,
     schema: Schema,
-    cache: HashMap<ChunkKey, Chunk>,
-    dirty: HashSet<ChunkKey>,
-    cache_capacity: usize,
+    /// Number of chunk files this `World` has read since it was opened.
+    /// Counts operations, not distinct chunks -- touching the same chunk
+    /// twice counts twice, since nothing is cached between calls (see
+    /// `with_chunk`).
     pub chunks_read_from_disk: u64,
+    /// Number of chunk files this `World` has (over)written since it was
+    /// opened. Same counting caveat as `chunks_read_from_disk`: a cell
+    /// `set` four times in the same chunk, even in a row, is four writes.
     pub chunks_written_to_disk: u64,
 }
 
@@ -165,27 +199,13 @@ impl World {
         fs::create_dir_all(&root)?;
         let requested = WorldParams { axes, world_dim };
 
-        match WorldParams::read(&root)? {
-            Some(existing) if existing == requested => {}
-            Some(existing) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "world at {} already exists with axes={}, world_dim={} -- \
-                         create() was called with axes={axes}, world_dim={world_dim}",
-                        root.display(),
-                        existing.axes,
-                        existing.world_dim
-                    ),
-                ));
-            }
-            None => {
-                WorldParams::write(&root, requested)?;
-                crate::logger::info(format!(
-                    "created world at {} (axes={axes}, world_dim={world_dim})",
-                    root.display()
-                ));
-            }
+        // Atomic with respect to any other process doing the same thing at
+        // the same moment -- see `WorldParams::create_or_validate`.
+        if WorldParams::create_or_validate(&root, requested)? {
+            crate::logger::info(format!(
+                "created world at {} (axes={axes}, world_dim={world_dim})",
+                root.display()
+            ));
         }
         Self::open_inner(root, requested)
     }
@@ -225,9 +245,6 @@ impl World {
             world_dim: params.world_dim,
             chunk_cells: chunk::chunk_cells(params.axes),
             schema,
-            cache: HashMap::new(),
-            dirty: HashSet::new(),
-            cache_capacity: 256,
             chunks_read_from_disk: 0,
             chunks_written_to_disk: 0,
         })
@@ -288,87 +305,69 @@ impl World {
         Ok((ckey, local_idx))
     }
 
-    fn load_chunk(&mut self, ckey: &ChunkKey) -> io::Result<()> {
-        if self.cache.contains_key(ckey) {
-            return Ok(());
-        }
-        self.evict_if_needed()?;
+    fn chunk_lock_path(&self, ckey: &ChunkKey) -> PathBuf {
+        let mut p = self.chunk_path(ckey).into_os_string();
+        p.push(".lock");
+        PathBuf::from(p)
+    }
 
-        let path = self.chunk_path(ckey);
-        let chunk = if path.exists() {
-            let f = File::open(&path)?;
+    /// Runs `f` against chunk `ckey`'s *current* on-disk contents, having
+    /// first acquired `access` on that chunk's lock file -- shared for
+    /// `Access::Read`, exclusive for `Access::Write`. `f` gets a `Chunk`
+    /// freshly read from disk (or a fresh empty one, if the chunk has
+    /// never been written), and for `Access::Write` that chunk is written
+    /// straight back (or its file deleted, if `f` left it empty) before
+    /// the lock is released. This is the one place `World` touches a
+    /// chunk file, and it's the whole of `World`'s cross-process
+    /// concurrency story -- see the "Concurrency" section of `World`'s own
+    /// doc comment.
+    fn with_chunk<T>(
+        &mut self,
+        ckey: &ChunkKey,
+        access: Access,
+        f: impl FnOnce(&mut Chunk) -> T,
+    ) -> io::Result<T> {
+        let lock_path = self.chunk_lock_path(ckey);
+        fs::create_dir_all(lock_path.parent().unwrap())?;
+        let _lock = match access {
+            Access::Read => FileLock::shared(&lock_path)?,
+            Access::Write => FileLock::exclusive(&lock_path)?,
+        };
+
+        let chunk_path = self.chunk_path(ckey);
+        let mut chunk = if chunk_path.exists() {
+            let f = File::open(&chunk_path)?;
             let mut r = BufReader::new(f);
             self.chunks_read_from_disk += 1;
             Chunk::read_from(&mut r, self.chunk_cells)?
         } else {
             Chunk::new(self.chunk_cells)
         };
-        self.cache.insert(ckey.clone(), chunk);
-        Ok(())
+
+        let result = f(&mut chunk);
+
+        if access == Access::Write {
+            if chunk.is_empty() {
+                // Nothing left in this chunk (e.g. every cell was removed)
+                // -- don't leave a pointless empty file around.
+                let _ = fs::remove_file(&chunk_path);
+            } else {
+                let file = File::create(&chunk_path)?;
+                let mut w = BufWriter::new(file);
+                chunk.write_to(&mut w)?;
+                self.chunks_written_to_disk += 1;
+            }
+        }
+
+        Ok(result)
     }
 
-    /// Keeps the resident chunk cache bounded, which is what makes it fine to
-    /// address a 10,000^3 (1-trillion-cell) world from a process that only
-    /// ever holds a couple hundred chunks -- a few tens of MB -- in memory at
-    /// once. A real system would use LRU; this prototype evicts an arbitrary
-    /// clean entry (flushing first if it was dirty) to keep the mechanism
-    /// easy to follow.
-    fn evict_if_needed(&mut self) -> io::Result<()> {
-        if self.cache.len() < self.cache_capacity {
-            return Ok(());
-        }
-        let victim = self
-            .cache
-            .keys()
-            .find(|k| !self.dirty.contains(*k))
-            .cloned()
-            .or_else(|| self.cache.keys().next().cloned());
-        if let Some(k) = victim {
-            // Routine, not a problem: this is how the bounded cache stays
-            // bounded. Not WARN-level -- a world touching more chunks than
-            // fit in cache is the expected case, not an error condition.
-            crate::logger::info(format!(
-                "chunk cache at capacity ({}); evicting {k:?}",
-                self.cache_capacity
-            ));
-            self.flush_one(&k)?;
-            self.cache.remove(&k);
-        }
-        Ok(())
-    }
-
-    fn flush_one(&mut self, ckey: &ChunkKey) -> io::Result<()> {
-        if !self.dirty.remove(ckey) {
-            return Ok(());
-        }
-        let chunk = match self.cache.get(ckey) {
-            Some(c) => c,
-            None => return Ok(()),
-        };
-        let path = self.chunk_path(ckey);
-        if chunk.is_empty() {
-            // Nothing left in this chunk (e.g. every cell was removed) --
-            // don't leave a pointless empty file around.
-            let _ = fs::remove_file(&path);
-            return Ok(());
-        }
-        fs::create_dir_all(path.parent().unwrap())?;
-        let f = File::create(&path)?;
-        let mut w = BufWriter::new(f);
-        chunk.write_to(&mut w)?;
-        self.chunks_written_to_disk += 1;
-        Ok(())
-    }
-
-    /// Write every dirty chunk currently in the cache back to disk.
+    /// Every write this crate has ever made is already durable the moment
+    /// its call returns (see `with_chunk`) -- there's no dirty/cached
+    /// state left to flush. Kept as a no-op, rather than removed, so code
+    /// written against the version of this API that *did* batch writes
+    /// (this crate's own demo included) doesn't need to change.
     pub fn flush(&mut self) -> io::Result<()> {
-        let keys: Vec<_> = self.dirty.iter().cloned().collect();
-        if !keys.is_empty() {
-            crate::logger::info(format!("flushing {} dirty chunk(s)", keys.len()));
-        }
-        for k in keys {
-            self.flush_one(&k)?;
-        }
         Ok(())
     }
 
@@ -379,12 +378,10 @@ impl World {
         // this doubles as a request-validation boundary for callers (like
         // kdbserver) that pass through attacker-/user-supplied coordinates.
         let (ckey, local_idx) = self.split(coord)?;
-        let key_id = match self.schema.id_for_key(key) {
-            Some(id) => id,
-            None => return Ok(None), // this key has never been written anywhere in the world
+        let Some(key_id) = self.schema.id_for_key(key)? else {
+            return Ok(None); // this key has never been written anywhere in the world
         };
-        self.load_chunk(&ckey)?;
-        Ok(self.cache[&ckey].get(local_idx, key_id))
+        self.with_chunk(&ckey, Access::Read, |chunk| chunk.get(local_idx, key_id))
     }
 
     pub fn set(&mut self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
@@ -393,13 +390,9 @@ impl World {
         // key that was never actually written anywhere.
         let (ckey, local_idx) = self.split(coord)?;
         let key_id = self.schema.intern(key)?;
-        self.load_chunk(&ckey)?;
-        self.cache
-            .get_mut(&ckey)
-            .unwrap()
-            .set(local_idx, key_id, value);
-        self.dirty.insert(ckey);
-        Ok(())
+        self.with_chunk(&ckey, Access::Write, |chunk| {
+            chunk.set(local_idx, key_id, value)
+        })
     }
 
     pub fn remove(&mut self, coord: &[u32], key: &str) -> io::Result<()> {
@@ -407,36 +400,20 @@ impl World {
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
         let (ckey, local_idx) = self.split(coord)?;
-        let key_id = match self.schema.id_for_key(key) {
-            Some(id) => id,
-            None => {
-                // Distinct from "key exists but isn't set on this cell"
-                // (routine, logged as INFO below): this key has never been
-                // interned anywhere in the world, which more likely means a
-                // typo than a deliberate no-op.
-                crate::logger::warn(format!(
-                    "remove() called with unknown key '{key}' at {coord:?} -- no-op"
-                ));
-                return Ok(());
-            }
+        let Some(key_id) = self.schema.id_for_key(key)? else {
+            // Distinct from "key exists but isn't set on this cell"
+            // (routine, logged as INFO below): this key has never been
+            // interned anywhere in the world, which more likely means a
+            // typo than a deliberate no-op.
+            crate::logger::warn(format!(
+                "remove() called with unknown key '{key}' at {coord:?} -- no-op"
+            ));
+            return Ok(());
         };
-        self.remove_cell_at(ckey, local_idx, key_id)?;
+        self.with_chunk(&ckey, Access::Write, |chunk| {
+            chunk.remove(local_idx, key_id)
+        })?;
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
-        Ok(())
-    }
-
-    /// Core of `remove`/`remove_region`, without the per-call logging --
-    /// `remove_region` logs one summary line for the whole box instead of
-    /// one per cell.
-    fn remove_cell(&mut self, coord: &[u32], key_id: u32) -> io::Result<()> {
-        let (ckey, local_idx) = self.split(coord)?;
-        self.remove_cell_at(ckey, local_idx, key_id)
-    }
-
-    fn remove_cell_at(&mut self, ckey: ChunkKey, local_idx: usize, key_id: u32) -> io::Result<()> {
-        self.load_chunk(&ckey)?;
-        self.cache.get_mut(&ckey).unwrap().remove(local_idx, key_id);
-        self.dirty.insert(ckey);
         Ok(())
     }
 
@@ -487,9 +464,20 @@ impl World {
     /// is `RegionIter::new(region).nth(i)`.
     pub fn get_region(&mut self, region: &Region, key: &str) -> io::Result<Vec<Option<Value>>> {
         self.check_region(region)?;
-        let mut out = Vec::with_capacity(region.volume() as usize);
-        for coord in RegionIter::new(region) {
-            out.push(self.get(&coord, key)?);
+        let mut out = vec![None; region.volume() as usize];
+        let Some(key_id) = self.schema.id_for_key(key)? else {
+            return Ok(out); // never interned anywhere: every cell is None
+        };
+        for (ckey, cells) in self.group_region_by_chunk(region)? {
+            let values = self.with_chunk(&ckey, Access::Read, |chunk| {
+                cells
+                    .iter()
+                    .map(|&(i, local_idx)| (i, chunk.get(local_idx, key_id)))
+                    .collect::<Vec<_>>()
+            })?;
+            for (i, v) in values {
+                out[i] = v;
+            }
         }
         Ok(out)
     }
@@ -517,14 +505,12 @@ impl World {
             return Ok(());
         }
         let key_id = self.schema.intern(key)?;
-        for (coord, value) in RegionIter::new(region).zip(values) {
-            let (ckey, local_idx) = self.split(&coord)?;
-            self.load_chunk(&ckey)?;
-            self.cache
-                .get_mut(&ckey)
-                .unwrap()
-                .set(local_idx, key_id, value.clone());
-            self.dirty.insert(ckey);
+        for (ckey, cells) in self.group_region_by_chunk(region)? {
+            self.with_chunk(&ckey, Access::Write, |chunk| {
+                for (i, local_idx) in cells {
+                    chunk.set(local_idx, key_id, values[i].clone());
+                }
+            })?;
         }
         crate::logger::info(format!(
             "set region {region:?} key '{key}' from {volume} per-cell values"
@@ -542,17 +528,18 @@ impl World {
         if region.volume() == 0 {
             return Ok(());
         }
-        let key_id = match self.schema.id_for_key(key) {
-            Some(id) => id,
-            None => {
-                crate::logger::warn(format!(
-                    "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
-                ));
-                return Ok(());
-            }
+        let Some(key_id) = self.schema.id_for_key(key)? else {
+            crate::logger::warn(format!(
+                "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
+            ));
+            return Ok(());
         };
-        for coord in RegionIter::new(region) {
-            self.remove_cell(&coord, key_id)?;
+        for (ckey, cells) in self.group_region_by_chunk(region)? {
+            self.with_chunk(&ckey, Access::Write, |chunk| {
+                for (_, local_idx) in cells {
+                    chunk.remove(local_idx, key_id);
+                }
+            })?;
         }
         crate::logger::info(format!(
             "removed region {region:?} key '{key}' ({} cells)",
@@ -560,13 +547,25 @@ impl World {
         ));
         Ok(())
     }
-}
 
-impl Drop for World {
-    fn drop(&mut self) {
-        // Best-effort: make sure a `World` that goes out of scope without an
-        // explicit flush() doesn't silently lose writes.
-        let _ = self.flush();
+    /// Groups every coordinate in `region` by which chunk it falls in, so
+    /// `get_region`/`set_region`/`remove_region` touch (lock + read [+
+    /// write]) each chunk exactly once no matter how many of the region's
+    /// cells land in it, rather than once per cell -- an 8x8x8 region
+    /// wholly inside one chunk is one chunk touch, not 512. Each cell is
+    /// paired with its index in `RegionIter`/`get_region`-result order,
+    /// which callers need to scatter results back or pick the matching
+    /// input value.
+    fn group_region_by_chunk(
+        &self,
+        region: &Region,
+    ) -> io::Result<HashMap<ChunkKey, Vec<(usize, usize)>>> {
+        let mut by_chunk: HashMap<ChunkKey, Vec<(usize, usize)>> = HashMap::new();
+        for (i, coord) in RegionIter::new(region).enumerate() {
+            let (ckey, local_idx) = self.split(&coord)?;
+            by_chunk.entry(ckey).or_default().push((i, local_idx));
+        }
+        Ok(by_chunk)
     }
 }
 
@@ -574,6 +573,7 @@ impl Drop for World {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     /// A scratch directory under the OS temp dir, unique per test, removed
     /// when it goes out of scope.
@@ -1064,8 +1064,10 @@ mod tests {
         .unwrap();
         w.flush().unwrap();
 
-        // Reopen so the read exercises chunks freshly loaded from disk, not
-        // just what's still resident in cache.
+        // Reopen as a brand new `World` handle (nothing carries over
+        // in-process anymore -- every read already goes straight to disk,
+        // see `with_chunk`) to double-check a fresh handle sees exactly
+        // what was written, the same as a second process attaching would.
         let mut w = World::open(&dir).unwrap();
         let got = w.get_region(&region, "material").unwrap();
         assert_eq!(got.len(), region.volume() as usize);
@@ -1208,5 +1210,122 @@ mod tests {
         let mut w = World::open(&dir).unwrap();
         let got = w.get_region(&region, "material").unwrap();
         assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
+    }
+
+    // --- Concurrency: multiple independent `World` handles on one directory ---
+    //
+    // These open a separate `World::open` handle per thread rather than
+    // sharing one `World` across threads: the locking this crate relies on
+    // (`crate::lock::FileLock`) is OS-level, per open file description, so
+    // independent handles genuinely exercise the same cross-*process*
+    // exclusion multiple `kdbserver` instances would rely on -- not just
+    // "was `&mut World` enforced", which the type system already
+    // guarantees for free and wouldn't be testing anything.
+
+    #[test]
+    fn concurrent_writers_to_sibling_keys_on_the_same_cell_do_not_lose_updates() {
+        let dir = TempDir::new("concurrent-siblings");
+        World::create(&dir, AXES, WORLD_DIM).unwrap();
+        let c = coord3(1, 1, 1);
+        let n = 16;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = PathBuf::from(dir.as_ref());
+                let c = c.clone();
+                thread::spawn(move || {
+                    let mut w = World::open(&path).unwrap();
+                    w.set(&c, &format!("key{i}"), Value::I64(i)).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut w = World::open(&dir).unwrap();
+        for i in 0..n {
+            assert_eq!(
+                w.get(&c, &format!("key{i}")).unwrap(),
+                Some(Value::I64(i)),
+                "key{i} lost -- a concurrent writer's chunk rewrite clobbered it"
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_interning_of_different_new_keys_does_not_collide() {
+        // Regression: Schema::intern used to compute a new key's id from
+        // its own in-memory count without ever re-checking schema.txt, so
+        // two processes interning two different new keys at once could
+        // both assign the same id -- corrupting schema.txt (a
+        // non-dense/out-of-order id sequence) badly enough that even
+        // *reopening* the world later would panic.
+        let dir = TempDir::new("concurrent-intern");
+        World::create(&dir, AXES, WORLD_DIM).unwrap();
+        let n = 16;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let path = PathBuf::from(dir.as_ref());
+                thread::spawn(move || {
+                    let mut w = World::open(&path).unwrap();
+                    w.set(&coord3(0, 0, 0), &format!("key{i}"), Value::I64(i))
+                        .unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // Reopening must not panic (the dense/in-order id invariant must
+        // still hold), and every key must have made it in with its own
+        // distinct id -- if two keys had collided on one id, at least one
+        // of these reads would come back wrong (a different key's value,
+        // or a type mismatch panic in Chunk::set from two different
+        // value types sharing a column).
+        let mut w = World::open(&dir).unwrap();
+        assert_eq!(w.schema_len(), n as usize);
+        for i in 0..n {
+            assert_eq!(
+                w.get(&coord3(0, 0, 0), &format!("key{i}")).unwrap(),
+                Some(Value::I64(i))
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_set_region_on_overlapping_regions_does_not_corrupt_a_chunk() {
+        let dir = TempDir::new("concurrent-overlapping-regions");
+        World::create(&dir, AXES, WORLD_DIM).unwrap();
+
+        // Same box, different keys: both threads' writes land fully in the
+        // same set of chunks, at the same time, under different keys --
+        // this is what would surface a chunk-file torn write/lost update
+        // if with_chunk's lock+read+write weren't actually atomic.
+        let region = Region::new(coord3(0, 0, 0), coord3(10, 10, 10));
+
+        let handles: Vec<_> = ["a", "b"]
+            .into_iter()
+            .map(|key| {
+                let path = PathBuf::from(dir.as_ref());
+                let region = region.clone();
+                let values = fill(&region, Value::Str(key.into()));
+                thread::spawn(move || {
+                    let mut w = World::open(&path).unwrap();
+                    w.set_region(&region, key, &values).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let mut w = World::open(&dir).unwrap();
+        let a = w.get_region(&region, "a").unwrap();
+        let b = w.get_region(&region, "b").unwrap();
+        assert!(a.iter().all(|v| *v == Some(Value::Str("a".into()))));
+        assert!(b.iter().all(|v| *v == Some(Value::Str("b".into()))));
     }
 }

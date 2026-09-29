@@ -1,3 +1,4 @@
+use crate::lock::FileLock;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -5,10 +6,11 @@ use std::path::{Path, PathBuf};
 /// The two numbers that fix a world's shape for its entire lifetime: how
 /// many axes it has, and how many cells wide each axis is. Persisted as
 /// `world.txt` at the world root (`axes\t<n>\nworld_dim\t<n>\n`), written
-/// once by `World::create` and never rewritten, so reopening a world --
-/// or accidentally `create`-ing a second one in the same directory with
-/// different numbers -- can't silently change its shape out from under
-/// data already on disk.
+/// once by `World::create` (via `create_or_validate`) and never rewritten,
+/// so reopening a world -- or a second process `create`-ing one in the
+/// same directory with different numbers, possibly at the very same
+/// moment -- can't silently change its shape out from under data already
+/// on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldParams {
     pub axes: usize,
@@ -20,9 +22,30 @@ impl WorldParams {
         world_root.join("world.txt")
     }
 
+    /// A sidecar lock file, deliberately *not* `world.txt` itself:
+    /// `read_locked`/`create_or_validate` need to tell "no world here yet"
+    /// apart from "world.txt exists but is empty/corrupt", and
+    /// `FileLock::exclusive`/`shared` create the path they're given if
+    /// it's missing -- locking `world.txt` directly would blur that
+    /// distinction by conjuring an empty `world.txt` into existence just
+    /// from taking the lock.
+    fn lock_path(world_root: &Path) -> PathBuf {
+        world_root.join("world.txt.lock")
+    }
+
     /// Reads `world.txt` at `world_root`, or `None` if this directory has
-    /// no world yet.
+    /// no world yet. Takes a shared lock first, so this can never observe
+    /// a `world.txt` another process's `create_or_validate` is mid-way
+    /// through writing.
     pub fn read(world_root: &Path) -> io::Result<Option<Self>> {
+        let _lock = FileLock::shared(&Self::lock_path(world_root))?;
+        Self::read_locked(world_root)
+    }
+
+    /// Core of `read`, minus the locking -- callers that already hold
+    /// *some* lock on `lock_path` (shared or exclusive) call this
+    /// directly instead of taking a second, redundant one.
+    fn read_locked(world_root: &Path) -> io::Result<Option<Self>> {
         let path = Self::path(world_root);
         if !path.exists() {
             return Ok(None);
@@ -62,14 +85,42 @@ impl WorldParams {
         Ok(Some(WorldParams { axes, world_dim }))
     }
 
-    /// Writes `world.txt` at `world_root`. Only ever called once per world,
-    /// by `World::create` the first time it sees a directory with no
-    /// existing `world.txt`.
-    pub fn write(world_root: &Path, params: WorldParams) -> io::Result<()> {
-        fs::write(
-            Self::path(world_root),
-            format!("axes\t{}\nworld_dim\t{}\n", params.axes, params.world_dim),
-        )
+    /// The one operation `World::create` needs: if `world_root` has no
+    /// world yet, creates it with `requested` and returns `true`; if it
+    /// already has one, `requested` must match it exactly (returning
+    /// `false`) or this errors. The whole check-then-maybe-write sequence
+    /// runs under one exclusive lock, so two processes racing to create
+    /// the very same fresh directory -- possibly with *different* numbers
+    /// -- can't both "win": the second one to actually run sees what the
+    /// first one wrote and is validated against it like any other
+    /// pre-existing world.
+    pub fn create_or_validate(world_root: &Path, requested: WorldParams) -> io::Result<bool> {
+        let _lock = FileLock::exclusive(&Self::lock_path(world_root))?;
+        match Self::read_locked(world_root)? {
+            Some(existing) if existing == requested => Ok(false),
+            Some(existing) => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "world at {} already exists with axes={}, world_dim={} -- requested \
+                     axes={}, world_dim={}",
+                    world_root.display(),
+                    existing.axes,
+                    existing.world_dim,
+                    requested.axes,
+                    requested.world_dim
+                ),
+            )),
+            None => {
+                fs::write(
+                    Self::path(world_root),
+                    format!(
+                        "axes\t{}\nworld_dim\t{}\n",
+                        requested.axes, requested.world_dim
+                    ),
+                )?;
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -84,6 +135,7 @@ fn corrupt(path: &Path, why: &str) -> io::Error {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread;
 
     struct TempDir(PathBuf);
 
@@ -111,14 +163,51 @@ mod tests {
     }
 
     #[test]
-    fn write_then_read_roundtrips() {
+    fn create_or_validate_then_read_roundtrips() {
         let dir = TempDir::new("roundtrip");
         let params = WorldParams {
             axes: 4,
             world_dim: 777,
         };
-        WorldParams::write(&dir.0, params).unwrap();
+        assert!(
+            WorldParams::create_or_validate(&dir.0, params).unwrap(),
+            "first call must report a fresh creation"
+        );
         assert_eq!(WorldParams::read(&dir.0).unwrap(), Some(params));
+    }
+
+    #[test]
+    fn create_or_validate_is_idempotent_with_matching_params() {
+        let dir = TempDir::new("idempotent");
+        let params = WorldParams {
+            axes: 3,
+            world_dim: 100,
+        };
+        assert!(WorldParams::create_or_validate(&dir.0, params).unwrap());
+        assert!(
+            !WorldParams::create_or_validate(&dir.0, params).unwrap(),
+            "second call with the same params must report no new creation"
+        );
+    }
+
+    #[test]
+    fn create_or_validate_rejects_mismatched_params() {
+        let dir = TempDir::new("mismatch");
+        let original = WorldParams {
+            axes: 3,
+            world_dim: 100,
+        };
+        WorldParams::create_or_validate(&dir.0, original).unwrap();
+
+        let different = WorldParams {
+            axes: 4,
+            world_dim: 100,
+        };
+        let err = WorldParams::create_or_validate(&dir.0, different).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // Untouched: still reads back as the original.
+        assert_eq!(WorldParams::read(&dir.0).unwrap(), Some(original));
     }
 
     #[test]
@@ -135,5 +224,35 @@ mod tests {
         fs::write(dir.0.join("world.txt"), "axes\t3\n").unwrap(); // missing world_dim
         let err = WorldParams::read(&dir.0).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn concurrent_create_or_validate_with_the_same_params_creates_exactly_once() {
+        // Regression: World::create used to check "does world.txt exist"
+        // then, separately, write it -- a classic TOCTOU race between two
+        // processes doing this at once. Here, many threads race to
+        // create_or_validate the same fresh directory with identical
+        // params; exactly one may report having created it, the rest must
+        // see it as already-existing-and-matching, and none may error.
+        let dir = TempDir::new("concurrent-create");
+        let params = WorldParams {
+            axes: 3,
+            world_dim: 50,
+        };
+
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let path = dir.0.clone();
+                thread::spawn(move || WorldParams::create_or_validate(&path, params).unwrap())
+            })
+            .collect();
+
+        let results: Vec<bool> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(
+            results.iter().filter(|&&created| created).count(),
+            1,
+            "exactly one racer should have created the world; results were {results:?}"
+        );
+        assert_eq!(WorldParams::read(&dir.0).unwrap(), Some(params));
     }
 }

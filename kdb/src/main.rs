@@ -113,12 +113,12 @@ fn run() -> io::Result<()> {
 
     println!("wrote {n} cells (4 keys each, 1-in-50 also get a 5th) in {write_elapsed:?}");
     println!(
-        "chunk files written: {}  |  distinct keys interned: {}",
+        "chunk file writes: {}  |  distinct keys interned: {}",
         w.chunks_written_to_disk,
         w.schema_len()
     );
     logger::info(format!(
-        "wrote {n} cells in {write_elapsed:?} ({} chunk files written, {} keys interned)",
+        "wrote {n} cells in {write_elapsed:?} ({} chunk file writes, {} keys interned)",
         w.chunks_written_to_disk,
         w.schema_len()
     ));
