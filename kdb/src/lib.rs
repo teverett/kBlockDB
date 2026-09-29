@@ -21,4 +21,4 @@ pub mod world;
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::Value;
-pub use world::{Region, World, AXES, DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM};
+pub use world::{Region, Stats, World, AXES, DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM};

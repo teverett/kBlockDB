@@ -18,6 +18,8 @@ fn next_port() -> u64 {
     NEXT_PORT.fetch_add(1, Ordering::Relaxed)
 }
 
+const TEST_ADMIN_PASSWORD: &str = "kdbperf-test-admin-password";
+
 fn temp_data_dir(tag: &str) -> PathBuf {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -37,7 +39,19 @@ async fn spawn_test_server(dir: &std::path::Path) -> Option<ManagedServer> {
         );
         return None;
     }
-    Some(ManagedServer::spawn(&bin, dir, &format!("127.0.0.1:{}", next_port())).await)
+    Some(
+        ManagedServer::spawn(
+            &bin,
+            dir,
+            &format!("127.0.0.1:{}", next_port()),
+            TEST_ADMIN_PASSWORD,
+        )
+        .await,
+    )
+}
+
+fn test_client(server: &ManagedServer) -> Client {
+    Client::new(server.url.clone(), "admin", TEST_ADMIN_PASSWORD)
 }
 
 #[tokio::test]
@@ -47,7 +61,7 @@ async fn set_cell_scenario_runs_against_a_real_server_with_no_errors() {
         return;
     };
 
-    let client = Client::new(server.url.clone());
+    let client = test_client(&server);
     let health = client.health().await.expect("health check failed");
     assert_eq!(health.axes, kdb_default_axes());
 
@@ -65,7 +79,7 @@ async fn get_and_remove_cell_scenarios_populate_their_own_data() {
     let Some(server) = spawn_test_server(&dir).await else {
         return;
     };
-    let client = Client::new(server.url.clone());
+    let client = test_client(&server);
     let health = client.health().await.unwrap();
 
     // These scenarios must work even though nothing was set beforehand --
@@ -87,7 +101,7 @@ async fn region_sweep_scenario_runs_with_no_errors() {
     let Some(server) = spawn_test_server(&dir).await else {
         return;
     };
-    let client = Client::new(server.url.clone());
+    let client = test_client(&server);
     let health = client.health().await.unwrap();
 
     let results = scenarios::region_sweep(&client, health.axes, &[2, 4], 2).await;
@@ -106,7 +120,7 @@ async fn concurrency_scan_scenario_runs_concurrently_with_no_errors() {
     let Some(server) = spawn_test_server(&dir).await else {
         return;
     };
-    let client = Client::new(server.url.clone());
+    let client = test_client(&server);
     let health = client.health().await.unwrap();
 
     let results =
@@ -128,12 +142,15 @@ async fn multi_instance_scenario_runs_against_two_servers_sharing_one_data_dir()
         return;
     };
     let bin = default_kdbserver_bin();
-    let server_b = ManagedServer::spawn(&bin, &dir, &format!("127.0.0.1:{}", next_port())).await;
+    let server_b = ManagedServer::spawn(
+        &bin,
+        &dir,
+        &format!("127.0.0.1:{}", next_port()),
+        TEST_ADMIN_PASSWORD,
+    )
+    .await;
 
-    let clients = vec![
-        Client::new(server_a.url.clone()),
-        Client::new(server_b.url.clone()),
-    ];
+    let clients = vec![test_client(&server_a), test_client(&server_b)];
     let health = clients[0].health().await.unwrap();
 
     let result = scenarios::multi_instance(&clients, health.axes, health.world_dim, 8, 5).await;

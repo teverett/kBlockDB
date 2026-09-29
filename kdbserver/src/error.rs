@@ -23,6 +23,12 @@ pub enum ApiError {
     /// that the caller couldn't have prevented by sending a different
     /// request.
     Internal(String),
+    /// No credentials, or credentials that don't match any configured
+    /// account. See `auth.rs`.
+    Unauthorized(String),
+    /// Valid credentials, but for a read-only account attempting a write.
+    /// See `auth.rs`.
+    Forbidden(String),
 }
 
 impl From<io::Error> for ApiError {
@@ -41,6 +47,8 @@ impl IntoResponse for ApiError {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
+            ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
+            ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         };
         (status, Json(json!({ "error": message }))).into_response()
     }

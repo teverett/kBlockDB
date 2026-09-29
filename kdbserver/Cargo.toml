@@ -15,9 +15,11 @@ path = "src/main.rs"
 [dependencies]
 kdb = { path = "../kdb" }
 axum = "0.7"
+axum-extra = { version = "0.9", features = ["typed-header"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+toml = "0.8"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

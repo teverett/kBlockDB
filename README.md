@@ -225,7 +225,9 @@ packed value array. That costs two different things:
   library other code (like `kdbserver`) calls with unvalidated/
   attacker-controlled input, so a malformed coordinate is always rejected
   the same way rather than sometimes being silently absorbed by an
-  unrelated short-circuit.
+  unrelated short-circuit. Also `stats()` -- a live filesystem walk
+  totaling chunk count, size, and disk-block usage into a `Stats`, which
+  `kdbserver` exposes as `/stats`.
 - `kdb/src/logger.rs` -- minimal dependency-free logger, appends to
   `kdb.log` in the working directory.
 - `kdb/src/main.rs`   -- demo/benchmark driver (the `kdb` binary).
@@ -239,11 +241,20 @@ cargo build --release
 cargo run -p kdbserver -- --data-dir ./data --addr 127.0.0.1:8080
 ```
 
+A default `kdbserver.toml` (admin/`changeme`, see below) is checked in at
+the repo root so this works out of the box -- **change `admin_password`
+before running this anywhere reachable by anyone you don't trust.**
+
 ```
 USAGE:
     kdbserver [OPTIONS]
 
 OPTIONS:
+    --config <path>                Config file (default: ./kdbserver.toml). Required --
+                                    holds admin_password and, optionally, [[users]], plus
+                                    optional addr/data_dir/axes/world_dim/
+                                    max_concurrent_disk_ops (each overridden by the
+                                    matching CLI flag below, if given)
     --data-dir <path>              World data directory (default: ./data)
     --axes <n>                     Axis count for a brand-new world (default: 3)
     --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
@@ -265,7 +276,46 @@ and write concurrently without corrupting anything. `kdb` itself is what
 makes that safe (see its "Concurrency" section above); this server doesn't
 need to know or do anything special.
 
+### Config file
+
+`--config` (default `./kdbserver.toml`) is TOML and is required to start
+the server -- it's the only place credentials can come from (never a CLI
+flag, so they don't end up in shell history or `ps` output):
+
+```toml
+addr = "127.0.0.1:8080"      # optional; same defaults/precedence as the CLI flags
+data_dir = "./data"          # optional
+axes = 3                     # optional
+world_dim = 10000            # optional
+max_concurrent_disk_ops = 32 # optional
+admin_password = "change-me" # required
+
+[[users]]
+username = "alice"
+password = "alice-password"
+
+[[users]]
+username = "viewer"
+password = "viewer-password"
+read_only = true              # optional, defaults to false
+```
+
+`admin_password` and each `[[users]]` entry are separate accounts.
+`admin` is a reserved username (it can't also appear in `[[users]]`),
+usernames must be unique, and no password may be empty. A `[[users]]`
+entry defaults to full read/write access, same as `admin`; set
+`read_only = true` to limit it to `GET` (see below).
+
 ### REST API
+
+Every endpoint below except `/health` requires **HTTP Basic Auth** against
+one of the config file's accounts (`admin`/`admin_password`, or a
+`[[users]]` entry) -- a request with no `Authorization` header, an unknown
+username, or the wrong password gets `401`. A `read_only` account gets
+`403` on anything but `GET` (`PUT`/`DELETE` are writes). `/health` is left
+open so load balancers/orchestrators can poll liveness without
+credentials; it exposes nothing more sensitive than the world's shape and
+this server's clock.
 
 Every coordinate, and every region origin/extent, is a comma-separated
 list of `u32`s in the URL, one per axis (`1,2,3` for a 3-axis world) --
@@ -282,13 +332,28 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/health` | | `200` `{"status":"ok","axes":3,"world_dim":10000}` |
+| `GET` | `/health` | | `200` `{"status":"ok","axes":3,"world_dim":10000,"timestamp":1735689600}` |
 | `GET` | `/cells/{coords}/{key}` | | `200 {"value": <value>}`, or `404` if unset |
 | `PUT` | `/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/cells/{coords}/{key}` | | `204` |
 | `GET` | `/regions/{origin}/{extent}/{key}` | | `200 {"values": [<value or null>, ...]}` |
 | `PUT` | `/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
 | `DELETE` | `/regions/{origin}/{extent}/{key}` | | `204` |
+| `GET` | `/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
+
+`/stats` walks the on-disk chunk files under `--data-dir` and reports:
+`total_chunks` (chunk files currently on disk -- see `kdb`'s "Layout on
+disk" doc comment, a chunk with no cells set in it is never written and an
+emptied one is deleted, not left behind empty), `total_bytes` (their
+combined size), and `total_blocks` (their combined actual disk-block
+allocation -- smaller than `total_bytes / 512` for chunks with large
+never-written, and so sparse, regions; on Windows this is instead
+`total_bytes` rounded up to whole 512-byte blocks, an upper bound rather
+than a real sparse-file measurement). It's a live filesystem walk each
+call, not a running counter, so it costs time proportional to how many
+chunks currently exist. Like the cell/region endpoints (and unlike
+`/health`), it requires auth, but being a `GET` it's available to
+`read_only` accounts too.
 
 Region `values` arrays are in axis-0-fastest order (matching
 `kdb::World::get_region`/`set_region`): index `i` is offset
@@ -299,40 +364,50 @@ to a region must supply exactly one value per cell (`extent[0] * extent[1]
 Errors are `{"error": "<message>"}`, with the status code reflecting the
 cause: `400` for a malformed/out-of-range coordinate, a region whose axis
 count doesn't match the world's, or a `values` array of the wrong length
-(all of these are `kdb`'s own validation surfacing through); `404` for a
-`GET` that found nothing; `500` for anything on the server's side (disk
-I/O, ...).
+(all of these are `kdb`'s own validation surfacing through); `401` for
+missing/invalid credentials; `403` for a `read_only` account attempting a
+write; `404` for a `GET` that found nothing; `500` for anything on the
+server's side (disk I/O, ...).
 
 ```sh
 # set a cell
-curl -X PUT localhost:8080/cells/1,2,3/material \
+curl -u admin:change-me -X PUT localhost:8080/cells/1,2,3/material \
   -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
 
 # read it back
-curl localhost:8080/cells/1,2,3/material
+curl -u admin:change-me localhost:8080/cells/1,2,3/material
 # {"value":{"type":"str","value":"stone"}}
 
 # fill an 8x8x8 region with distinct per-cell values (512 of them, omitted here)
-curl -X PUT localhost:8080/regions/0,0,0/8,8,8/material \
+curl -u admin:change-me -X PUT localhost:8080/regions/0,0,0/8,8,8/material \
   -H 'content-type: application/json' -d '{"values":[...]}'
 
 # read the whole region back
-curl localhost:8080/regions/0,0,0/8,8,8/material
+curl -u admin:change-me localhost:8080/regions/0,0,0/8,8,8/material
 
 # clear a cell / a region
-curl -X DELETE localhost:8080/cells/1,2,3/material
-curl -X DELETE localhost:8080/regions/0,0,0/8,8,8/material
+curl -u admin:change-me -X DELETE localhost:8080/cells/1,2,3/material
+curl -u admin:change-me -X DELETE localhost:8080/regions/0,0,0/8,8,8/material
+
+# on-disk stats
+curl -u admin:change-me localhost:8080/stats
+# {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
 ### Layout
 
-- `kdbserver/src/main.rs`       -- CLI arg parsing, opens the world, starts
-  the server (with graceful shutdown on Ctrl+C).
+- `kdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
+  opens the world, starts the server (with graceful shutdown on Ctrl+C).
+- `kdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
+  (addr/data_dir/axes/world_dim/max_concurrent_disk_ops, admin_password,
+  `[[users]]`) and its validation.
+- `kdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
+  to every route except `/health`, including the `read_only` write check.
 - `kdbserver/src/routes.rs`     -- the router and all HTTP handlers.
 - `kdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
-  `World`) and `with_world`, which runs each `World` call on a
-  `spawn_blocking` thread so `World`'s synchronous file I/O never blocks
-  the async runtime.
+  `World`, plus the configured accounts) and `with_world`, which runs each
+  `World` call on a `spawn_blocking` thread so `World`'s synchronous file
+  I/O never blocks the async runtime.
 - `kdbserver/src/value_json.rs` -- `ValueJson`, the JSON wire format for
   `kdb::Value` (kept in this crate, not `kdb`, since `kdb` itself doesn't
   depend on `serde`).
@@ -360,8 +435,18 @@ cargo build --workspace --release
 ./target/release/kdbperf                       # spawns its own instance(s), runs every scenario
 ./target/release/kdbperf --scenario set_cell    # just one scenario
 ./target/release/kdbperf --json > results.json  # machine-readable output
-./target/release/kdbperf --url http://localhost:8080   # target an already-running instance instead
+
+# target an already-running instance instead (its REST API requires login --
+# see kdbserver's config file above -- so --password is required here)
+./target/release/kdbperf --url http://localhost:8080 --user admin --password change-me
 ```
+
+When it spawns its own instance(s), kdbperf writes each one a minimal
+config file itself (`admin_password` only) and authenticates as `admin`
+automatically -- `--user`/`--password` only matter with `--url`, against a
+server whose config you don't control. Pass `--password` to pin the
+generated instances' password too (e.g. to `curl` one mid-run); otherwise
+it's a random one-off.
 
 Run `--help` for the full flag list (concurrency levels, op counts, region
 sizes, instance count, etc.) -- everything has a default chosen to finish a

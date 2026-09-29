@@ -1,0 +1,19 @@
+version: 2
+updates:
+  # kdb/kdbserver/kdbperf are one Cargo workspace rooted here -- Dependabot
+  # resolves all three members' Cargo.toml files from this one entry.
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    groups:
+      cargo-dependencies:
+        patterns:
+          - "*"
+
+  # Keeps the actions pinned in ci.yml (actions/checkout, dtolnay/rust-toolchain,
+  # Swatinem/rust-cache) current too.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

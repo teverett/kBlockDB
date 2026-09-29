@@ -194,6 +194,27 @@ impl Iterator for RegionIter {
 /// one `Mutex<World>`, which meant one slow request -- or just a lot of
 /// concurrent ones -- stalled every other request in that process
 /// regardless of whether they touched the same chunk at all.
+/// Aggregate on-disk statistics for a world's data, as of whenever
+/// `World::stats` was called -- a live snapshot, not tracked incrementally,
+/// so it reflects concurrent writers too (see `World::stats`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Stats {
+    /// Number of `.chunk` files on disk, i.e. how many chunks currently
+    /// hold at least one cell (an emptied chunk's file is deleted, not
+    /// left behind empty -- see `with_chunk`).
+    pub total_chunks: u64,
+    /// Sum of those files' sizes, in bytes.
+    pub total_bytes: u64,
+    /// Sum of those files' actual on-disk allocation, in 512-byte blocks
+    /// (`stat(2)`'s `st_blocks`) -- can be smaller than `total_bytes / 512`
+    /// for chunks with sparse (never-written) regions, which is most of
+    /// them in a large, mostly-empty world (see `World`'s "Layout on disk"
+    /// doc comment). Platforms without that metadata (Windows) fall back
+    /// to `total_bytes` rounded up to whole 512-byte blocks -- an upper
+    /// bound, not a real sparse-file measurement, on those platforms.
+    pub total_blocks: u64,
+}
+
 pub struct World {
     root: PathBuf,
     axes: usize,
@@ -360,6 +381,20 @@ impl World {
 
     pub fn schema_len(&self) -> usize {
         self.schema().len()
+    }
+
+    /// Walks every chunk file on disk under `root` and totals their count,
+    /// size, and disk-block usage into a [`Stats`]. A live filesystem walk,
+    /// not a running total -- proportional in cost to how many chunks
+    /// currently exist, not to the world's nominal size -- so it reflects
+    /// whatever's on disk *right now*, including concurrent writers'
+    /// chunks appearing or (once emptied) disappearing mid-walk; such a
+    /// chunk is counted or not on a best-effort basis rather than causing
+    /// this to fail.
+    pub fn stats(&self) -> io::Result<Stats> {
+        let mut stats = Stats::default();
+        accumulate_chunk_stats(&self.root, &mut stats)?;
+        Ok(stats)
     }
 
     fn chunk_path(&self, ckey: &ChunkKey) -> PathBuf {
@@ -671,6 +706,60 @@ impl World {
         }
         Ok(by_chunk)
     }
+}
+
+/// Recursively walks `dir` (a world's `root`, or one of its nested
+/// per-axis subdirectories -- see `World`'s "Layout on disk" doc comment)
+/// and folds every `.chunk` file it finds into `stats`. Tolerates a
+/// directory or file vanishing between being listed and being stat'd (a
+/// concurrent writer emptying and deleting a chunk) by simply skipping it,
+/// rather than failing the whole walk over a single-chunk race -- see
+/// `World::stats`.
+fn accumulate_chunk_stats(dir: &Path, stats: &mut Stats) -> io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        if file_type.is_dir() {
+            accumulate_chunk_stats(&entry.path(), stats)?;
+            continue;
+        }
+        // Excludes `<...>.chunk.lock` files (whose extension is `lock`,
+        // not `chunk`) and `world.txt`/`schema.txt` (directly under
+        // `root`, so never seen here as anything but a sibling to walk
+        // past) without needing to name any of them explicitly.
+        if entry.path().extension().is_none_or(|ext| ext != "chunk") {
+            continue;
+        }
+        let metadata = match entry.metadata() {
+            Ok(metadata) => metadata,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        stats.total_chunks += 1;
+        stats.total_bytes += metadata.len();
+        stats.total_blocks += disk_blocks(&metadata);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn disk_blocks(metadata: &std::fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    metadata.blocks()
+}
+
+#[cfg(not(unix))]
+fn disk_blocks(metadata: &std::fs::Metadata) -> u64 {
+    metadata.len().div_ceil(512)
 }
 
 #[cfg(test)]
@@ -1602,5 +1691,63 @@ mod tests {
             "serial (cap=1, {serial:?}) should be slower than parallel (cap={workers}, \
              {parallel:?}) -- the cap doesn't seem to be limiting anything"
         );
+    }
+
+    #[test]
+    fn stats_of_an_untouched_world_are_all_zero() {
+        let dir = TempDir::new("stats-empty");
+        let w = create(&dir);
+        assert_eq!(w.stats().unwrap(), Stats::default());
+    }
+
+    #[test]
+    fn stats_count_one_chunk_per_touched_chunk_not_per_cell() {
+        let dir = TempDir::new("stats-one-chunk");
+        let w = create(&dir);
+        // All within CHUNK_DIM (32) of each other, and of (0,0,0) -- same
+        // one chunk, whether one cell or many are set in it.
+        w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
+        w.set(&coord3(1, 2, 3), "k", Value::I64(2)).unwrap();
+        w.set(&coord3(0, 0, 0), "other", Value::I64(3)).unwrap();
+
+        let stats = w.stats().unwrap();
+        assert_eq!(stats.total_chunks, 1);
+        assert!(stats.total_bytes > 0);
+        assert!(stats.total_blocks > 0);
+    }
+
+    #[test]
+    fn stats_count_distinct_chunks_across_far_apart_cells() {
+        let dir = TempDir::new("stats-many-chunks");
+        let w = create(&dir);
+        // Each at least CHUNK_DIM (32) apart on every axis -- three
+        // distinct chunks.
+        w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
+        w.set(&coord3(100, 0, 0), "k", Value::I64(2)).unwrap();
+        w.set(&coord3(0, 100, 0), "k", Value::I64(3)).unwrap();
+
+        assert_eq!(w.stats().unwrap().total_chunks, 3);
+    }
+
+    #[test]
+    fn stats_reflect_a_chunk_emptied_back_out() {
+        let dir = TempDir::new("stats-emptied");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
+        assert_eq!(w.stats().unwrap().total_chunks, 1);
+
+        w.remove(&coord3(0, 0, 0), "k").unwrap();
+        assert_eq!(w.stats().unwrap(), Stats::default());
+    }
+
+    #[test]
+    fn stats_ignore_world_txt_and_schema_txt() {
+        let dir = TempDir::new("stats-ignores-metadata-files");
+        let w = create(&dir);
+        // world.txt and schema.txt both exist directly under root by now
+        // (schema.txt from interning "k" below) -- neither should be
+        // mistaken for a chunk file.
+        w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
+        assert_eq!(w.stats().unwrap().total_chunks, 1);
     }
 }

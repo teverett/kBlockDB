@@ -14,6 +14,8 @@ use std::time::{Duration, Instant};
 pub struct Client {
     http: reqwest::Client,
     base_url: String,
+    username: String,
+    password: String,
 }
 
 /// The outcome of one timed HTTP call.
@@ -30,10 +32,19 @@ pub struct HealthInfo {
 }
 
 impl Client {
-    pub fn new(base_url: impl Into<String>) -> Client {
+    /// `username`/`password` authenticate every call below except
+    /// `health()` -- kdbserver's REST API requires HTTP Basic Auth on
+    /// everything but `/health` (see kdbserver's `routes.rs`).
+    pub fn new(
+        base_url: impl Into<String>,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> Client {
         Client {
             http: reqwest::Client::new(),
             base_url: base_url.into(),
+            username: username.into(),
+            password: password.into(),
         }
     }
 
@@ -69,6 +80,7 @@ impl Client {
         let ok = self
             .http
             .put(url)
+            .basic_auth(&self.username, Some(&self.password))
             .json(&body)
             .send()
             .await
@@ -85,6 +97,7 @@ impl Client {
         let ok = self
             .http
             .get(url)
+            .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
@@ -100,6 +113,7 @@ impl Client {
         let ok = self
             .http
             .delete(url)
+            .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());
@@ -129,6 +143,7 @@ impl Client {
         let ok = self
             .http
             .put(url)
+            .basic_auth(&self.username, Some(&self.password))
             .json(&body)
             .send()
             .await
@@ -150,6 +165,7 @@ impl Client {
         let ok = self
             .http
             .get(url)
+            .basic_auth(&self.username, Some(&self.password))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success());

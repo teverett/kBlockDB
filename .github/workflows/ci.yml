@@ -50,7 +50,11 @@ jobs:
       - name: Run kdbserver (smoke test)
         run: |
           rm -rf "$RUNNER_TEMP/kdbserver_ci_data"
-          ./target/debug/kdbserver --data-dir "$RUNNER_TEMP/kdbserver_ci_data" --addr 127.0.0.1:8099 &
+          cat > "$RUNNER_TEMP/kdbserver_ci_config.toml" <<'EOF'
+          admin_password = "ci-smoke-test-password"
+          EOF
+          ./target/debug/kdbserver --data-dir "$RUNNER_TEMP/kdbserver_ci_data" --addr 127.0.0.1:8099 \
+            --config "$RUNNER_TEMP/kdbserver_ci_config.toml" &
           server_pid=$!
 
           ready=0
@@ -69,9 +73,9 @@ jobs:
 
           curl -sf http://127.0.0.1:8099/health
           echo
-          curl -sf -X PUT http://127.0.0.1:8099/cells/1,2,3/material \
+          curl -sf -u admin:ci-smoke-test-password -X PUT http://127.0.0.1:8099/cells/1,2,3/material \
             -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
-          curl -sf http://127.0.0.1:8099/cells/1,2,3/material
+          curl -sf -u admin:ci-smoke-test-password http://127.0.0.1:8099/cells/1,2,3/material
           echo
 
           kill "$server_pid"

@@ -1,26 +1,34 @@
 //! The REST API surface: two resources, `/cells/...` (a single cell) and
 //! `/regions/...` (an axis-aligned box of cells), each with GET (read),
-//! PUT (write) and DELETE (remove) -- plus `/health`.
+//! PUT (write) and DELETE (remove) -- plus read-only `/stats` and
+//! `/health`.
 //!
 //! Coordinates and region origin/extent are comma-separated path segments
 //! (`/cells/1,2,3/material`, `/regions/0,0,0/8,8,8/material`), matching
 //! however many axes the world was created with -- there's nothing
 //! 3-axis-specific here, same as in `kdb` itself.
+//!
+//! Every route below requires HTTP Basic Auth (see `auth.rs`) except
+//! `/health`, left open so load balancers/orchestrators can poll liveness
+//! without credentials -- it exposes nothing more sensitive than the
+//! world's shape and this server's clock. `/stats` is a `GET`, so a
+//! `read_only` account can use it same as any other account.
 
+use crate::auth::require_auth;
 use crate::coords::parse_coords;
 use crate::error::ApiError;
 use crate::state::AppState;
 use crate::value_json::ValueJson;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
+use axum::middleware;
 use axum::routing::get;
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::json;
 
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route(
             "/cells/:coords/:key",
             get(get_cell).put(set_cell).delete(remove_cell),
@@ -29,6 +37,12 @@ pub fn router(state: AppState) -> Router {
             "/regions/:origin/:extent/:key",
             get(get_region).put(set_region).delete(remove_region),
         )
+        .route("/stats", get(stats))
+        .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
+
+    Router::new()
+        .route("/health", get(health))
+        .merge(protected)
         .with_state(state)
 }
 
@@ -39,7 +53,32 @@ async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
         "status": "ok",
         "axes": state.world.axes(),
         "world_dim": state.world.world_dim(),
+        "timestamp": unix_timestamp(),
     }))
+}
+
+/// Seconds since the Unix epoch, per this server's own clock -- lets a
+/// caller sanity-check clock skew or confirm the response isn't a stale
+/// cached one, without pulling in a full date/time formatting dependency
+/// for one field.
+fn unix_timestamp() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+/// On-disk statistics for the world's data (see `kdb::World::stats`):
+/// total chunk files, their combined size, and their combined actual
+/// disk-block usage (smaller than size/512 would suggest for chunks with
+/// sparse, never-written regions -- see `kdb::Stats`'s doc comment).
+async fn stats(State(state): State<AppState>) -> Result<Json<serde_json::Value>, ApiError> {
+    let stats = state.with_world(kdb::World::stats).await?;
+    Ok(Json(json!({
+        "total_chunks": stats.total_chunks,
+        "total_bytes": stats.total_bytes,
+        "total_blocks": stats.total_blocks,
+    })))
 }
 
 async fn get_cell(

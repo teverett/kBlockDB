@@ -23,6 +23,8 @@ struct Args {
     scenarios: Vec<String>,
     json: bool,
     keep_data_dir: bool,
+    user: String,
+    password: Option<String>,
 }
 
 impl Default for Args {
@@ -40,6 +42,8 @@ impl Default for Args {
             scenarios: Vec::new(),
             json: false,
             keep_data_dir: false,
+            user: "admin".to_string(),
+            password: None,
         }
     }
 }
@@ -83,6 +87,8 @@ fn parse_args() -> Args {
             }
             "--json" => args.json = true,
             "--keep-data-dir" => args.keep_data_dir = true,
+            "--user" => args.user = expect_value(&mut it, "--user"),
+            "--password" => args.password = Some(expect_value(&mut it, "--password")),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -152,6 +158,12 @@ fn print_help() {
          One of: {}\n    \
          --json                   Print results as JSON instead of a table\n    \
          --keep-data-dir          Don't delete the spawned temp data dir on exit\n    \
+         --user <name>            Username for kdbserver's REST API (default: admin;\n                              \
+         only meaningful with --url -- spawned instances are always\n                              \
+         driven as admin)\n    \
+         --password <pw>          Password for --user. Required with --url (kdbserver\n                              \
+         requires login). When spawning instances, defaults to a random\n                              \
+         per-run password used for both the spawned config and the client\n    \
          -h, --help               Print this help",
         default.instances,
         default.base_port,
@@ -198,9 +210,17 @@ async fn main() {
     let clients: Vec<Client>;
 
     if !args.urls.is_empty() {
+        let password = args.password.clone().unwrap_or_else(|| {
+            eprintln!("--password is required with --url (kdbserver requires login)");
+            std::process::exit(1);
+        });
         _data_dir = None;
         _servers = Vec::new();
-        clients = args.urls.iter().map(|u| Client::new(u.clone())).collect();
+        clients = args
+            .urls
+            .iter()
+            .map(|u| Client::new(u.clone(), args.user.clone(), password.clone()))
+            .collect();
         println!("targeting {} existing instance(s)\n", clients.len());
     } else {
         let bin = args
@@ -228,12 +248,24 @@ async fn main() {
             data_dir.display()
         );
 
+        // Always the `admin` account here, regardless of `--user`: the
+        // config this spawns each instance with only ever creates that one
+        // account (see `ManagedServer::spawn`), so `--user` only matters
+        // against an already-running server (`--url`).
+        let admin_password = args
+            .password
+            .clone()
+            .unwrap_or_else(|| format!("kdbperf-{}", rand_suffix()));
+
         let mut servers = Vec::with_capacity(args.instances);
         for i in 0..args.instances {
             let addr = format!("127.0.0.1:{}", args.base_port + i as u16);
-            servers.push(ManagedServer::spawn(&bin, &data_dir, &addr).await);
+            servers.push(ManagedServer::spawn(&bin, &data_dir, &addr, &admin_password).await);
         }
-        clients = servers.iter().map(|s| Client::new(s.url.clone())).collect();
+        clients = servers
+            .iter()
+            .map(|s| Client::new(s.url.clone(), "admin", admin_password.clone()))
+            .collect();
         _servers = servers;
         _data_dir = Some(TempDataDir {
             path: data_dir,
