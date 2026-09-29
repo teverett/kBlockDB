@@ -14,6 +14,13 @@ pub fn chunk_cells(axes: usize) -> usize {
     (CHUNK_DIM as usize).pow(axes as u32)
 }
 
+/// Bytes per `rank`-acceleration block -- see `Bitset::block_counts`. 64 is
+/// a small, simple, fixed constant (not derived per chunk shape): big
+/// enough to keep `block_counts` cheap (1/32 of the bitmap's own size, in
+/// `u16`s), small enough that the "scan the rest of the target block"
+/// part of `rank` stays cheap too. Not tuned to any particular `axes`.
+const RANK_BLOCK_BYTES: usize = 64;
+
 /// A bitmap, one bit per cell in the chunk, marking whether that cell has a
 /// value in a given column. Sized at construction from the owning world's
 /// `chunk_cells(axes)` -- `axes` isn't known until a `World` is opened, so
@@ -22,6 +29,10 @@ pub fn chunk_cells(axes: usize) -> usize {
 #[derive(Clone)]
 struct Bitset {
     bits: Vec<u8>,
+    /// Number of set bits in each `RANK_BLOCK_BYTES`-byte block of `bits`,
+    /// kept in sync with `bits` on every `set` call -- see `rank`, the
+    /// reason this exists.
+    block_counts: Vec<u16>,
 }
 
 impl Bitset {
@@ -31,7 +42,20 @@ impl Bitset {
     fn new(byte_len: usize) -> Self {
         Bitset {
             bits: vec![0u8; byte_len],
+            block_counts: vec![0u16; byte_len.div_ceil(RANK_BLOCK_BYTES)],
         }
+    }
+
+    /// Rebuilds a `Bitset` (and its `block_counts` index) from raw bytes
+    /// read off disk -- `block_counts` is a derived, in-memory-only
+    /// accelerator, never itself persisted (see the on-disk format comment
+    /// below), so loading a chunk means computing it once here.
+    fn from_bits(bits: Vec<u8>) -> Self {
+        let block_counts = bits
+            .chunks(RANK_BLOCK_BYTES)
+            .map(|block| block.iter().map(|&b| b.count_ones() as u16).sum())
+            .collect();
+        Bitset { bits, block_counts }
     }
 
     fn get(&self, idx: usize) -> bool {
@@ -39,22 +63,46 @@ impl Bitset {
     }
 
     fn set(&mut self, idx: usize, v: bool) {
+        let byte_idx = idx >> 3;
         let mask = 1u8 << (idx & 7);
+        let was_set = self.bits[byte_idx] & mask != 0;
+        if v == was_set {
+            return; // no change -- block_counts is already correct
+        }
         if v {
-            self.bits[idx >> 3] |= mask;
+            self.bits[byte_idx] |= mask;
+            self.block_counts[byte_idx / RANK_BLOCK_BYTES] += 1;
         } else {
-            self.bits[idx >> 3] &= !mask;
+            self.bits[byte_idx] &= !mask;
+            self.block_counts[byte_idx / RANK_BLOCK_BYTES] -= 1;
         }
     }
 
     /// Number of set bits strictly before `idx` -- i.e. this cell's position
     /// within the column's dense `values` vec, if it's present at all.
+    ///
+    /// A naive version of this scans every byte before `idx` and sums their
+    /// popcounts -- O(presence_bytes) per call, which is most of a chunk's
+    /// presence bitmap (up to a few thousand bytes) on *every*
+    /// `get`/`set`/`remove`. `block_counts` turns that into
+    /// O(presence_bytes/RANK_BLOCK_BYTES + RANK_BLOCK_BYTES): sum the
+    /// (few) whole blocks before `idx`'s block from the precomputed
+    /// per-block counts, then only popcount-scan the one partial block
+    /// `idx` actually falls in.
     fn rank(&self, idx: usize) -> usize {
         let byte_idx = idx >> 3;
-        let mut count: usize = self.bits[..byte_idx]
+        let block_idx = byte_idx / RANK_BLOCK_BYTES;
+        let block_start = block_idx * RANK_BLOCK_BYTES;
+
+        let mut count: usize = self.block_counts[..block_idx]
+            .iter()
+            .map(|&c| c as usize)
+            .sum();
+        count += self.bits[block_start..byte_idx]
             .iter()
             .map(|b| b.count_ones() as usize)
-            .sum();
+            .sum::<usize>();
+
         let bit_in_byte = idx & 7;
         if bit_in_byte > 0 {
             let partial_mask = (1u8 << bit_in_byte) - 1;
@@ -64,7 +112,7 @@ impl Bitset {
     }
 
     fn count(&self) -> usize {
-        self.bits.iter().map(|b| b.count_ones() as usize).sum()
+        self.block_counts.iter().map(|&c| c as usize).sum()
     }
 }
 
@@ -251,7 +299,7 @@ impl Chunk {
 
             let mut bits = vec![0u8; presence_bytes];
             r.read_exact(&mut bits)?;
-            let presence = Bitset { bits };
+            let presence = Bitset::from_bits(bits);
             let count = presence.count();
 
             let data = match tag[0] {
@@ -392,5 +440,108 @@ mod tests {
 
         let c2 = Chunk::read_from(&mut &buf[..], chunk_cells(2)).unwrap();
         assert_eq!(c2.get(0, 0), Some(Value::I64(1)));
+    }
+
+    // --- Bitset::rank's block-count acceleration ---
+    //
+    // The tests above only ever touch indices below 137 (well within
+    // RANK_BLOCK_BYTES=64 bytes -- i.e. index 512 -- of bits), so they
+    // never exercise `rank`'s "sum the whole blocks before this one" path
+    // at all. These specifically spread across many blocks.
+
+    #[test]
+    fn rank_is_correct_across_many_block_boundaries() {
+        // CELLS = 32,768 cells = 64 blocks of 512 bits each. An odd
+        // stride so set cells land at varying offsets within their block,
+        // not just at block-aligned positions.
+        let mut c = Chunk::new(CELLS);
+        let indices: Vec<usize> = (0..CELLS).step_by(137).collect();
+        for (i, &idx) in indices.iter().enumerate() {
+            c.set(idx, 42, Value::I64(i as i64));
+        }
+        for (i, &idx) in indices.iter().enumerate() {
+            assert_eq!(
+                c.get(idx, 42),
+                Some(Value::I64(i as i64)),
+                "wrong value at idx {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn rank_is_correct_exactly_at_block_boundaries() {
+        // 511/512/513 straddle the boundary between block 0 and block 1;
+        // 1023/1024 straddle block 1/block 2 -- the off-by-one-prone edges
+        // of the block-counts acceleration.
+        let mut c = Chunk::new(CELLS);
+        let boundary_indices = [0usize, 511, 512, 513, 1023, 1024, 1535, 1536];
+        for (i, &idx) in boundary_indices.iter().enumerate() {
+            c.set(idx, 7, Value::I64(i as i64));
+        }
+        for (i, &idx) in boundary_indices.iter().enumerate() {
+            assert_eq!(
+                c.get(idx, 7),
+                Some(Value::I64(i as i64)),
+                "wrong value at idx {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn removing_a_cell_in_an_earlier_block_does_not_corrupt_a_later_blocks_ranks() {
+        // A later cell's rank depends on the block_counts sum over every
+        // earlier block -- this specifically checks that a `set(.., false)`
+        // in block 0 correctly updates block_counts so a lookup in a much
+        // later block still resolves to the right value.
+        let mut c = Chunk::new(CELLS);
+        c.set(10, 1, Value::I64(100)); // block 0
+        c.set(2000, 1, Value::I64(200)); // block 3 (2000 / 512 = 3)
+        assert_eq!(c.get(2000, 1), Some(Value::I64(200)));
+
+        c.remove(10, 1);
+        assert_eq!(c.get(10, 1), None);
+        assert_eq!(
+            c.get(2000, 1),
+            Some(Value::I64(200)),
+            "later block's value corrupted after removing an earlier cell"
+        );
+    }
+
+    #[test]
+    fn count_matches_set_cells_across_many_blocks() {
+        // is_empty() (and, in World, chunk-file garbage collection) routes
+        // through Bitset::count(), which now sums block_counts instead of
+        // rescanning every byte -- exercise it across many blocks, both
+        // ways.
+        let mut c = Chunk::new(CELLS);
+        let indices: Vec<usize> = (0..CELLS).step_by(97).collect();
+        for &idx in &indices {
+            c.set(idx, 3, Value::I64(0));
+        }
+        assert!(!c.is_empty());
+        for &idx in &indices {
+            c.remove(idx, 3);
+        }
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn from_bits_reconstructs_block_counts_matching_incremental_set() {
+        // write_to/read_from (Bitset::from_bits) must produce a Bitset
+        // whose rank() behaves identically to one built incrementally via
+        // set() -- from_bits is the only other place a Bitset's
+        // block_counts get built.
+        let mut c = Chunk::new(CELLS);
+        for idx in (0..CELLS).step_by(211) {
+            c.set(idx, 5, Value::I64(idx as i64));
+        }
+
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        let c2 = Chunk::read_from(&mut &buf[..], CELLS).unwrap();
+
+        for idx in (0..CELLS).step_by(211) {
+            assert_eq!(c2.get(idx, 5), Some(Value::I64(idx as i64)));
+        }
     }
 }

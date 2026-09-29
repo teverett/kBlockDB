@@ -158,6 +158,39 @@ access pattern:
 Neither is implemented here -- the prototype optimizes for showing the
 mechanism clearly, not for the last byte of density.
 
+### `Chunk`'s two per-cell costs, and which one is fixed
+
+Every `get`/`set`/`remove` on a column needs that cell's *rank* (its
+position among the column's set cells) to index into the column's dense,
+packed value array. That costs two different things:
+
+- **Computing the rank** used to be an O(presence_bytes) linear popcount
+  scan of the whole bitmap before the target bit -- up to ~4096 byte
+  popcounts per call for the default chunk shape, on *every* `get`/`set`/
+  `remove`, since there's no cache to amortize it across calls anymore
+  (see "Concurrency" above). `Bitset` now keeps a small per-64-byte-block
+  running-count index (`block_counts`, updated in O(1) on every `set`,
+  never persisted -- rebuilt once when a chunk is read off disk), turning
+  `rank` into summing a handful of block counts plus scanning one partial
+  block: measured (a standalone probe, not this crate's own benchmarking
+  machinery, comparing both implementations directly) at roughly 4x faster
+  on average and ~7x faster for a cell near the end of a densely-populated
+  bitmap -- the case this project's own design rationale says is the
+  common one, not the pathological one.
+- **Using the rank** to insert/remove a value still means an
+  `Vec::insert`/`Vec::remove` into `ColumnData`'s packed array -- an
+  O(occupancy) shift of every value after that point in the column. This
+  one is *not* fixed here: doing so would mean allocating a full
+  `chunk_cells`-sized slot per column instead of a packed one (the same
+  "fixed size regardless of occupancy" trade-off the presence bitmap
+  already makes, extended to values too), which is a real, opposite-facing
+  cost -- multiplying a sparse column's on-disk/in-memory footprint by
+  potentially tens of thousands, in exactly the scattered/sparse-chunk
+  case this README already calls out as the worst case this prototype
+  demonstrates on purpose. Worth doing if your workload is genuinely
+  dense-per-chunk and memory isn't the constraint; not done by default
+  because it isn't, universally.
+
 ### Layout
 
 - `kdb/src/lib.rs`    -- the library crate root; re-exports `World`,
