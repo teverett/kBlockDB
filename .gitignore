@@ -1,5 +1,8 @@
-/target
-/data
-/Cargo.lock
+**/target
+**/data
+**/kdb.log
 /.idea
-/kdb.log
+
+# Cargo.lock is committed: this workspace produces binaries (the kdb demo
+# and kdbserver), where a locked dependency tree is the point, not just a
+# library.

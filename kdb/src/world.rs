@@ -40,15 +40,20 @@ pub struct Region {
 }
 
 impl Region {
+    /// Builds a `Region` from any origin/extent that convert to `Coord`.
+    /// Doesn't itself require `origin.len() == extent.len()` -- `Region` is
+    /// a plain data holder, and this crate is a library other code (e.g. a
+    /// server parsing coordinates out of a URL) can call with attacker- or
+    /// user-controlled input, so it's not this constructor's place to
+    /// `panic!`/`debug_assert!` on a shape mismatch. `World::check_region`
+    /// (run by every `*_region` method before touching any data) is what
+    /// actually validates a `Region` and reports a mismatch as a proper
+    /// `io::Result` error instead.
     pub fn new(origin: impl Into<Coord>, extent: impl Into<Coord>) -> Self {
-        let origin = origin.into();
-        let extent = extent.into();
-        debug_assert_eq!(
-            origin.len(),
-            extent.len(),
-            "Region origin/extent must have the same number of axes"
-        );
-        Region { origin, extent }
+        Region {
+            origin: origin.into(),
+            extent: extent.into(),
+        }
     }
 
     pub fn volume(&self) -> u64 {
@@ -368,18 +373,26 @@ impl World {
     }
 
     pub fn get(&mut self, coord: &[u32], key: &str) -> io::Result<Option<Value>> {
+        // Validate the coordinate *before* consulting the schema: a
+        // malformed/out-of-range coordinate must always be rejected the
+        // same way, regardless of whether `key` happens to be known yet --
+        // this doubles as a request-validation boundary for callers (like
+        // kdbserver) that pass through attacker-/user-supplied coordinates.
+        let (ckey, local_idx) = self.split(coord)?;
         let key_id = match self.schema.id_for_key(key) {
             Some(id) => id,
             None => return Ok(None), // this key has never been written anywhere in the world
         };
-        let (ckey, local_idx) = self.split(coord)?;
         self.load_chunk(&ckey)?;
         Ok(self.cache[&ckey].get(local_idx, key_id))
     }
 
     pub fn set(&mut self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
-        let key_id = self.schema.intern(key)?;
+        // Validate the coordinate before interning `key`: a failed `set`
+        // shouldn't have the side effect of permanently registering a new
+        // key that was never actually written anywhere.
         let (ckey, local_idx) = self.split(coord)?;
+        let key_id = self.schema.intern(key)?;
         self.load_chunk(&ckey)?;
         self.cache
             .get_mut(&ckey)
@@ -390,6 +403,10 @@ impl World {
     }
 
     pub fn remove(&mut self, coord: &[u32], key: &str) -> io::Result<()> {
+        // See `get`: validate the coordinate before the key-existence
+        // short-circuit, so a bad coordinate is never silently absorbed
+        // into remove's usual "unknown key is a harmless no-op" behavior.
+        let (ckey, local_idx) = self.split(coord)?;
         let key_id = match self.schema.id_for_key(key) {
             Some(id) => id,
             None => {
@@ -403,7 +420,7 @@ impl World {
                 return Ok(());
             }
         };
-        self.remove_cell(coord, key_id)?;
+        self.remove_cell_at(ckey, local_idx, key_id)?;
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
         Ok(())
     }
@@ -413,21 +430,29 @@ impl World {
     /// one per cell.
     fn remove_cell(&mut self, coord: &[u32], key_id: u32) -> io::Result<()> {
         let (ckey, local_idx) = self.split(coord)?;
+        self.remove_cell_at(ckey, local_idx, key_id)
+    }
+
+    fn remove_cell_at(&mut self, ckey: ChunkKey, local_idx: usize, key_id: u32) -> io::Result<()> {
         self.load_chunk(&ckey)?;
         self.cache.get_mut(&ckey).unwrap().remove(local_idx, key_id);
         self.dirty.insert(ckey);
         Ok(())
     }
 
-    /// Checks that `region` has this world's axis count and fits inside it
-    /// without overflowing `u32` along the way.
+    /// Checks that `region`'s origin and extent both have this world's axis
+    /// count -- *not* just that they match each other, since `Region::new`
+    /// itself doesn't enforce that (see its doc comment) -- and that it
+    /// fits inside the world without overflowing `u32` along the way.
     fn check_region(&self, region: &Region) -> io::Result<()> {
-        if region.axes() != self.axes {
+        if region.origin.len() != self.axes || region.extent.len() != self.axes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "region {region:?} has {} axes but this world has {}",
-                    region.axes(),
+                    "region {region:?} has {} origin axes and {} extent axes but this world \
+                     has {}",
+                    region.origin.len(),
+                    region.extent.len(),
                     self.axes
                 ),
             ));
@@ -675,6 +700,55 @@ mod tests {
         // Key never interned anywhere in the world.
         assert_eq!(w.get(&coord3(0, 0, 0), "material").unwrap(), None);
         assert_eq!(w.schema_len(), 0);
+    }
+
+    #[test]
+    fn get_validates_the_coordinate_even_for_a_never_interned_key() {
+        // Regression: get() used to check schema membership before
+        // validating the coordinate, so a bad coordinate against an
+        // unknown key silently returned Ok(None) instead of erroring.
+        let dir = TempDir::new("get-validates-oob-unknown-key");
+        let mut w = create(&dir);
+
+        assert_eq!(
+            w.get(&coord3(WORLD_DIM, 0, 0), "never-set")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            w.get(&[1, 2], "never-set").unwrap_err().kind(), // wrong axis count
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn remove_validates_the_coordinate_even_for_a_never_interned_key() {
+        // Regression: same short-circuit-before-validation bug as get(),
+        // in remove()'s "unknown key is a harmless no-op" path.
+        let dir = TempDir::new("remove-validates-oob-unknown-key");
+        let mut w = create(&dir);
+
+        assert_eq!(
+            w.remove(&coord3(WORLD_DIM, 0, 0), "never-set")
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn set_does_not_intern_the_key_if_the_coordinate_is_invalid() {
+        // Regression: set() used to intern the key before validating the
+        // coordinate, so a failed set() still had the permanent side
+        // effect of registering a key nothing was ever actually stored
+        // under.
+        let dir = TempDir::new("set-no-intern-on-bad-coord");
+        let mut w = create(&dir);
+
+        let err = w.set(&coord3(WORLD_DIM, 0, 0), "material", Value::I64(1));
+        assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(w.schema_len(), 0, "key must not be interned on failure");
     }
 
     #[test]
@@ -1094,6 +1168,22 @@ mod tests {
         let mut w = create(&dir); // 3-axis world
 
         let region = Region::new(vec![0, 0], vec![2, 2]); // 2 axes
+        assert_eq!(
+            w.get_region(&region, "material").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn region_with_mismatched_origin_and_extent_axes_is_an_error() {
+        // Regression: Region::new doesn't (and, taking origin/extent from
+        // untrusted input like an HTTP request, can't) itself guarantee
+        // origin.len() == extent.len() -- check_region must catch this
+        // rather than leaving it to panic or index out of bounds later.
+        let dir = TempDir::new("region-mismatched-origin-extent");
+        let mut w = create(&dir); // 3-axis world
+
+        let region = Region::new(vec![0, 0, 0], vec![2, 2]); // 3 origin axes, 2 extent axes
         assert_eq!(
             w.get_region(&region, "material").unwrap_err().kind(),
             io::ErrorKind::InvalidInput

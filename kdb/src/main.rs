@@ -1,16 +1,7 @@
-mod chunk;
-mod coord;
-mod logger;
-mod params;
-mod schema;
-mod value;
-mod world;
-
+use kdb::{chunk, logger, world, Coord, Value, World};
 use std::io;
 use std::path::Path;
 use std::time::Instant;
-use value::Value;
-use world::{Coord, World};
 
 fn main() -> io::Result<()> {
     let result = run();

@@ -1,16 +1,9 @@
-[package]
-name = "kdb"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+resolver = "2"
+members = ["kdb", "kdbserver"]
 
-# Zero external dependencies on purpose: the whole point of this prototype is a
-# compact, hand-rolled binary chunk format. `cargo build --release` (or plain
-# `rustc`) needs nothing from crates.io.
-
-[[bin]]
-name = "kdb"
-path = "src/main.rs"
-
+# Shared across every workspace member (member manifests can't set profiles
+# themselves -- Cargo ignores profile sections outside the workspace root).
 [profile.release]
 opt-level = 3
 lto = true

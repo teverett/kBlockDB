@@ -34,15 +34,44 @@ jobs:
         run: cargo fmt --all -- --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Build
-        run: cargo build --verbose
+        run: cargo build --workspace --verbose
 
       - name: Test
-        run: cargo test --verbose
+        run: cargo test --workspace --verbose
 
-      - name: Run demo binary (smoke test)
+      - name: Run kdb demo binary (smoke test)
         run: |
           rm -rf "$RUNNER_TEMP/kdb_ci_data"
           ./target/debug/kdb "$RUNNER_TEMP/kdb_ci_data"
+
+      - name: Run kdbserver (smoke test)
+        run: |
+          rm -rf "$RUNNER_TEMP/kdbserver_ci_data"
+          ./target/debug/kdbserver --data-dir "$RUNNER_TEMP/kdbserver_ci_data" --addr 127.0.0.1:8099 &
+          server_pid=$!
+
+          ready=0
+          for _ in $(seq 1 20); do
+            if curl -sf http://127.0.0.1:8099/health > /dev/null; then
+              ready=1
+              break
+            fi
+            sleep 0.5
+          done
+          if [ "$ready" -ne 1 ]; then
+            echo "kdbserver never became ready" >&2
+            kill "$server_pid" 2>/dev/null || true
+            exit 1
+          fi
+
+          curl -sf http://127.0.0.1:8099/health
+          echo
+          curl -sf -X PUT http://127.0.0.1:8099/cells/1,2,3/material \
+            -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
+          curl -sf http://127.0.0.1:8099/cells/1,2,3/material
+          echo
+
+          kill "$server_pid"

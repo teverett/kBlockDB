@@ -60,6 +60,10 @@ impl Schema {
         self.id_to_key.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.id_to_key.is_empty()
+    }
+
     /// Look up `key`'s id, interning (and durably persisting) a new one if
     /// this is the first time this world has ever seen it.
     pub fn intern(&mut self, key: &str) -> io::Result<u32> {
