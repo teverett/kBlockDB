@@ -33,14 +33,13 @@ pub fn router(state: AppState) -> Router {
 }
 
 async fn health(State(state): State<AppState>) -> Json<serde_json::Value> {
-    // Brief, non-blocking lock: just two field reads, no I/O, so this is
-    // fine directly in an async handler (unlike the World operations
-    // below, which all go through AppState::with_world).
-    let (axes, world_dim) = {
-        let w = state.world.lock().unwrap_or_else(|p| p.into_inner());
-        (w.axes(), w.world_dim())
-    };
-    Json(json!({ "status": "ok", "axes": axes, "world_dim": world_dim }))
+    // No lock needed at all: World::axes/world_dim are plain field reads
+    // via &self, and state.world is a bare Arc<World> now (see state.rs).
+    Json(json!({
+        "status": "ok",
+        "axes": state.world.axes(),
+        "world_dim": state.world.world_dim(),
+    }))
 }
 
 async fn get_cell(

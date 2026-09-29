@@ -112,6 +112,29 @@ than cells: they group a region's cells by chunk first, so each chunk a
 region touches is still locked, read, and (for a write) written back
 exactly once, no matter how many of the region's cells land in it.
 
+**Every `World` method takes `&self`, not `&mut self`.** `World` holds no
+cache -- its only interior state is a locked `Schema` and a couple of
+atomic counters -- so a single process can share one `World` behind a
+plain `Arc` (no `Mutex<World>` needed) and let concurrent calls actually
+run concurrently, limited only by the same per-chunk file locks that
+already make concurrent *processes* safe. `kdbserver` does exactly this.
+
+**Concurrent filesystem operations don't scale indefinitely, though.**
+Measured on one real, fast, local SSD: going from 1 to 8-32 concurrent
+`with_chunk` calls (disjoint chunks, so no lock contention between them)
+roughly doubled throughput, as expected -- but pushing to 128 concurrent
+calls made aggregate throughput *worse* than at 1, not just diminishing --
+confirmed to be real OS/filesystem-level contention (reproduced with a
+synthetic probe doing only `create_dir_all`/`flock`/file I/O, no `kdb` code
+at all, and ruled out an in-memory `Mutex` bottleneck the same way: a pure
+lock-contention probe at the same thread count showed no degradation at
+all). `World` caps how many `with_chunk` calls run concurrently
+(`DEFAULT_MAX_CONCURRENT_DISK_OPS`, `World::with_max_concurrent_disk_ops`
+to override) for exactly this reason. The right cap is a property of the
+underlying filesystem/storage, not of `kdb` -- the default is a reasonable
+starting point, not a measured optimum for any particular deployment;
+measure yours with `kdbperf`'s `concurrency_scan`.
+
 ### A real trade-off this prototype makes visible
 
 The presence bitmap is a *fixed* size per column regardless of how many
@@ -188,11 +211,15 @@ USAGE:
     kdbserver [OPTIONS]
 
 OPTIONS:
-    --data-dir <path>    World data directory (default: ./data)
-    --axes <n>           Axis count for a brand-new world (default: 3)
-    --world-dim <n>      Cells per axis for a brand-new world (default: 10000)
-    --addr <host:port>   Address to listen on (default: 127.0.0.1:8080)
-    -h, --help           Print help
+    --data-dir <path>              World data directory (default: ./data)
+    --axes <n>                     Axis count for a brand-new world (default: 3)
+    --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
+    --addr <host:port>             Address to listen on (default: 127.0.0.1:8080)
+    --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
+                                    (default: 32 -- see kdb's "Concurrency"
+                                    section; measure the right value for your
+                                    filesystem with kdbperf's concurrency_scan)
+    -h, --help                     Print help
 ```
 
 `--axes`/`--world-dim` only matter the *first* time a world is created at

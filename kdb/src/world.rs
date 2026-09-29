@@ -3,11 +3,14 @@ pub use crate::coord::Coord;
 use crate::lock::FileLock;
 use crate::params::WorldParams;
 use crate::schema::Schema;
+use crate::semaphore::Semaphore;
 use crate::value::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Whether a `World::with_chunk` call means to only read a chunk or to
 /// (possibly) write it -- see that method.
@@ -30,6 +33,23 @@ pub const AXES: usize = 3;
 /// the same "default at create time, persisted and authoritative
 /// afterward" rule applies.
 pub const WORLD_DIM: u32 = 10_000;
+
+/// Default cap on how many `with_chunk` calls -- i.e. real concurrent
+/// filesystem operations (`create_dir_all`/`flock`/file I/O) -- a `World`
+/// will have in flight at once. Override with
+/// `World::with_max_concurrent_disk_ops`.
+///
+/// This exists because concurrent small-file/metadata operations don't
+/// scale indefinitely on every filesystem: measured on one real, fast,
+/// local SSD, throughput roughly doubled going from 1 to 8-32 concurrent
+/// `with_chunk` calls, then *fell below the single-digit-concurrency
+/// baseline* at 128 -- letting too many pile up was worse than capping
+/// them, not just a diminishing return. 32 is a reasonable starting point,
+/// not a measured optimum for any particular deployment; the right number
+/// is a property of the underlying filesystem/storage, not of `kdb` --
+/// measure it for yours (e.g. with `kdbperf`'s `concurrency_scan`) rather
+/// than trusting this default.
+pub const DEFAULT_MAX_CONCURRENT_DISK_OPS: usize = 32;
 
 const _: () = assert!(AXES >= 1, "AXES must be at least 1");
 
@@ -161,22 +181,48 @@ impl Iterator for RegionIter {
 /// locked operations, not one transaction, so another process's write can
 /// land in between them -- same as most simple key/value stores without
 /// an explicit read-modify-write or transaction API.
+///
+/// **All of this is also why every method takes `&self`, not `&mut
+/// self`.** `World` holds no cache and no other state that a second
+/// concurrent call could corrupt in-process -- its only interior state is
+/// `schema` (behind its own `Mutex`) and two atomic counters -- so a
+/// single process can hold one `World` behind an `Arc` (no outer `Mutex`
+/// needed) and let concurrent requests actually run concurrently, limited
+/// only by the same per-chunk file locks that already make concurrent
+/// *processes* safe. `kdbserver` does exactly this (see
+/// `kdbserver/src/state.rs`): earlier, it serialized every request through
+/// one `Mutex<World>`, which meant one slow request -- or just a lot of
+/// concurrent ones -- stalled every other request in that process
+/// regardless of whether they touched the same chunk at all.
 pub struct World {
     root: PathBuf,
     axes: usize,
     world_dim: u32,
     chunk_cells: usize,
-    schema: Schema,
+    schema: Mutex<Schema>,
     /// Number of chunk files this `World` has read since it was opened.
     /// Counts operations, not distinct chunks -- touching the same chunk
     /// twice counts twice, since nothing is cached between calls (see
-    /// `with_chunk`).
-    pub chunks_read_from_disk: u64,
+    /// `with_chunk`). Read via `chunks_read_from_disk()`.
+    chunks_read_from_disk: AtomicU64,
     /// Number of chunk files this `World` has (over)written since it was
     /// opened. Same counting caveat as `chunks_read_from_disk`: a cell
     /// `set` four times in the same chunk, even in a row, is four writes.
-    pub chunks_written_to_disk: u64,
+    /// Read via `chunks_written_to_disk()`.
+    chunks_written_to_disk: AtomicU64,
+    /// Caps how many `with_chunk` calls run concurrently -- see
+    /// `DEFAULT_MAX_CONCURRENT_DISK_OPS`.
+    disk_io: Semaphore,
 }
+
+// `World` needs to be usable as `Arc<World>` shared across threads (see its
+// doc comment above) -- this is a compile-time check that it actually is,
+// rather than leaving that as an implicit assumption a later change could
+// silently break.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<World>();
+};
 
 impl World {
     /// Creates a new world at `root`, or validates an existing one there.
@@ -244,10 +290,60 @@ impl World {
             axes: params.axes,
             world_dim: params.world_dim,
             chunk_cells: chunk::chunk_cells(params.axes),
-            schema,
-            chunks_read_from_disk: 0,
-            chunks_written_to_disk: 0,
+            schema: Mutex::new(schema),
+            chunks_read_from_disk: AtomicU64::new(0),
+            chunks_written_to_disk: AtomicU64::new(0),
+            disk_io: Semaphore::new(DEFAULT_MAX_CONCURRENT_DISK_OPS),
         })
+    }
+
+    /// Overrides the cap on concurrent `with_chunk` calls (real concurrent
+    /// filesystem operations) -- see `DEFAULT_MAX_CONCURRENT_DISK_OPS` for
+    /// why this exists and how to pick a value. `0` is treated as `1`
+    /// (a cap of zero would mean no call could ever acquire a permit,
+    /// deadlocking every operation forever -- clearly not what "0" was
+    /// meant to ask for).
+    ///
+    /// Chainable right after `create`/`open`, since it takes and returns
+    /// `Self`:
+    /// ```no_run
+    /// # fn main() -> std::io::Result<()> {
+    /// let world = kdb::World::create("./data", 3, 10_000)?
+    ///     .with_max_concurrent_disk_ops(8);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_max_concurrent_disk_ops(mut self, n: usize) -> Self {
+        self.disk_io = Semaphore::new(n.max(1));
+        self
+    }
+
+    /// Locks `schema` (recovering rather than panicking if a prior panic
+    /// left it poisoned: `Schema`'s own mutations build a replacement
+    /// `HashMap`/`Vec` and only assign them in as the last step, so a
+    /// panic partway through never leaves the *old*, already-consistent
+    /// state half-updated -- recovering here can't hand back a corrupt
+    /// `Schema`, only, at worst, a slightly stale one).
+    fn schema(&self) -> MutexGuard<'_, Schema> {
+        self.schema.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Number of chunk files this `World` has read since it was opened --
+    /// see the field doc comment for what "read" counts.
+    pub fn chunks_read_from_disk(&self) -> u64 {
+        self.chunks_read_from_disk.load(Ordering::Relaxed)
+    }
+
+    /// Number of chunk files this `World` has (over)written since it was
+    /// opened -- see the field doc comment for what "written" counts.
+    pub fn chunks_written_to_disk(&self) -> u64 {
+        self.chunks_written_to_disk.load(Ordering::Relaxed)
+    }
+
+    /// The current cap on concurrent `with_chunk` calls -- see
+    /// `DEFAULT_MAX_CONCURRENT_DISK_OPS`/`with_max_concurrent_disk_ops`.
+    pub fn max_concurrent_disk_ops(&self) -> usize {
+        self.disk_io.capacity()
     }
 
     pub fn axes(&self) -> usize {
@@ -263,7 +359,7 @@ impl World {
     }
 
     pub fn schema_len(&self) -> usize {
-        self.schema.len()
+        self.schema().len()
     }
 
     fn chunk_path(&self, ckey: &ChunkKey) -> PathBuf {
@@ -322,11 +418,19 @@ impl World {
     /// concurrency story -- see the "Concurrency" section of `World`'s own
     /// doc comment.
     fn with_chunk<T>(
-        &mut self,
+        &self,
         ckey: &ChunkKey,
         access: Access,
         f: impl FnOnce(&mut Chunk) -> T,
     ) -> io::Result<T> {
+        // Held for the rest of this function -- see `disk_io`'s field doc
+        // comment and `DEFAULT_MAX_CONCURRENT_DISK_OPS`. Acquired before
+        // any filesystem call at all, including `create_dir_all`: that one
+        // showed the same concurrency-128 slowdown as the lock/read/write
+        // calls below it when measured in isolation, so it's inside the
+        // cap too, not just the chunk file I/O.
+        let _permit = self.disk_io.acquire();
+
         let lock_path = self.chunk_lock_path(ckey);
         fs::create_dir_all(lock_path.parent().unwrap())?;
         let _lock = match access {
@@ -338,7 +442,7 @@ impl World {
         let mut chunk = if chunk_path.exists() {
             let f = File::open(&chunk_path)?;
             let mut r = BufReader::new(f);
-            self.chunks_read_from_disk += 1;
+            self.chunks_read_from_disk.fetch_add(1, Ordering::Relaxed);
             Chunk::read_from(&mut r, self.chunk_cells)?
         } else {
             Chunk::new(self.chunk_cells)
@@ -355,7 +459,7 @@ impl World {
                 let file = File::create(&chunk_path)?;
                 let mut w = BufWriter::new(file);
                 chunk.write_to(&mut w)?;
-                self.chunks_written_to_disk += 1;
+                self.chunks_written_to_disk.fetch_add(1, Ordering::Relaxed);
             }
         }
 
@@ -367,40 +471,40 @@ impl World {
     /// state left to flush. Kept as a no-op, rather than removed, so code
     /// written against the version of this API that *did* batch writes
     /// (this crate's own demo included) doesn't need to change.
-    pub fn flush(&mut self) -> io::Result<()> {
+    pub fn flush(&self) -> io::Result<()> {
         Ok(())
     }
 
-    pub fn get(&mut self, coord: &[u32], key: &str) -> io::Result<Option<Value>> {
+    pub fn get(&self, coord: &[u32], key: &str) -> io::Result<Option<Value>> {
         // Validate the coordinate *before* consulting the schema: a
         // malformed/out-of-range coordinate must always be rejected the
         // same way, regardless of whether `key` happens to be known yet --
         // this doubles as a request-validation boundary for callers (like
         // kdbserver) that pass through attacker-/user-supplied coordinates.
         let (ckey, local_idx) = self.split(coord)?;
-        let Some(key_id) = self.schema.id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key)? else {
             return Ok(None); // this key has never been written anywhere in the world
         };
         self.with_chunk(&ckey, Access::Read, |chunk| chunk.get(local_idx, key_id))
     }
 
-    pub fn set(&mut self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
+    pub fn set(&self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
         // Validate the coordinate before interning `key`: a failed `set`
         // shouldn't have the side effect of permanently registering a new
         // key that was never actually written anywhere.
         let (ckey, local_idx) = self.split(coord)?;
-        let key_id = self.schema.intern(key)?;
+        let key_id = self.schema().intern(key)?;
         self.with_chunk(&ckey, Access::Write, |chunk| {
             chunk.set(local_idx, key_id, value)
         })
     }
 
-    pub fn remove(&mut self, coord: &[u32], key: &str) -> io::Result<()> {
+    pub fn remove(&self, coord: &[u32], key: &str) -> io::Result<()> {
         // See `get`: validate the coordinate before the key-existence
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
         let (ckey, local_idx) = self.split(coord)?;
-        let Some(key_id) = self.schema.id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key)? else {
             // Distinct from "key exists but isn't set on this cell"
             // (routine, logged as INFO below): this key has never been
             // interned anywhere in the world, which more likely means a
@@ -462,10 +566,10 @@ impl World {
     ///
     /// Results come back in `RegionIter` order (axis 0 fastest): `result[i]`
     /// is `RegionIter::new(region).nth(i)`.
-    pub fn get_region(&mut self, region: &Region, key: &str) -> io::Result<Vec<Option<Value>>> {
+    pub fn get_region(&self, region: &Region, key: &str) -> io::Result<Vec<Option<Value>>> {
         self.check_region(region)?;
         let mut out = vec![None; region.volume() as usize];
-        let Some(key_id) = self.schema.id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key)? else {
             return Ok(out); // never interned anywhere: every cell is None
         };
         for (ckey, cells) in self.group_region_by_chunk(region)? {
@@ -489,7 +593,7 @@ impl World {
     /// or this returns an `InvalidInput` error without writing anything. A
     /// no-op region (any axis's extent zero, so `values` must be empty too)
     /// doesn't even intern `key`.
-    pub fn set_region(&mut self, region: &Region, key: &str, values: &[Value]) -> io::Result<()> {
+    pub fn set_region(&self, region: &Region, key: &str, values: &[Value]) -> io::Result<()> {
         self.check_region(region)?;
         let volume = region.volume() as usize;
         if values.len() != volume {
@@ -504,7 +608,7 @@ impl World {
         if volume == 0 {
             return Ok(());
         }
-        let key_id = self.schema.intern(key)?;
+        let key_id = self.schema().intern(key)?;
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             self.with_chunk(&ckey, Access::Write, |chunk| {
                 for (i, local_idx) in cells {
@@ -523,12 +627,12 @@ impl World {
     /// `remove`, this logs one summary line for the whole region rather
     /// than one line per cell, so clearing a large region doesn't flood
     /// `kdb.log`.
-    pub fn remove_region(&mut self, region: &Region, key: &str) -> io::Result<()> {
+    pub fn remove_region(&self, region: &Region, key: &str) -> io::Result<()> {
         self.check_region(region)?;
         if region.volume() == 0 {
             return Ok(());
         }
-        let Some(key_id) = self.schema.id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key)? else {
             crate::logger::warn(format!(
                 "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
             ));
@@ -675,7 +779,7 @@ mod tests {
     #[test]
     fn a_world_can_have_a_different_axis_count() {
         let dir = TempDir::new("create-2d");
-        let mut w = World::create(&dir, 2, 50).unwrap();
+        let w = World::create(&dir, 2, 50).unwrap();
 
         w.set(&[1, 2], "material", Value::Str("stone".into()))
             .unwrap();
@@ -695,7 +799,7 @@ mod tests {
     #[test]
     fn get_on_untouched_world_is_none() {
         let dir = TempDir::new("untouched");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         // Key never interned anywhere in the world.
         assert_eq!(w.get(&coord3(0, 0, 0), "material").unwrap(), None);
@@ -708,7 +812,7 @@ mod tests {
         // validating the coordinate, so a bad coordinate against an
         // unknown key silently returned Ok(None) instead of erroring.
         let dir = TempDir::new("get-validates-oob-unknown-key");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         assert_eq!(
             w.get(&coord3(WORLD_DIM, 0, 0), "never-set")
@@ -727,7 +831,7 @@ mod tests {
         // Regression: same short-circuit-before-validation bug as get(),
         // in remove()'s "unknown key is a harmless no-op" path.
         let dir = TempDir::new("remove-validates-oob-unknown-key");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         assert_eq!(
             w.remove(&coord3(WORLD_DIM, 0, 0), "never-set")
@@ -744,7 +848,7 @@ mod tests {
         // effect of registering a key nothing was ever actually stored
         // under.
         let dir = TempDir::new("set-no-intern-on-bad-coord");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let err = w.set(&coord3(WORLD_DIM, 0, 0), "material", Value::I64(1));
         assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
@@ -754,7 +858,7 @@ mod tests {
     #[test]
     fn set_then_get_roundtrips_each_value_type() {
         let dir = TempDir::new("set-get-types");
-        let mut w = create(&dir);
+        let w = create(&dir);
         let c = coord3(1, 2, 3);
 
         w.set(&c, "material", Value::Str("stone".into())).unwrap();
@@ -772,7 +876,7 @@ mod tests {
     #[test]
     fn set_overwrites_previous_value_at_same_cell_and_key() {
         let dir = TempDir::new("overwrite");
-        let mut w = create(&dir);
+        let w = create(&dir);
         let c = coord3(9, 9, 9);
 
         w.set(&c, "material", Value::Str("stone".into())).unwrap();
@@ -787,7 +891,7 @@ mod tests {
     #[test]
     fn set_on_one_cell_does_not_affect_neighbors_or_other_keys() {
         let dir = TempDir::new("isolation");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
             .unwrap();
@@ -801,7 +905,7 @@ mod tests {
     #[test]
     fn set_across_multiple_chunks() {
         let dir = TempDir::new("multi-chunk");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         // CHUNK_DIM cells apart on axis 0 guarantees these land in different
         // chunks.
@@ -823,7 +927,7 @@ mod tests {
     #[test]
     fn interning_a_new_key_grows_the_schema() {
         let dir = TempDir::new("schema-growth");
-        let mut w = create(&dir);
+        let w = create(&dir);
         assert_eq!(w.schema_len(), 0);
 
         w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
@@ -844,13 +948,13 @@ mod tests {
         let dir = TempDir::new("set-persist");
         let c = coord3(100, 200, 300);
         {
-            let mut w = create(&dir);
+            let w = create(&dir);
             w.set(&c, "material", Value::Str("stone".into())).unwrap();
             w.set(&c, "density", Value::F64(2.5)).unwrap();
             w.flush().unwrap();
         }
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         assert_eq!(
             w.get(&c, "material").unwrap(),
             Some(Value::Str("stone".into()))
@@ -863,7 +967,7 @@ mod tests {
     #[test]
     fn remove_clears_cell_in_same_session() {
         let dir = TempDir::new("same-session");
-        let mut w = create(&dir);
+        let w = create(&dir);
         let c = coord3(1, 2, 3);
 
         w.set(&c, "material", Value::Str("stone".into())).unwrap();
@@ -879,7 +983,7 @@ mod tests {
     #[test]
     fn remove_of_unset_key_is_a_harmless_noop() {
         let dir = TempDir::new("noop");
-        let mut w = create(&dir);
+        let w = create(&dir);
         let c = coord3(4, 5, 6);
 
         // Key was never interned anywhere in the world.
@@ -897,13 +1001,13 @@ mod tests {
         let dir = TempDir::new("persist");
         let c = coord3(100, 200, 300);
         {
-            let mut w = create(&dir);
+            let w = create(&dir);
             w.set(&c, "material", Value::Str("stone".into())).unwrap();
             w.remove(&c, "material").unwrap();
             w.flush().unwrap();
         }
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         assert_eq!(w.get(&c, "material").unwrap(), None);
     }
 
@@ -913,7 +1017,7 @@ mod tests {
         let c = coord3(0, 0, 0);
         let chunk_path;
         {
-            let mut w = create(&dir);
+            let w = create(&dir);
             w.set(&c, "material", Value::Str("stone".into())).unwrap();
             w.flush().unwrap();
             let (ckey, _) = w.split(&c).unwrap();
@@ -924,7 +1028,7 @@ mod tests {
             "chunk file should exist once populated"
         );
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         w.remove(&c, "material").unwrap();
         w.flush().unwrap();
         assert!(
@@ -942,7 +1046,7 @@ mod tests {
     #[test]
     fn get_region_on_untouched_world_is_all_none() {
         let dir = TempDir::new("region-untouched");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(5, 5, 5), coord3(3, 2, 2));
         let got = w.get_region(&region, "material").unwrap();
@@ -953,7 +1057,7 @@ mod tests {
     #[test]
     fn set_region_then_get_region_roundtrips_within_one_chunk() {
         let dir = TempDir::new("region-roundtrip");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(1, 1, 1), coord3(4, 3, 2));
         w.set_region(
@@ -971,7 +1075,7 @@ mod tests {
     #[test]
     fn set_region_writes_distinct_per_cell_values() {
         let dir = TempDir::new("region-per-cell");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(10, 20, 30), coord3(3, 2, 2));
         let values: Vec<Value> = (0..region.volume())
@@ -988,7 +1092,7 @@ mod tests {
     #[test]
     fn set_region_rejects_a_mismatched_value_count() {
         let dir = TempDir::new("region-bad-count");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(0, 0, 0), coord3(2, 2, 2));
         let too_few = vec![Value::I64(0); region.volume() as usize - 1];
@@ -1003,7 +1107,7 @@ mod tests {
     #[test]
     fn set_region_does_not_leak_outside_its_bounds() {
         let dir = TempDir::new("region-bounds");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(10, 10, 10), coord3(2, 2, 2));
         w.set_region(
@@ -1027,7 +1131,7 @@ mod tests {
     #[test]
     fn get_region_orders_results_axis0_fastest() {
         let dir = TempDir::new("region-order");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(10, 20, 30), coord3(3, 2, 2));
 
@@ -1047,7 +1151,7 @@ mod tests {
     #[test]
     fn region_spans_chunks_including_partial_chunks() {
         let dir = TempDir::new("region-span-chunks");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         // Starts 5 cells before a chunk boundary and ends 5 cells past the
         // next one, on every axis: covers the tail of one chunk, all of a
@@ -1068,7 +1172,7 @@ mod tests {
         // in-process anymore -- every read already goes straight to disk,
         // see `with_chunk`) to double-check a fresh handle sees exactly
         // what was written, the same as a second process attaching would.
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         let got = w.get_region(&region, "material").unwrap();
         assert_eq!(got.len(), region.volume() as usize);
         assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
@@ -1081,7 +1185,7 @@ mod tests {
     #[test]
     fn remove_region_clears_key_across_chunks_without_touching_others() {
         let dir = TempDir::new("region-remove");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let x0 = CHUNK_DIM - 2;
         let region = Region::new(coord3(x0, 0, 0), coord3(5, 5, 5));
@@ -1106,7 +1210,7 @@ mod tests {
     #[test]
     fn remove_region_of_unknown_key_is_a_harmless_noop() {
         let dir = TempDir::new("region-remove-unknown");
-        let mut w = create(&dir);
+        let w = create(&dir);
         // Should not error even though "material" has never been interned.
         w.remove_region(&Region::new(coord3(0, 0, 0), coord3(4, 4, 4)), "material")
             .unwrap();
@@ -1115,7 +1219,7 @@ mod tests {
     #[test]
     fn zero_sized_region_is_a_harmless_noop() {
         let dir = TempDir::new("region-zero");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let zero_extent = coord3(0, 5, 5); // zero on any single axis empties the whole region
 
@@ -1142,7 +1246,7 @@ mod tests {
     #[test]
     fn region_out_of_world_bounds_is_an_error() {
         let dir = TempDir::new("region-oob");
-        let mut w = create(&dir);
+        let w = create(&dir);
 
         let region = Region::new(coord3(WORLD_DIM - 1, 0, 0), coord3(2, 1, 1));
         assert_eq!(
@@ -1167,7 +1271,7 @@ mod tests {
     #[test]
     fn region_with_wrong_axis_count_is_an_error() {
         let dir = TempDir::new("region-wrong-axes");
-        let mut w = create(&dir); // 3-axis world
+        let w = create(&dir); // 3-axis world
 
         let region = Region::new(vec![0, 0], vec![2, 2]); // 2 axes
         assert_eq!(
@@ -1183,7 +1287,7 @@ mod tests {
         // origin.len() == extent.len() -- check_region must catch this
         // rather than leaving it to panic or index out of bounds later.
         let dir = TempDir::new("region-mismatched-origin-extent");
-        let mut w = create(&dir); // 3-axis world
+        let w = create(&dir); // 3-axis world
 
         let region = Region::new(vec![0, 0, 0], vec![2, 2]); // 3 origin axes, 2 extent axes
         assert_eq!(
@@ -1197,7 +1301,7 @@ mod tests {
         let dir = TempDir::new("region-persist");
         let region = Region::new(coord3(100, 100, 100), coord3(3, 3, 3));
         {
-            let mut w = create(&dir);
+            let w = create(&dir);
             w.set_region(
                 &region,
                 "material",
@@ -1207,7 +1311,7 @@ mod tests {
             w.flush().unwrap();
         }
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         let got = w.get_region(&region, "material").unwrap();
         assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
     }
@@ -1234,7 +1338,7 @@ mod tests {
                 let path = PathBuf::from(dir.as_ref());
                 let c = c.clone();
                 thread::spawn(move || {
-                    let mut w = World::open(&path).unwrap();
+                    let w = World::open(&path).unwrap();
                     w.set(&c, &format!("key{i}"), Value::I64(i)).unwrap();
                 })
             })
@@ -1243,7 +1347,7 @@ mod tests {
             h.join().unwrap();
         }
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         for i in 0..n {
             assert_eq!(
                 w.get(&c, &format!("key{i}")).unwrap(),
@@ -1269,7 +1373,7 @@ mod tests {
             .map(|i| {
                 let path = PathBuf::from(dir.as_ref());
                 thread::spawn(move || {
-                    let mut w = World::open(&path).unwrap();
+                    let w = World::open(&path).unwrap();
                     w.set(&coord3(0, 0, 0), &format!("key{i}"), Value::I64(i))
                         .unwrap();
                 })
@@ -1285,7 +1389,7 @@ mod tests {
         // of these reads would come back wrong (a different key's value,
         // or a type mismatch panic in Chunk::set from two different
         // value types sharing a column).
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         assert_eq!(w.schema_len(), n as usize);
         for i in 0..n {
             assert_eq!(
@@ -1313,7 +1417,7 @@ mod tests {
                 let region = region.clone();
                 let values = fill(&region, Value::Str(key.into()));
                 thread::spawn(move || {
-                    let mut w = World::open(&path).unwrap();
+                    let w = World::open(&path).unwrap();
                     w.set_region(&region, key, &values).unwrap();
                 })
             })
@@ -1322,10 +1426,181 @@ mod tests {
             h.join().unwrap();
         }
 
-        let mut w = World::open(&dir).unwrap();
+        let w = World::open(&dir).unwrap();
         let a = w.get_region(&region, "a").unwrap();
         let b = w.get_region(&region, "b").unwrap();
         assert!(a.iter().all(|v| *v == Some(Value::Str("a".into()))));
         assert!(b.iter().all(|v| *v == Some(Value::Str("b".into()))));
+    }
+
+    #[test]
+    fn one_world_is_usable_concurrently_via_arc_with_no_external_lock() {
+        // The point of &self (not &mut self) throughout: a single process
+        // can share one `World` behind a plain `Arc` -- no
+        // `Mutex<World>` wrapper needed -- and let concurrent calls into
+        // it actually run concurrently, limited only by the per-chunk file
+        // locks `with_chunk` already takes. This wouldn't even compile if
+        // any method still required `&mut self`.
+        let dir = TempDir::new("arc-shared-concurrent");
+        let w = std::sync::Arc::new(create(&dir));
+        let n = 32;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let w = std::sync::Arc::clone(&w);
+                thread::spawn(move || {
+                    // Disjoint cells -- this exercises real concurrent
+                    // execution (different chunks, no lock contention
+                    // between threads), not just concurrent *calls* that
+                    // happen to serialize.
+                    let c = coord3(i, i, i);
+                    w.set(&c, "bench", Value::I64(i as i64)).unwrap();
+                    w.get(&c, "bench").unwrap()
+                })
+            })
+            .collect();
+
+        for (i, h) in handles.into_iter().enumerate() {
+            assert_eq!(h.join().unwrap(), Some(Value::I64(i as i64)));
+        }
+
+        // And everything actually landed, from any handle.
+        for i in 0..n {
+            assert_eq!(
+                w.get(&coord3(i, i, i), "bench").unwrap(),
+                Some(Value::I64(i as i64))
+            );
+        }
+    }
+
+    #[test]
+    fn default_max_concurrent_disk_ops_is_the_documented_constant() {
+        let dir = TempDir::new("cap-default");
+        let w = create(&dir);
+        assert_eq!(w.max_concurrent_disk_ops(), DEFAULT_MAX_CONCURRENT_DISK_OPS);
+    }
+
+    #[test]
+    fn with_max_concurrent_disk_ops_overrides_the_default() {
+        let dir = TempDir::new("cap-override");
+        let w = World::create(&dir, AXES, WORLD_DIM)
+            .unwrap()
+            .with_max_concurrent_disk_ops(3);
+        assert_eq!(w.max_concurrent_disk_ops(), 3);
+    }
+
+    #[test]
+    fn zero_max_concurrent_disk_ops_is_treated_as_one_not_a_deadlock() {
+        let dir = TempDir::new("cap-zero");
+        let w = World::create(&dir, AXES, WORLD_DIM)
+            .unwrap()
+            .with_max_concurrent_disk_ops(0);
+        assert_eq!(w.max_concurrent_disk_ops(), 1);
+        // And it must still actually work, not just report "1".
+        w.set(&coord3(0, 0, 0), "material", Value::I64(1)).unwrap();
+        assert_eq!(
+            w.get(&coord3(0, 0, 0), "material").unwrap(),
+            Some(Value::I64(1))
+        );
+    }
+
+    #[test]
+    fn a_tight_cap_does_not_break_correctness_under_real_concurrency() {
+        // Reruns the same shape as
+        // concurrent_writers_to_sibling_keys_on_the_same_cell_do_not_lose_updates,
+        // but with the cap forced down to 1 -- i.e. with_chunk calls fully
+        // serialized -- to make sure the semaphore is a pure scheduling
+        // change, not a correctness one.
+        let dir = TempDir::new("cap-one-correctness");
+        let w = std::sync::Arc::new(
+            World::create(&dir, AXES, WORLD_DIM)
+                .unwrap()
+                .with_max_concurrent_disk_ops(1),
+        );
+        let c = coord3(1, 1, 1);
+        let n = 16;
+
+        let handles: Vec<_> = (0..n)
+            .map(|i| {
+                let w = std::sync::Arc::clone(&w);
+                let c = c.clone();
+                thread::spawn(move || {
+                    w.set(&c, &format!("key{i}"), Value::I64(i)).unwrap();
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        for i in 0..n {
+            assert_eq!(w.get(&c, &format!("key{i}")).unwrap(), Some(Value::I64(i)));
+        }
+    }
+
+    #[test]
+    fn max_concurrent_disk_ops_actually_limits_concurrency() {
+        // A tight cap forces what would otherwise be concurrent,
+        // disjoint-chunk writes to run effectively serially; a generous
+        // cap lets them overlap freely. If with_max_concurrent_disk_ops
+        // didn't actually gate with_chunk, these two would take about the
+        // same wall-clock time -- they shouldn't.
+        //
+        // Each of `workers` threads does `ops_per_worker` real,
+        // disjoint-chunk writes (not just `workers` total): a handful of
+        // threads doing one op each makes this a wall-clock comparison
+        // between real (small, sub-millisecond-scale) filesystem work and
+        // one-time OS-thread-spawn overhead, which is noisy enough to make
+        // the test flaky (confirmed while writing it). Enough aggregate
+        // work per worker makes the real per-op I/O time dominate that
+        // fixed overhead instead.
+        fn time_writes(
+            w: &std::sync::Arc<World>,
+            workers: u32,
+            ops_per_worker: u32,
+        ) -> std::time::Duration {
+            let t0 = std::time::Instant::now();
+            let handles: Vec<_> = (0..workers)
+                .map(|worker| {
+                    let w = std::sync::Arc::clone(w);
+                    thread::spawn(move || {
+                        for op in 0..ops_per_worker {
+                            let seed = worker * ops_per_worker + op;
+                            w.set(&coord3(seed, seed, seed), "bench", Value::I64(seed as i64))
+                                .unwrap();
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+            t0.elapsed()
+        }
+
+        let workers = 8;
+        let ops_per_worker = 30;
+
+        let dir_serial = TempDir::new("cap-timing-serial");
+        let w_serial = std::sync::Arc::new(
+            World::create(&dir_serial, AXES, WORLD_DIM)
+                .unwrap()
+                .with_max_concurrent_disk_ops(1),
+        );
+        let serial = time_writes(&w_serial, workers, ops_per_worker);
+
+        let dir_parallel = TempDir::new("cap-timing-parallel");
+        let w_parallel = std::sync::Arc::new(
+            World::create(&dir_parallel, AXES, WORLD_DIM)
+                .unwrap()
+                .with_max_concurrent_disk_ops(workers as usize),
+        );
+        let parallel = time_writes(&w_parallel, workers, ops_per_worker);
+
+        assert!(
+            serial > parallel,
+            "serial (cap=1, {serial:?}) should be slower than parallel (cap={workers}, \
+             {parallel:?}) -- the cap doesn't seem to be limiting anything"
+        );
     }
 }

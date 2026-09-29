@@ -49,7 +49,7 @@ fn run() -> io::Result<()> {
     // this data dir) and validates an existing one (every later run): if
     // `root/world.txt` already holds different axes/world_dim, this fails
     // loudly instead of silently reinterpreting whatever's on disk.
-    let mut w = World::create(&root, world::AXES, world::WORLD_DIM)?;
+    let w = World::create(&root, world::AXES, world::WORLD_DIM)?;
     let axes = w.axes();
     let world_dim = w.world_dim();
 
@@ -114,12 +114,12 @@ fn run() -> io::Result<()> {
     println!("wrote {n} cells (4 keys each, 1-in-50 also get a 5th) in {write_elapsed:?}");
     println!(
         "chunk file writes: {}  |  distinct keys interned: {}",
-        w.chunks_written_to_disk,
+        w.chunks_written_to_disk(),
         w.schema_len()
     );
     logger::info(format!(
         "wrote {n} cells in {write_elapsed:?} ({} chunk file writes, {} keys interned)",
-        w.chunks_written_to_disk,
+        w.chunks_written_to_disk(),
         w.schema_len()
     ));
 

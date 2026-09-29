@@ -14,10 +14,11 @@ mod lock;
 pub mod logger;
 pub mod params;
 pub mod schema;
+mod semaphore;
 pub mod value;
 pub mod world;
 
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::Value;
-pub use world::{Region, World, AXES, WORLD_DIM};
+pub use world::{Region, World, AXES, DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM};
