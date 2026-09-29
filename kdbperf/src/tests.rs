@@ -1,0 +1,153 @@
+//! Integration tests: spawn a real `kdbserver` (or two) and run a real
+//! scenario against it, checking the result is sane (no errors, the right
+//! op count) rather than just that the helper functions compute correctly
+//! in isolation (see the `#[cfg(test)]` blocks in `stats.rs`/`client.rs`/
+//! `scenarios.rs` for those). Skips (rather than failing) if the
+//! `kdbserver` binary isn't built yet, since `cargo test -p kdbperf` alone
+//! doesn't imply `cargo build -p kdbserver` ran first.
+
+use crate::client::Client;
+use crate::scenarios;
+use crate::server::{default_kdbserver_bin, ManagedServer};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_PORT: AtomicU64 = AtomicU64::new(19_080);
+
+fn next_port() -> u64 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+}
+
+fn temp_data_dir(tag: &str) -> PathBuf {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("kdbperf-test-{tag}-{n}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("failed to create temp data dir");
+    dir
+}
+
+/// `None` (the test should skip, not fail) if `kdbserver` hasn't been
+/// built into this same `target/<profile>/` directory yet.
+async fn spawn_test_server(dir: &std::path::Path) -> Option<ManagedServer> {
+    let bin = default_kdbserver_bin();
+    if !bin.exists() {
+        eprintln!(
+            "skipping: {} not found -- run `cargo build -p kdbserver` first",
+            bin.display()
+        );
+        return None;
+    }
+    Some(ManagedServer::spawn(&bin, dir, &format!("127.0.0.1:{}", next_port())).await)
+}
+
+#[tokio::test]
+async fn set_cell_scenario_runs_against_a_real_server_with_no_errors() {
+    let dir = temp_data_dir("set-cell");
+    let Some(server) = spawn_test_server(&dir).await else {
+        return;
+    };
+
+    let client = Client::new(server.url.clone());
+    let health = client.health().await.expect("health check failed");
+    assert_eq!(health.axes, kdb_default_axes());
+
+    let result = scenarios::set_cell(&client, health.axes, health.world_dim, 20).await;
+    assert_eq!(result.throughput.ops, 20);
+    assert_eq!(result.latency.count, 20);
+    assert_eq!(result.latency.errors, 0);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn get_and_remove_cell_scenarios_populate_their_own_data() {
+    let dir = temp_data_dir("get-remove-cell");
+    let Some(server) = spawn_test_server(&dir).await else {
+        return;
+    };
+    let client = Client::new(server.url.clone());
+    let health = client.health().await.unwrap();
+
+    // These scenarios must work even though nothing was set beforehand --
+    // they populate what they need themselves.
+    let get = scenarios::get_cell(&client, health.axes, health.world_dim, 10).await;
+    assert_eq!(get.latency.errors, 0);
+    assert_eq!(get.latency.count, 10);
+
+    let remove = scenarios::remove_cell(&client, health.axes, health.world_dim, 10).await;
+    assert_eq!(remove.latency.errors, 0);
+    assert_eq!(remove.latency.count, 10);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn region_sweep_scenario_runs_with_no_errors() {
+    let dir = temp_data_dir("region-sweep");
+    let Some(server) = spawn_test_server(&dir).await else {
+        return;
+    };
+    let client = Client::new(server.url.clone());
+    let health = client.health().await.unwrap();
+
+    let results = scenarios::region_sweep(&client, health.axes, &[2, 4], 2).await;
+    // 2 edge sizes x (set_region + get_region) = 4 results.
+    assert_eq!(results.len(), 4);
+    for r in &results {
+        assert_eq!(r.latency.errors, 0, "{} {} had errors", r.name, r.detail);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn concurrency_scan_scenario_runs_concurrently_with_no_errors() {
+    let dir = temp_data_dir("concurrency-scan");
+    let Some(server) = spawn_test_server(&dir).await else {
+        return;
+    };
+    let client = Client::new(server.url.clone());
+    let health = client.health().await.unwrap();
+
+    let results =
+        scenarios::concurrency_scan(&client, health.axes, health.world_dim, &[1, 8], 5).await;
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].throughput.ops, 5); // concurrency=1
+    assert_eq!(results[1].throughput.ops, 40); // concurrency=8
+    for r in &results {
+        assert_eq!(r.latency.errors, 0);
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn multi_instance_scenario_runs_against_two_servers_sharing_one_data_dir() {
+    let dir = temp_data_dir("multi-instance");
+    let Some(server_a) = spawn_test_server(&dir).await else {
+        return;
+    };
+    let bin = default_kdbserver_bin();
+    let server_b = ManagedServer::spawn(&bin, &dir, &format!("127.0.0.1:{}", next_port())).await;
+
+    let clients = vec![
+        Client::new(server_a.url.clone()),
+        Client::new(server_b.url.clone()),
+    ];
+    let health = clients[0].health().await.unwrap();
+
+    let result = scenarios::multi_instance(&clients, health.axes, health.world_dim, 8, 5).await;
+    assert_eq!(result.throughput.ops, 40);
+    assert_eq!(result.latency.errors, 0);
+    assert!(result.detail.contains("instances=2"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `kdb::AXES`'s default, duplicated as a literal since kdbperf
+/// deliberately doesn't depend on `kdb` (it treats kdbserver as a black
+/// box over HTTP) -- used only to sanity-check a freshly spawned test
+/// server came up with the shape we expect.
+fn kdb_default_axes() -> usize {
+    3
+}

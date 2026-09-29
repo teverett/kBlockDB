@@ -1,6 +1,6 @@
 # kdb
 
-A Cargo workspace with two crates:
+A Cargo workspace with three crates:
 
 - **`kdb`** -- a prototype storage engine for a huge simulation grid where
   every cell is its own key/value store (string keys; string, f64, or i64
@@ -14,10 +14,15 @@ A Cargo workspace with two crates:
   standard modern Rust web stack (axum + tokio + serde) -- that
   dependency-free constraint was specific to `kdb`'s storage format, not to
   everything built on top of it.
+- **`kdbperf`** -- a performance test suite that drives a real `kdbserver`
+  (or several) over real HTTP and measures it: single-cell and region
+  throughput/latency, concurrency scaling, lock contention, and multi-process
+  scaling across several instances sharing one data directory.
 
 ```
 kdb/         the storage engine (library `kdb` + demo binary `kdb`)
 kdbserver/   the REST server (binary `kdbserver`, depends on kdb)
+kdbperf/     the performance test suite (binary `kdbperf`, drives kdbserver over HTTP)
 ```
 
 ## `kdb`: the storage engine
@@ -280,6 +285,87 @@ curl -X DELETE localhost:8080/regions/0,0,0/8,8,8/material
 - `kdbserver/src/tests.rs`      -- HTTP-level integration tests (real
   requests through the real `Router` via `tower::ServiceExt::oneshot`, no
   TCP socket needed).
+
+## `kdbperf`: the performance test suite
+
+Drives a real `kdbserver` process (by default, one or more it spawns and
+tears down itself) over real HTTP and measures it -- this is a measurement
+of what a client actually experiences, not a microbenchmark of `kdb`'s
+internals.
+
+### Build & run
+
+```sh
+cargo build --workspace --release
+./target/release/kdbperf                       # spawns its own instance(s), runs every scenario
+./target/release/kdbperf --scenario set_cell    # just one scenario
+./target/release/kdbperf --json > results.json  # machine-readable output
+./target/release/kdbperf --url http://localhost:8080   # target an already-running instance instead
+```
+
+Run `--help` for the full flag list (concurrency levels, op counts, region
+sizes, instance count, etc.) -- everything has a default chosen to finish a
+full run in well under a minute, and every default is overridable.
+
+### Scenarios
+
+- **`set_cell` / `get_cell` / `remove_cell`** -- sequential (one client, no
+  concurrency) single-cell operations on `--cells` distinct cells.
+  `get_cell`/`remove_cell` populate their own data first (untimed), so
+  they measure just the operation named, and are runnable on their own.
+- **`region`** -- `set_region`/`get_region` at each edge length in
+  `--region-edges` (a cube of that edge on every axis), repeated
+  `--region-reps` times. Because `kdb`'s region methods touch each chunk a
+  region spans exactly once regardless of how many cells land in it (see
+  `kdb`'s "Concurrency" section above), these routinely report far higher
+  effective cells/sec than the single-cell scenarios -- that gap *is* the
+  batching win region operations exist for.
+- **`concurrency_scan`** -- `set` from `--concurrency` concurrent clients,
+  each on its own disjoint cells (different chunks, typically), at each
+  level in the list. Shows how throughput scales with concurrency when
+  requests don't contend for the same chunk.
+- **`contended_cell`** -- the same concurrency sweep, but every client
+  targets the *same* cell (different keys, so it's not just racing an
+  identical overwrite). `kdb::World::set` takes an exclusive lock on that
+  cell's chunk file per call and must read-modify-write the *whole* chunk
+  file every time (more expensive the more distinct keys have accumulated
+  in it), so this is typically much slower than `concurrency_scan` even at
+  the same concurrency level -- contrasting the two is the point.
+- **`multi_instance`** -- the same disjoint-cell concurrency sweep, run
+  once against one server and once against several servers (`--instances`,
+  sharing one data directory, round-robin) at the same total concurrency.
+  A single `kdbserver` process serializes every request through one
+  `Mutex<World>` regardless of `kdb`'s own per-chunk locking (see
+  `kdbserver/src/state.rs`), so that lock only stops being the bottleneck
+  once there's more than one *process* to spread load across -- this is
+  the scenario that actually demonstrates multi-process scaling, and the
+  reason `kdbperf` spawns multiple instances by default. Interpreting the
+  result honestly: on one machine, multiple `kdbserver` processes also
+  compete for the same CPU cores and disk, so how much (if any) improvement
+  shows up depends on real available headroom -- this scenario is most
+  meaningful comparing genuinely separate deployments (e.g. `--url` pointed
+  at instances on different machines/containers), where that competition
+  doesn't exist.
+
+### Layout
+
+- `kdbperf/src/main.rs`      -- CLI parsing and orchestration: spawn or
+  connect to server(s), run the selected scenarios, print the report.
+- `kdbperf/src/client.rs`    -- a thin async HTTP client for kdbserver's
+  REST API (every value used is an `i64`, so payload shape stays constant
+  across scenarios).
+- `kdbperf/src/server.rs`    -- `ManagedServer`, which spawns a `kdbserver`
+  child process and kills it on drop, and locates the `kdbserver` binary
+  built alongside this one.
+- `kdbperf/src/scenarios.rs` -- the scenarios themselves.
+- `kdbperf/src/stats.rs`     -- latency percentiles and throughput,
+  computed from a plain sorted `Vec<Duration>` (sample counts here are
+  thousands, not millions -- a histogram crate would be solving a problem
+  this doesn't have).
+- `kdbperf/src/report.rs`    -- table/JSON output.
+- `kdbperf/src/tests.rs`     -- integration tests that spawn a real
+  `kdbserver` (or two, sharing one data dir) and run a real scenario
+  against it.
 
 ## Build & test everything
 

@@ -1,0 +1,21 @@
+[package]
+name = "kdbperf"
+version = "0.1.0"
+edition = "2021"
+
+# A performance test suite that drives a real kdbserver process (or several)
+# over real HTTP -- not a microbenchmark of kdb's internals, a measurement of
+# what a client actually experiences. Like kdbserver, this crate takes on
+# whatever dependencies make that straightforward; the dependency-free
+# constraint was specific to kdb's storage format.
+
+[[bin]]
+name = "kdbperf"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP-only (no https:// target here), so no TLS backend is pulled in.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
