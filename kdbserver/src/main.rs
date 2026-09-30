@@ -2,6 +2,7 @@ mod auth;
 mod config;
 mod coords;
 mod error;
+mod openapi;
 mod routes;
 mod state;
 #[cfg(test)]

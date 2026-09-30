@@ -5,8 +5,17 @@
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
-use serde_json::json;
+use serde::Serialize;
 use std::io;
+use utoipa::ToSchema;
+
+/// The wire shape of every error response: `{"error": "<message>"}`. A
+/// real type (not just a `serde_json::json!` map) so the OpenAPI spec
+/// (`openapi.rs`) has a concrete schema to point error responses at.
+#[derive(Serialize, ToSchema)]
+pub struct ErrorBody {
+    pub error: String,
+}
 
 #[derive(Debug)]
 pub enum ApiError {
@@ -50,6 +59,6 @@ impl IntoResponse for ApiError {
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),
         };
-        (status, Json(json!({ "error": message }))).into_response()
+        (status, Json(ErrorBody { error: message })).into_response()
     }
 }

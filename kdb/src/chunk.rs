@@ -166,6 +166,15 @@ impl Chunk {
         })
     }
 
+    /// `value`'s type must match whatever `key_id` already holds elsewhere
+    /// in this chunk (if anything) -- callers (`World::set`/`set_region`)
+    /// are expected to have already checked that against `Schema`, which
+    /// records a key's type once, world-wide, the first time it's ever set
+    /// (see `Schema`'s doc comment). The `panic!`s below are that
+    /// assumption made explicit: reaching them means a caller skipped that
+    /// check, not a normal, reachable-from-user-input outcome -- unlike
+    /// `Schema::intern`'s type check, which returns a graceful
+    /// `InvalidInput` error for exactly this situation.
     pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value) {
         let presence_bytes = self.presence_bytes;
         let col = self.columns.entry(key_id).or_insert_with(|| Column {
@@ -186,8 +195,8 @@ impl Chunk {
                 (ColumnData::I64(v), Value::I64(x)) => v[rank] = x,
                 (ColumnData::Str(v), Value::Str(x)) => v[rank] = x,
                 _ => panic!(
-                    "key {key_id} already holds a different value type in this chunk; \
-                     this prototype doesn't support changing a key's type"
+                    "key {key_id} already holds a different value type in this chunk -- \
+                     caller should have checked this against Schema first"
                 ),
             }
         } else {
@@ -197,8 +206,8 @@ impl Chunk {
                 (ColumnData::I64(v), Value::I64(x)) => v.insert(rank, x),
                 (ColumnData::Str(v), Value::Str(x)) => v.insert(rank, x),
                 _ => panic!(
-                    "key {key_id} already holds a different value type in this chunk; \
-                     this prototype doesn't support changing a key's type"
+                    "key {key_id} already holds a different value type in this chunk -- \
+                     caller should have checked this against Schema first"
                 ),
             }
         }

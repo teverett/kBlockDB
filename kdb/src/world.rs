@@ -528,7 +528,10 @@ impl World {
         // shouldn't have the side effect of permanently registering a new
         // key that was never actually written anywhere.
         let (ckey, local_idx) = self.split(coord)?;
-        let key_id = self.schema().intern(key)?;
+        // intern also enforces `key`'s type (fixed the first time it's set
+        // -- see `Schema`'s doc comment), so a type mismatch fails here,
+        // before touching any chunk, as a normal `InvalidInput` error.
+        let key_id = self.schema().intern(key, value.value_type())?;
         self.with_chunk(&ckey, Access::Write, |chunk| {
             chunk.set(local_idx, key_id, value)
         })
@@ -625,8 +628,11 @@ impl World {
     /// and partial chunks exactly like `get_region`. `values` holds one
     /// value per cell, in the same order as `get_region`'s result (see
     /// `RegionIter`), and its length must equal `region.volume()` exactly,
-    /// or this returns an `InvalidInput` error without writing anything. A
-    /// no-op region (any axis's extent zero, so `values` must be empty too)
+    /// or this returns an `InvalidInput` error without writing anything.
+    /// Every value in `values` must also be the same type, and match
+    /// `key`'s type if it's been set anywhere before (see `Schema`'s doc
+    /// comment) -- same error, same all-or-nothing guarantee. A no-op
+    /// region (any axis's extent zero, so `values` must be empty too)
     /// doesn't even intern `key`.
     pub fn set_region(&self, region: &Region, key: &str, values: &[Value]) -> io::Result<()> {
         self.check_region(region)?;
@@ -643,7 +649,19 @@ impl World {
         if volume == 0 {
             return Ok(());
         }
-        let key_id = self.schema().intern(key)?;
+        let value_type = values[0].value_type();
+        if let Some(bad) = values.iter().position(|v| v.value_type() != value_type) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "set_region: values must all be the same type -- value 0 is {} but \
+                     value {bad} is {}",
+                    value_type.as_str(),
+                    values[bad].value_type().as_str()
+                ),
+            ));
+        }
+        let key_id = self.schema().intern(key, value_type)?;
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             self.with_chunk(&ckey, Access::Write, |chunk| {
                 for (i, local_idx) in cells {
@@ -978,6 +996,34 @@ mod tests {
     }
 
     #[test]
+    fn set_rejects_a_different_type_for_an_already_used_key_anywhere_in_the_world() {
+        let dir = TempDir::new("type-mismatch-set");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "temperature", Value::F64(20.0))
+            .unwrap();
+
+        // Same key, a *different, far-away cell* (a different chunk
+        // entirely) -- the type conflict must still be caught, since it's
+        // recorded in the schema, not per-chunk.
+        let err = w
+            .set(&coord3(9_000, 9_000, 9_000), "temperature", Value::I64(20))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("temperature"));
+
+        // The failed set didn't write anything, and the original value is
+        // untouched.
+        assert_eq!(
+            w.get(&coord3(9_000, 9_000, 9_000), "temperature").unwrap(),
+            None
+        );
+        assert_eq!(
+            w.get(&coord3(0, 0, 0), "temperature").unwrap(),
+            Some(Value::F64(20.0))
+        );
+    }
+
+    #[test]
     fn set_on_one_cell_does_not_affect_neighbors_or_other_keys() {
         let dir = TempDir::new("isolation");
         let w = create(&dir);
@@ -1191,6 +1237,39 @@ mod tests {
         // The rejected call must not have written anything.
         let got = w.get_region(&region, "n").unwrap();
         assert!(got.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn set_region_rejects_mixed_value_types_in_one_call() {
+        let dir = TempDir::new("region-mixed-types");
+        let w = create(&dir);
+
+        let region = Region::new(coord3(0, 0, 0), coord3(2, 2, 2)); // 8 cells
+        let mut values = vec![Value::I64(0); 8];
+        values[5] = Value::Str("oops".into());
+        let err = w.set_region(&region, "n", &values).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // All-or-nothing: not even the 5 consistent values before the odd
+        // one out got written.
+        let got = w.get_region(&region, "n").unwrap();
+        assert!(got.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn set_region_rejects_a_type_that_does_not_match_the_keys_existing_type() {
+        let dir = TempDir::new("region-type-mismatch");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "n", Value::I64(1)).unwrap();
+
+        let region = Region::new(coord3(0, 0, 0), coord3(2, 2, 2));
+        let values = vec![Value::F64(1.0); region.volume() as usize];
+        let err = w.set_region(&region, "n", &values).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        // The pre-existing cell is untouched, and the rest of the region
+        // still reads as unset.
+        assert_eq!(w.get(&coord3(0, 0, 0), "n").unwrap(), Some(Value::I64(1)));
     }
 
     #[test]

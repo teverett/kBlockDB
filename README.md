@@ -1,6 +1,6 @@
 # kdb
 
-A Cargo workspace with three crates:
+A Cargo workspace with four crates:
 
 - **`kdb`** -- a prototype storage engine for a huge simulation grid where
   every cell is its own key/value store (string keys; string, f64, or i64
@@ -18,11 +18,16 @@ A Cargo workspace with three crates:
   (or several) over real HTTP and measures it: single-cell and region
   throughput/latency, concurrency scaling, lock contention, and multi-process
   scaling across several instances sharing one data directory.
+- **`kdbcli`** -- a small command-line client for kdbserver's REST API:
+  `get`/`set`/`remove` a single cell's value from a shell, authenticating
+  like `curl -u` would. A pure HTTP client, same as `kdbperf` -- it treats
+  kdbserver as a black box over its REST API, not `kdb` directly.
 
 ```
 kdb/         the storage engine (library `kdb` + demo binary `kdb`)
 kdbserver/   the REST server (binary `kdbserver`, depends on kdb)
 kdbperf/     the performance test suite (binary `kdbperf`, drives kdbserver over HTTP)
+kdbcli/      the command-line client (binary `kdbcli`, drives kdbserver over HTTP)
 ```
 
 ## `kdb`: the storage engine
@@ -44,10 +49,14 @@ kdbperf/     the performance test suite (binary `kdbperf`, drives kdbserver over
   this chunk" touches one contiguous array, not a trillion separate hashmap
   lookups.
 
-- **Global key interning.** Key strings ("temperature", "material", ...)
-  are interned once into small integer ids in `schema.txt` at the world
-  root (append-only, so ids never change). Chunks store columns by id, not
-  by string.
+- **Global key interning, type fixed on first use.** Key strings
+  ("temperature", "material", ...) are interned once into small integer ids
+  in `schema.txt` at the world root (append-only, so ids never change), and
+  the value type (`str`/`f64`/`i64`) `set` first used for that key is
+  recorded alongside the id and permanently fixed from then on, world-wide
+  -- a later `set` for the same key with a different type fails with a
+  normal `InvalidInput` error rather than writing anything. Chunks store
+  columns by id, not by string.
 
 - **No client-side cache -- every operation is durable and lock-guarded on
   its own.** `get`/`set`/`remove` lock (shared for a read, exclusive for a
@@ -195,7 +204,9 @@ packed value array. That costs two different things:
 
 - `kdb/src/lib.rs`    -- the library crate root; re-exports `World`,
   `Value`, `Region`, `Coord`, `WorldParams`, `AXES`, `WORLD_DIM`.
-- `kdb/src/value.rs`  -- the `Value` enum (Str/F64/I64) and its type tags.
+- `kdb/src/value.rs`  -- the `Value` enum (Str/F64/I64), its on-disk type
+  tags, and `ValueType` (a `Value` without the value itself -- what
+  `Schema` records per key).
 - `kdb/src/coord.rs`  -- `Coord`, a small-vec-style `u32` sequence (inline
   up to 8 axes, heap beyond that) used for coordinates and chunk keys. A
   world's axis count is a runtime value (see `params.rs`), so a coordinate
@@ -212,6 +223,8 @@ packed value array. That costs two different things:
   lock-guarded operation `World::create` needs.
 - `kdb/src/schema.rs` -- global key-string <-> id registry (`schema.txt`),
   lock-guarded so concurrent interning of different new keys can't collide.
+  Also records each key's value type on first use and enforces it on every
+  later `intern` call, world-wide (see `ValueType` in `value.rs`).
 - `kdb/src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
   serialization, unit tests. Its cell count (`chunk_cells(axes)`) is
   computed at runtime from the owning world's axis count.
@@ -308,6 +321,17 @@ entry defaults to full read/write access, same as `admin`; set
 
 ### REST API
 
+An OpenAPI spec for everything below is generated (via
+[utoipa](https://github.com/juhaku/utoipa)) straight from the same
+`#[utoipa::path(...)]` annotations on each handler in
+`kdbserver/src/routes.rs` -- served as JSON at `GET /api-docs/openapi.json`
+and browsable interactively at `GET /swagger-ui/`, both unauthenticated
+(like `/health`, they describe the API, not any of its data). Because the
+spec is generated from the same annotations the router is built from,
+adding or changing a route without updating its annotation is a compile
+error, not documentation that silently drifts from what the server
+actually does.
+
 Every endpoint below except `/health` requires **HTTP Basic Auth** against
 one of the config file's accounts (`admin`/`admin_password`, or a
 `[[users]]` entry) -- a request with no `Authorization` header, an unknown
@@ -403,14 +427,19 @@ curl -u admin:change-me localhost:8080/stats
   `[[users]]`) and its validation.
 - `kdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
   to every route except `/health`, including the `read_only` write check.
-- `kdbserver/src/routes.rs`     -- the router and all HTTP handlers.
+- `kdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each
+  one's `#[utoipa::path(...)]` OpenAPI annotation.
+- `kdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
+  that collects every handler's annotation (and every response type's
+  `#[derive(ToSchema)]`) into the spec served at `/api-docs/openapi.json`,
+  plus the `basic_auth` security scheme those annotations reference.
 - `kdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
   `World`, plus the configured accounts) and `with_world`, which runs each
   `World` call on a `spawn_blocking` thread so `World`'s synchronous file
   I/O never blocks the async runtime.
 - `kdbserver/src/value_json.rs` -- `ValueJson`, the JSON wire format for
   `kdb::Value` (kept in this crate, not `kdb`, since `kdb` itself doesn't
-  depend on `serde`).
+  depend on `serde`), also `ToSchema` for its OpenAPI schema.
 - `kdbserver/src/coords.rs`     -- parses the comma-separated coordinate
   path segments.
 - `kdbserver/src/error.rs`      -- `ApiError`, the one error type every
@@ -511,6 +540,61 @@ full run in well under a minute, and every default is overridable.
 - `kdbperf/src/tests.rs`     -- integration tests that spawn a real
   `kdbserver` (or two, sharing one data dir) and run a real scenario
   against it.
+
+## `kdbcli`: the command-line client
+
+A thin wrapper over kdbserver's `/cells/{coords}/{key}` endpoint -- `get`,
+`set`, and `remove` one cell's value from a shell, with the same HTTP
+Basic Auth every other client of kdbserver's REST API needs.
+
+### Build & run
+
+```sh
+cargo build --release
+./target/release/kdbcli --password change-me set 1,2,3 material str stone
+./target/release/kdbcli --password change-me get 1,2,3 material
+# str stone
+./target/release/kdbcli --password change-me remove 1,2,3 material
+```
+
+```
+USAGE:
+    kdbcli [OPTIONS] <COMMAND> [ARGS]
+
+COMMANDS:
+    get <coords> <key>                  Print a cell's value, as `<type> <value>`
+    set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)
+    remove <coords> <key>               Clear a cell's value
+
+OPTIONS:
+    --url <url>        kdbserver base URL (default: http://127.0.0.1:8080)
+    --user <name>      Username (default: admin)
+    --password <pw>    Password (or set the KDBCLI_PASSWORD env var, so it
+                        doesn't end up in shell history)
+    -h, --help         Print this help
+```
+
+`<coords>` is a comma-separated coordinate, one `u32` per axis (`1,2,3` for
+a 3-axis world), matching however many axes the target world was created
+with -- same convention as the REST API itself.
+
+`get`'s output and `set`'s trailing two arguments share one format
+(`<type> <value>`, e.g. `str stone` or `i64 42`) on purpose, so the two
+compose directly: `kdbcli ... set 4,5,6 backup $(kdbcli ... get 1,2,3
+material)` copies one cell's value to another. Errors (a malformed
+coordinate, wrong credentials, no value set, ...) print kdbserver's own
+error message to stderr and exit non-zero -- nothing is swallowed or
+retried silently.
+
+### Layout
+
+- `kdbcli/src/main.rs`  -- CLI parsing, the HTTP calls (via
+  `reqwest::blocking`, so a one-shot command doesn't need an async
+  runtime), and the `<type> <value>` <-> kdbserver's tagged-JSON
+  conversion (`build_value_json`/`describe_value`).
+- `kdbcli/src/tests.rs` -- integration tests that spawn a real `kdbserver`
+  and run the actual compiled `kdbcli` binary against it via
+  `std::process::Command`, checking real stdout and exit codes.
 
 ## Build & test everything
 

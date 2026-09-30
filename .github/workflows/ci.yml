@@ -47,7 +47,7 @@ jobs:
           rm -rf "$RUNNER_TEMP/kdb_ci_data"
           ./target/debug/kdb "$RUNNER_TEMP/kdb_ci_data"
 
-      - name: Run kdbserver (smoke test)
+      - name: Run kdbserver and kdbcli (smoke test)
         run: |
           rm -rf "$RUNNER_TEMP/kdbserver_ci_data"
           cat > "$RUNNER_TEMP/kdbserver_ci_config.toml" <<'EOF'
@@ -77,6 +77,14 @@ jobs:
             -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
           curl -sf -u admin:ci-smoke-test-password http://127.0.0.1:8099/cells/1,2,3/material
           echo
+
+          echo "kdbcli:"
+          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+            --password ci-smoke-test-password set 4,5,6 material str dirt
+          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+            --password ci-smoke-test-password get 4,5,6 material
+          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+            --password ci-smoke-test-password remove 4,5,6 material
 
           kill "$server_pid"
 

@@ -252,6 +252,37 @@ async fn set_then_get_a_cell_roundtrips() {
 }
 
 #[tokio::test]
+async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_crash() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(
+        app.clone(),
+        put(
+            "/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Same key, a different cell (so it isn't just an overwrite), wrong
+    // type -- rejected as a normal 400, not a panicked/dropped connection
+    // (see kdb::Schema, which is what actually enforces this).
+    let (status, body) = send(
+        app.clone(),
+        put("/cells/9,9,9/material", json!({"type": "i64", "value": 7})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].as_str().unwrap().contains("material"));
+
+    // The connection survives, and the original value is untouched --
+    // this really was handled as an ordinary rejected request.
+    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({"value": {"type": "str", "value": "stone"}}));
+}
+
+#[tokio::test]
 async fn set_then_delete_then_get_a_cell_is_404_again() {
     let (app, _dir) = test_app();
     send(
@@ -535,4 +566,39 @@ async fn a_read_only_user_cannot_put_a_region() {
     );
     let (status, _) = send(test_app().0, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn openapi_json_is_served_without_auth_and_describes_every_path() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/api-docs/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["openapi"].is_string());
+
+    let paths = body["paths"]
+        .as_object()
+        .expect("openapi spec should have a paths object");
+    for path in [
+        "/health",
+        "/stats",
+        "/cells/{coords}/{key}",
+        "/regions/{origin}/{extent}/{key}",
+    ] {
+        assert!(paths.contains_key(path), "spec is missing path {path}");
+    }
+}
+
+#[tokio::test]
+async fn swagger_ui_is_served_without_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/swagger-ui/")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::OK);
 }

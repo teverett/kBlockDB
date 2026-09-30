@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["kdb", "kdbserver", "kdbperf"]
+members = ["kdb", "kdbserver", "kdbperf", "kdbcli"]
 
 # Shared across every workspace member (member manifests can't set profiles
 # themselves -- Cargo ignores profile sections outside the workspace root).
