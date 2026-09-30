@@ -23,6 +23,6 @@ pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::{Value, ValueType};
 pub use world::{
-    Region, Stats, World, AXES, DEFAULT_CHUNK_DIM, DEFAULT_MAX_CACHED_CHUNKS,
+    CellEntry, Region, Stats, World, AXES, DEFAULT_CHUNK_DIM, DEFAULT_MAX_CACHED_CHUNKS,
     DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM,
 };

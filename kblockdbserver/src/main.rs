@@ -1,5 +1,6 @@
 mod auth;
 mod binary_server;
+mod browser;
 mod config;
 mod coords;
 mod error;

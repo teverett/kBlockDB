@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>kBlockDB browser</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    margin: 2rem;
+    max-width: 60rem;
+  }
+  h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
+  p.sub { color: #666; margin-top: 0; }
+  #search {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 0.55rem 0.75rem;
+    font-size: 1rem;
+    margin-bottom: 1rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+  }
+  table { border-collapse: collapse; width: 100%; }
+  th, td {
+    border-bottom: 1px solid #ddd;
+    padding: 0.45rem 0.6rem;
+    text-align: left;
+    font-size: 0.9rem;
+  }
+  th { background: rgba(127, 127, 127, 0.08); }
+  tbody tr.row { cursor: pointer; }
+  tbody tr.row:hover { background: rgba(64, 128, 255, 0.08); }
+  td.coord { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  .pager {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-top: 1rem;
+  }
+  .pager button {
+    padding: 0.35rem 0.8rem;
+    cursor: pointer;
+  }
+  .pager button:disabled { cursor: default; opacity: 0.5; }
+  .muted { color: #666; font-size: 0.9rem; }
+  .empty { color: #666; padding: 1rem 0; }
+
+  #modal-backdrop {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.45);
+    align-items: flex-start;
+    justify-content: center;
+    padding-top: 4rem;
+  }
+  #modal-backdrop.open { display: flex; }
+  #modal {
+    background: Canvas;
+    color: CanvasText;
+    border-radius: 8px;
+    padding: 1.25rem 1.5rem 1.5rem;
+    width: 90%;
+    max-width: 42rem;
+    max-height: 75vh;
+    overflow: auto;
+    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
+  }
+  #modal-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+  }
+  #modal-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  #modal-close {
+    border: none;
+    background: none;
+    font-size: 1.4rem;
+    line-height: 1;
+    cursor: pointer;
+    color: inherit;
+  }
+  code {
+    background: rgba(127, 127, 127, 0.15);
+    padding: 0.05rem 0.35rem;
+    border-radius: 4px;
+    font-size: 0.85em;
+  }
+</style>
+</head>
+<body>
+  <h1>kBlockDB</h1>
+  <p class="sub">Every populated cell, sorted ascending by coordinate. Click a row for its full keys and values.</p>
+
+  <input id="search" type="search" placeholder="Search by coordinate, key, or value...">
+
+  <table>
+    <thead>
+      <tr>
+        <th>Coordinate</th>
+        <th># keys</th>
+        <th>Created</th>
+        <th>Modified</th>
+      </tr>
+    </thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p id="empty" class="empty" hidden>No cells match.</p>
+
+  <div class="pager">
+    <button id="prev" type="button">&larr; Prev</button>
+    <span id="page-info" class="muted"></span>
+    <button id="next" type="button">Next &rarr;</button>
+  </div>
+
+  <div id="modal-backdrop">
+    <div id="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      <div id="modal-header">
+        <h2 id="modal-title"></h2>
+        <button id="modal-close" type="button" aria-label="Close">&times;</button>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>Key</th>
+            <th>Value</th>
+            <th>Created</th>
+            <th>Modified</th>
+            <th>Version</th>
+          </tr>
+        </thead>
+        <tbody id="modal-rows"></tbody>
+      </table>
+    </div>
+  </div>
+
+<script>
+(function () {
+  "use strict";
+
+  const state = { page: 1, pageSize: 50, search: "" };
+
+  const rowsBody = document.getElementById("rows");
+  const emptyMsg = document.getElementById("empty");
+  const pageInfo = document.getElementById("page-info");
+  const searchInput = document.getElementById("search");
+  const prevBtn = document.getElementById("prev");
+  const nextBtn = document.getElementById("next");
+  const backdrop = document.getElementById("modal-backdrop");
+  const modalTitle = document.getElementById("modal-title");
+  const modalRows = document.getElementById("modal-rows");
+  const modalClose = document.getElementById("modal-close");
+
+  // Every helper below builds DOM nodes via createElement/textContent,
+  // never innerHTML, for anything derived from cell data (coordinates are
+  // safe -- they're always JSON numbers -- but key names and string
+  // values are arbitrary, attacker- or fat-finger-controllable content
+  // stored in the world, so they're treated as untrusted text, never markup).
+
+  function cell(tag, text) {
+    const el = document.createElement(tag);
+    if (text !== undefined) {
+      el.textContent = text;
+    }
+    return el;
+  }
+
+  function fmtTime(ms) {
+    if (!ms && ms !== 0) {
+      return "";
+    }
+    return new Date(ms).toISOString().replace("T", " ").replace("Z", "");
+  }
+
+  function fmtValue(v) {
+    if (!v) {
+      return "";
+    }
+    return String(v.value) + " (" + v.type + ")";
+  }
+
+  async function load() {
+    const params = new URLSearchParams({
+      page: String(state.page),
+      page_size: String(state.pageSize),
+      search: state.search,
+    });
+    let resp;
+    try {
+      resp = await fetch("rows?" + params.toString());
+    } catch (e) {
+      renderError("request failed: " + e);
+      return;
+    }
+    if (!resp.ok) {
+      let detail = resp.statusText;
+      try {
+        const body = await resp.json();
+        if (body && body.error) {
+          detail = body.error;
+        }
+      } catch (e) {
+        // response wasn't JSON -- fall back to the plain status text above
+      }
+      renderError(resp.status + ": " + detail);
+      return;
+    }
+    const data = await resp.json();
+    renderRows(data);
+  }
+
+  function renderError(message) {
+    rowsBody.textContent = "";
+    emptyMsg.hidden = false;
+    emptyMsg.textContent = message;
+    pageInfo.textContent = "";
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+  }
+
+  function renderRows(data) {
+    rowsBody.textContent = "";
+    emptyMsg.hidden = data.rows.length !== 0;
+    emptyMsg.textContent = "No cells match.";
+
+    data.rows.forEach(function (row) {
+      const tr = document.createElement("tr");
+      tr.className = "row";
+      tr.tabIndex = 0;
+
+      const coordTd = cell("td", row.coord.join(","));
+      coordTd.className = "coord";
+      tr.appendChild(coordTd);
+      tr.appendChild(cell("td", String(row.key_count)));
+      tr.appendChild(cell("td", fmtTime(row.created_at_ms)));
+      tr.appendChild(cell("td", fmtTime(row.modified_at_ms)));
+
+      tr.addEventListener("click", function () {
+        openModal(row);
+      });
+      tr.addEventListener("keydown", function (e) {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openModal(row);
+        }
+      });
+
+      rowsBody.appendChild(tr);
+    });
+
+    const totalPages = Math.max(1, data.total_pages);
+    pageInfo.textContent =
+      "page " + data.page + " of " + totalPages + " (" + data.total_rows + " cell" +
+      (data.total_rows === 1 ? "" : "s") + ")";
+    prevBtn.disabled = data.page <= 1;
+    nextBtn.disabled = data.page >= totalPages;
+  }
+
+  function openModal(row) {
+    modalTitle.textContent = "(" + row.coord.join(",") + ")";
+    modalRows.textContent = "";
+    row.keys.forEach(function (k) {
+      const tr = document.createElement("tr");
+      const keyTd = document.createElement("td");
+      keyTd.appendChild(cell("code", k.key));
+      tr.appendChild(keyTd);
+      tr.appendChild(cell("td", fmtValue(k.value)));
+      tr.appendChild(cell("td", fmtTime(k.created_at_ms)));
+      tr.appendChild(cell("td", fmtTime(k.modified_at_ms)));
+      tr.appendChild(cell("td", String(k.version)));
+      modalRows.appendChild(tr);
+    });
+    backdrop.classList.add("open");
+  }
+
+  function closeModal() {
+    backdrop.classList.remove("open");
+  }
+
+  modalClose.addEventListener("click", closeModal);
+  backdrop.addEventListener("click", function (e) {
+    if (e.target === backdrop) {
+      closeModal();
+    }
+  });
+  document.addEventListener("keydown", function (e) {
+    if (e.key === "Escape") {
+      closeModal();
+    }
+  });
+
+  let searchTimer = null;
+  searchInput.addEventListener("input", function () {
+    clearTimeout(searchTimer);
+    searchTimer = setTimeout(function () {
+      state.search = searchInput.value;
+      state.page = 1;
+      load();
+    }, 250);
+  });
+
+  prevBtn.addEventListener("click", function () {
+    if (state.page > 1) {
+      state.page -= 1;
+      load();
+    }
+  });
+  nextBtn.addEventListener("click", function () {
+    state.page += 1;
+    load();
+  });
+
+  load();
+})();
+</script>
+</body>
+</html>

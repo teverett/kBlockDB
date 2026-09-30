@@ -1,5 +1,5 @@
 use crate::value::Value;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Write};
 
 /// Cells in one chunk, for a world with `axes` axes and `chunk_dim` cells
@@ -111,6 +111,20 @@ impl Bitset {
 
     fn count(&self) -> usize {
         self.block_counts.iter().map(|&c| c as usize).sum()
+    }
+
+    /// Every set index, ascending -- the k-th yielded index (0-indexed) is
+    /// always exactly the cell at `rank` k in this column's dense value
+    /// array, since `rank(idx)` counts set bits before `idx` and these are
+    /// yielded in increasing `idx` order. Used by `Chunk::entries_by_local_idx`
+    /// to walk a whole column's entries without probing every possible
+    /// index with `get`/`rank` one at a time.
+    fn iter_set(&self) -> impl Iterator<Item = usize> + '_ {
+        self.bits.iter().enumerate().flat_map(|(byte_idx, &byte)| {
+            (0..8u8).filter_map(move |bit| {
+                (byte & (1 << bit) != 0).then_some(byte_idx * 8 + bit as usize)
+            })
+        })
     }
 }
 
@@ -281,6 +295,30 @@ impl Chunk {
     /// empty 10,000^3 world avoids allocating 30 million chunk files.
     pub fn is_empty(&self) -> bool {
         self.columns.values().all(|c| c.presence.count() == 0)
+    }
+
+    /// Every `(key_id, value, meta)` set anywhere in this chunk, grouped by
+    /// local cell index (the union of every column's presence bitmap) --
+    /// used by `World::list_cells` to build a whole-world cell listing.
+    /// Nothing else in this crate needs "every set cell in this chunk", so
+    /// unlike `get`/`set`/`remove` (each O(1)-ish, on the hot path of every
+    /// single-cell operation), this is O(chunk contents) and only meant to
+    /// be called occasionally, whole-chunk at a time.
+    pub fn entries_by_local_idx(&self) -> BTreeMap<usize, Vec<(u32, Value, CellMeta)>> {
+        let mut out: BTreeMap<usize, Vec<(u32, Value, CellMeta)>> = BTreeMap::new();
+        for (&key_id, col) in &self.columns {
+            for (rank, local_idx) in col.presence.iter_set().enumerate() {
+                let value = match &col.data {
+                    ColumnData::F64(v) => Value::F64(v[rank]),
+                    ColumnData::I64(v) => Value::I64(v[rank]),
+                    ColumnData::Str(v) => Value::Str(v[rank].clone()),
+                };
+                out.entry(local_idx)
+                    .or_default()
+                    .push((key_id, value, col.meta[rank]));
+            }
+        }
+        out
     }
 
     // --- Binary format ---
@@ -622,6 +660,81 @@ mod tests {
                 modified_at_ms: 3000,
                 version: 0,
             })
+        );
+    }
+
+    #[test]
+    fn entries_by_local_idx_is_empty_for_an_empty_chunk() {
+        let c = Chunk::new(CELLS);
+        assert!(c.entries_by_local_idx().is_empty());
+    }
+
+    #[test]
+    fn entries_by_local_idx_groups_multiple_keys_at_the_same_cell() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::Str("stone".into()), 1000);
+        c.set(0, 2, Value::I64(7), 2000);
+        c.set(5, 1, Value::Str("air".into()), 3000);
+
+        let entries = c.entries_by_local_idx();
+        assert_eq!(entries.len(), 2); // two distinct local indices: 0 and 5
+
+        let at_0 = &entries[&0];
+        assert_eq!(at_0.len(), 2);
+        assert!(at_0.contains(&(
+            1,
+            Value::Str("stone".into()),
+            CellMeta {
+                created_at_ms: 1000,
+                modified_at_ms: 1000,
+                version: 0,
+            }
+        )));
+        assert!(at_0.contains(&(
+            2,
+            Value::I64(7),
+            CellMeta {
+                created_at_ms: 2000,
+                modified_at_ms: 2000,
+                version: 0,
+            }
+        )));
+
+        let at_5 = &entries[&5];
+        assert_eq!(
+            at_5,
+            &vec![(
+                1,
+                Value::Str("air".into()),
+                CellMeta {
+                    created_at_ms: 3000,
+                    modified_at_ms: 3000,
+                    version: 0,
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn entries_by_local_idx_reflects_a_remove() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        c.set(0, 2, Value::I64(2), 1000);
+        c.remove(0, 1);
+
+        let entries = c.entries_by_local_idx();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[&0],
+            vec![(
+                2,
+                Value::I64(2),
+                CellMeta {
+                    created_at_ms: 1000,
+                    modified_at_ms: 1000,
+                    version: 0,
+                }
+            )]
         );
     }
 

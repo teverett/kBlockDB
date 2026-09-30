@@ -24,8 +24,14 @@
 //! `path = "..."` must include the `/rest` prefix too, since utoipa has no
 //! way to know about the `.nest("/rest", ...)` in `router()` below --
 //! it only ever sees the literal string given.
+//!
+//! `router()` also mounts `browser::router` at the top level (`/` and
+//! `/rows`, see that module) -- a read-only data browser over this same
+//! world, deliberately kept outside `/rest` since it isn't part of the
+//! versioned REST API surface.
 
 use crate::auth::require_auth;
+use crate::browser;
 use crate::coords::parse_coords;
 use crate::error::{ApiError, ErrorBody};
 use crate::openapi::ApiDoc;
@@ -68,6 +74,7 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .nest("/rest", rest)
         .merge(docs)
+        .merge(browser::router(state.clone()))
         .with_state(state)
 }
 

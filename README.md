@@ -24,11 +24,16 @@ A Cargo workspace with four crates:
   like `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
   kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
 
+Plus a standalone (non-Cargo) Java client at `client/java`: `KBlockDBClient`
+speaks kblockdbserver's binary protocol (see "Binary protocol" below),
+packaged as a plain jar via Maven -- no runtime dependencies.
+
 ```
 kblockdblib/         the storage engine (library `kblockdblib` + demo binary `kblockdblib`)
 kblockdbserver/   the REST server (binary `kblockdbserver`, depends on kblockdblib)
 kblockdbperf/     the performance test suite (binary `kblockdbperf`, drives kblockdbserver over HTTP)
 kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdbserver over HTTP)
+client/java/      the Java client (KBlockDBClient, speaks the binary protocol; Maven, not Cargo)
 ```
 
 ## `kblockdblib`: the storage engine
@@ -321,23 +326,30 @@ packed value array. That costs two different things:
   lock-guarded so concurrent interning of different new keys can't collide.
   Also records each key's value type on first use and enforces it on every
   later `intern` call, world-wide (see `ValueType` in `value.rs`).
-- `kblockdblib/src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
-  serialization, unit tests. Its cell count (`chunk_cells(axes)`) is
-  computed at runtime from the owning world's axis count.
+- `kblockdblib/src/chunk.rs`  -- the columnar chunk: bitset, columns, per-cell
+  `CellMeta`, binary serialization, unit tests. Its cell count
+  (`chunk_cells(axes, chunk_dim)`) is computed at runtime from the owning
+  world's axis count and chunk size (both per-world runtime parameters,
+  not compile-time constants -- see the axis-count/chunking bullets above).
 - `kblockdblib/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
   mapping, chunk file paths, `with_chunk_read`/`with_chunk_write` (the
   cache-then-apply[-then-write] cycle every operation goes through),
   `get`/`set`/`remove`/`flush`, and their `*_region` counterparts for
   arbitrary axis-aligned boxes of cells (`Region`) that may span or
-  partially cover any number of chunks.
-  `get`/`set`/`remove` always validate the coordinate itself before
-  consulting anything else (key existence, schema, ...) -- this crate is a
-  library other code (like `kblockdbserver`) calls with unvalidated/
-  attacker-controlled input, so a malformed coordinate is always rejected
-  the same way rather than sometimes being silently absorbed by an
-  unrelated short-circuit. Also `stats()` -- a live filesystem walk
-  totaling chunk count, size, and disk-block usage into a `Stats`, which
-  `kblockdbserver` exposes as `/rest/stats`.
+  partially cover any number of chunks. `get_meta`/`get_with_meta` read a
+  cell/key's `CellMeta` (the latter atomically alongside its value, from
+  the same chunk snapshot). `get`/`set`/`remove` always validate the
+  coordinate itself before consulting anything else (key existence,
+  schema, ...) -- this crate is a library other code (like
+  `kblockdbserver`) calls with unvalidated/attacker-controlled input, so a
+  malformed coordinate is always rejected the same way rather than
+  sometimes being silently absorbed by an unrelated short-circuit. Also
+  `stats()` -- a live filesystem walk totaling chunk count, size, and
+  disk-block usage into a `Stats`, which `kblockdbserver` exposes as
+  `/rest/stats` -- and `list_cells()`, a heavier live walk that decodes
+  every chunk file into a sorted `Vec<CellEntry>` (every populated cell's
+  full keys/values/metadata), which `kblockdbserver`'s `/` data browser
+  (see below) is built on.
 - `kblockdblib/src/logger.rs` -- minimal dependency-free logger, appends to
   `kblockdblib.log` in the working directory.
 - `kblockdblib/src/main.rs`   -- demo/benchmark driver (the `kblockdblib` binary).
@@ -554,6 +566,35 @@ curl -u admin:change-me localhost:8080/rest/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
+### Data browser
+
+`GET /` (note: *not* under `/rest` -- see below) serves a small
+self-contained HTML/JS page listing every populated cell in the world, one
+row per cell, sorted ascending by coordinate, with a search bar and paging
+controls. Clicking a row opens a modal with that cell's full keys, values,
+and metadata (`created_at_ms`/`modified_at_ms`/`version` per key -- see
+"REST API" above). It's read-only (there's no way to edit anything from
+here) and requires the same HTTP Basic Auth as the REST API -- a
+`read_only` account can browse same as any other, since it's all `GET`.
+The browser's own credential prompt (triggered by `/`'s `401`) is what a
+plain HTML page gets for free from the browser itself; the page's own JS
+never handles a password.
+
+`GET /rows?page=&page_size=&search=` is the JSON endpoint the page's JS
+calls (1-based `page`, default 50/max 500 `page_size`, an optional
+case-insensitive `search` matched against a cell's coordinate, any key
+name, or any value's rendered text) -- each row already carries its full
+per-key breakdown, so opening a modal needs no second request. Built on
+`kblockdblib::World::list_cells`, which -- like `/rest/stats` above, but
+heavier, since it decodes whole chunk files rather than just reading their
+sizes -- is a live, uncached filesystem walk redone on every call. Fine
+for a world browsed occasionally; not meant for a world with millions of
+populated cells polled repeatedly.
+
+Deliberately kept outside `/rest`: this is a convenience UI over the same
+data, not part of the versioned REST API surface -- it has no OpenAPI
+annotation and doesn't appear in `/rest/api-docs/openapi.json`.
+
 ### Binary protocol
 
 A minimal binary protocol, as a *peer* to the REST API above, not a
@@ -615,6 +656,12 @@ client can't depend on a Rust crate. `kblockdbcli` still speaks REST only.
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
   plus the `basic_auth` security scheme those annotations reference.
+- `kblockdbserver/src/browser.rs`    -- the `/` data browser (see "Data
+  browser" above): `GET /` (the page) and `GET /rows` (its JSON backend,
+  built on `kblockdblib::World::list_cells`).
+- `kblockdbserver/src/browser.html`  -- the browser's self-contained
+  HTML/CSS/JS, embedded into the binary via `include_str!` (no external
+  scripts/styles, no build step).
 - `kblockdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
   `World`, plus the configured accounts) and `with_world`, which runs each
   `World` call on a `spawn_blocking` thread so `World`'s synchronous file

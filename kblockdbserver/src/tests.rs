@@ -647,3 +647,205 @@ async fn swagger_ui_is_served_without_auth() {
     let (status, _) = send(test_app().0, req).await;
     assert_eq!(status, StatusCode::OK);
 }
+
+#[tokio::test]
+async fn the_root_data_browser_page_requires_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_root_data_browser_page_is_served_to_an_authenticated_user() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(
+        test_app().0,
+        with_auth(req, TEST_ADMIN, TEST_ADMIN_PASSWORD),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rows_requires_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rows")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_read_only_user_can_list_rows() {
+    let req = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rows")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn rows_of_an_untouched_world_is_an_empty_page() {
+    let (status, body) = send(test_app().0, get("/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 0);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn rows_lists_a_set_cell_with_its_metadata() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(app, get("/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    let row = &body["rows"][0];
+    assert_eq!(row["coord"], json!([1, 2, 3]));
+    assert_eq!(row["key_count"], 1);
+    assert_eq!(row["keys"][0]["key"], "material");
+    assert_eq!(
+        row["keys"][0]["value"],
+        json!({"type": "str", "value": "stone"})
+    );
+    assert_eq!(row["keys"][0]["version"], 0);
+}
+
+#[tokio::test]
+async fn rows_are_sorted_ascending_by_coordinate() {
+    let (app, _dir) = test_app();
+    for coords in ["50,0,0", "1,2,3", "0,0,0"] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/cells/{coords}/k"),
+                json!({"type": "i64", "value": 1}),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = send(app, get("/rows")).await;
+    assert_eq!(status, StatusCode::OK);
+    let coords: Vec<_> = body["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["coord"].clone())
+        .collect();
+    assert_eq!(
+        coords,
+        vec![json!([0, 0, 0]), json!([1, 2, 3]), json!([50, 0, 0]),]
+    );
+}
+
+#[tokio::test]
+async fn rows_search_filters_by_coordinate_key_or_value() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/9,9,9/temperature",
+            json!({"type": "f64", "value": 20.0}),
+        ),
+    )
+    .await;
+
+    let (_, body) = send(app.clone(), get("/rows?search=stone")).await;
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+
+    let (_, body) = send(app.clone(), get("/rows?search=temperature")).await;
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([9, 9, 9]));
+
+    let (_, body) = send(app.clone(), get("/rows?search=9,9,9")).await;
+    assert_eq!(body["total_rows"], 1);
+
+    let (_, body) = send(app, get("/rows?search=nonexistent")).await;
+    assert_eq!(body["total_rows"], 0);
+}
+
+#[tokio::test]
+async fn rows_paginates() {
+    let (app, _dir) = test_app();
+    for i in 0..5u32 {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/cells/{i},0,0/k"),
+                json!({"type": "i64", "value": 1}),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = send(app.clone(), get("/rows?page=1&page_size=2")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 5);
+    assert_eq!(body["total_pages"], 3);
+    assert_eq!(body["rows"].as_array().unwrap().len(), 2);
+    assert_eq!(body["rows"][0]["coord"], json!([0, 0, 0]));
+
+    let (_, body) = send(app.clone(), get("/rows?page=3&page_size=2")).await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 1);
+    assert_eq!(body["rows"][0]["coord"], json!([4, 0, 0]));
+
+    let (_, body) = send(app, get("/rows?page=4&page_size=2")).await;
+    assert_eq!(body["rows"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn rows_rejects_a_zero_page_or_an_oversized_page_size() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app.clone(), get("/rows?page=0")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    let (status, _) = send(app, get("/rows?page_size=100000")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn rows_reflects_a_removed_cell() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put("/rest/cells/1,2,3/k", json!({"type": "i64", "value": 1})),
+    )
+    .await;
+    send(app.clone(), delete("/rest/cells/1,2,3/k")).await;
+
+    let (_, body) = send(app, get("/rows")).await;
+    assert_eq!(body["total_rows"], 0);
+}

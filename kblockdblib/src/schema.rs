@@ -112,6 +112,13 @@ impl Schema {
         self.key_to_id.get(key).copied()
     }
 
+    /// The inverse of `id_for_key`/`intern`: the key string `id` was
+    /// interned for, or `None` if `id` was never issued by this `Schema`
+    /// (e.g. a stale id from a different world).
+    pub fn key_for_id(&self, id: u32) -> Option<&str> {
+        self.id_to_key.get(id as usize).map(String::as_str)
+    }
+
     pub fn len(&self) -> usize {
         self.id_to_key.len()
     }
@@ -271,5 +278,20 @@ mod tests {
         let dir = TempDir::new("id-for-key-miss");
         let schema = Schema::open(dir.as_ref()).unwrap();
         assert_eq!(schema.id_for_key("nonexistent"), None);
+    }
+
+    #[test]
+    fn key_for_id_is_the_inverse_of_id_for_key() {
+        let dir = TempDir::new("key-for-id");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let id = schema.intern("material", ValueType::Str).unwrap();
+        assert_eq!(schema.key_for_id(id), Some("material"));
+    }
+
+    #[test]
+    fn key_for_id_of_an_unissued_id_is_none() {
+        let dir = TempDir::new("key-for-id-miss");
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.key_for_id(0), None);
     }
 }

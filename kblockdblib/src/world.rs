@@ -275,6 +275,15 @@ pub struct Stats {
     pub total_blocks: u64,
 }
 
+/// One populated cell (a coordinate with at least one key set), as
+/// returned by `World::list_cells` -- every key set there, alongside its
+/// value and `CellMeta`. `values` is sorted ascending by key name.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellEntry {
+    pub coord: Coord,
+    pub values: Vec<(String, Value, CellMeta)>,
+}
+
 pub struct World {
     root: PathBuf,
     axes: usize,
@@ -522,6 +531,59 @@ impl World {
         Ok(stats)
     }
 
+    /// Every populated cell in the world (every coordinate with at least
+    /// one key set), each with the full set of keys/values/metadata set
+    /// there, sorted ascending by coordinate (axis 0 most significant --
+    /// plain lexicographic order over the coordinate's components, same as
+    /// comparing two `Vec<u32>`s).
+    ///
+    /// A live filesystem walk plus a full decode of every chunk file --
+    /// like `stats()`, but heavier, since this reads and decodes whole
+    /// chunk contents rather than just file sizes, so cost is proportional
+    /// to how much data actually exists on disk right now. Meant for
+    /// small-to-moderate worlds (e.g. kblockdbserver's `/` data browser),
+    /// not for scanning a world with millions of populated cells on every
+    /// call.
+    pub fn list_cells(&self) -> io::Result<Vec<CellEntry>> {
+        let mut chunk_keys = Vec::new();
+        collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
+
+        // Snapshotted once, up front, rather than locked for the whole
+        // (potentially slow, disk-bound) walk below -- schema.txt is small
+        // (one entry per distinct key ever used in the whole world, not per
+        // cell, see `Schema`'s doc comment), so this costs little and lets
+        // concurrent `set`s of a brand new key proceed without waiting on
+        // this call.
+        let key_names: Vec<String> = {
+            let schema = self.schema();
+            (0..schema.len() as u32)
+                .map(|id| schema.key_for_id(id).unwrap_or("?").to_string())
+                .collect()
+        };
+
+        let mut cells = Vec::new();
+        for ckey in &chunk_keys {
+            let chunk = self.load_chunk(ckey)?;
+            for (local_idx, entries) in chunk.entries_by_local_idx() {
+                let coord = self.unsplit(ckey, local_idx);
+                let mut values: Vec<(String, Value, CellMeta)> = entries
+                    .into_iter()
+                    .map(|(key_id, value, meta)| {
+                        let name = key_names
+                            .get(key_id as usize)
+                            .cloned()
+                            .unwrap_or_else(|| "?".to_string());
+                        (name, value, meta)
+                    })
+                    .collect();
+                values.sort_by(|a, b| a.0.cmp(&b.0));
+                cells.push(CellEntry { coord, values });
+            }
+        }
+        cells.sort_by(|a, b| a.coord.iter().cmp(b.coord.iter()));
+        Ok(cells)
+    }
+
     fn chunk_path(&self, ckey: &ChunkKey) -> PathBuf {
         let mut p = self.root.clone();
         for &c in &ckey[..self.axes - 1] {
@@ -559,6 +621,21 @@ impl World {
             mult *= self.chunk_dim as usize;
         }
         Ok((ckey, local_idx))
+    }
+
+    /// The inverse of `split`: given a chunk's key and a local index within
+    /// it, the full world coordinate that maps to that (chunk, local index)
+    /// pair. Used by `list_cells`, which discovers cells chunk-by-chunk
+    /// (via `Chunk::entries_by_local_idx`) and needs each one's real
+    /// coordinate, not just its opaque local index.
+    fn unsplit(&self, ckey: &ChunkKey, mut local_idx: usize) -> Coord {
+        let chunk_dim = self.chunk_dim as usize;
+        let mut coord = Coord::zeros(self.axes);
+        for a in 0..self.axes {
+            coord[a] = ckey[a] * self.chunk_dim + (local_idx % chunk_dim) as u32;
+            local_idx /= chunk_dim;
+        }
+        coord
     }
 
     /// Runs `f` against chunk `ckey`'s cached contents, read-only. If this
@@ -955,6 +1032,69 @@ fn accumulate_chunk_stats(dir: &Path, stats: &mut Stats) -> io::Result<()> {
         stats.total_chunks += 1;
         stats.total_bytes += metadata.len();
         stats.total_blocks += disk_blocks(&metadata);
+    }
+    Ok(())
+}
+
+/// Recursively walks `dir` (mirrors `accumulate_chunk_stats`'s traversal,
+/// but tracks the numeric path segments down to each `.chunk` file, since
+/// `list_cells` needs each chunk's actual key -- `<root>/<c0>/<c1>/.../
+/// <c_{axes-1}>.chunk`, one path segment per axis, see `World`'s "Layout on
+/// disk" doc comment -- not just a count of them.
+///
+/// `prefix` holds the directory segments seen so far, pushed before
+/// recursing into a numeric subdirectory and popped after, so it's back to
+/// its caller's value once this returns. A directory or file name that
+/// doesn't parse as a `u32` (unexpected, but not this function's place to
+/// fail over) is silently skipped, same tolerance-for-surprises philosophy
+/// as `accumulate_chunk_stats`.
+fn collect_chunk_keys(
+    dir: &Path,
+    axes: usize,
+    prefix: &mut Vec<u32>,
+    out: &mut Vec<Coord>,
+) -> io::Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e),
+        };
+        let path = entry.path();
+        if file_type.is_dir() {
+            let Some(n) = path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .and_then(|s| s.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            prefix.push(n);
+            collect_chunk_keys(&path, axes, prefix, out)?;
+            prefix.pop();
+            continue;
+        }
+        if path.extension().is_none_or(|ext| ext != "chunk") {
+            continue;
+        }
+        let Some(n) = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if prefix.len() + 1 == axes {
+            let mut ckey = prefix.clone();
+            ckey.push(n);
+            out.push(Coord::from(ckey));
+        }
     }
     Ok(())
 }
@@ -2264,6 +2404,25 @@ mod tests {
 
         let workers = 8;
         let ops_per_worker = 30;
+        // Best-of-`RUNS`, not a single timing: one-off scheduler noise (a
+        // background process stealing CPU mid-run, ...) only ever makes a
+        // run *slower* than what the cap truly allows, never faster --
+        // taking the minimum across repeats cancels that out, since a
+        // transient spike would have to hit *every* repeat on one side to
+        // still flip the comparison. Confirmed flaky often enough at
+        // `RUNS = 1` (a single noisy run on a busy machine) to be worth
+        // this rather than just padding the work size further.
+        const RUNS: u32 = 5;
+        fn min_time_writes(
+            w: &std::sync::Arc<World>,
+            workers: u32,
+            ops_per_worker: u32,
+        ) -> std::time::Duration {
+            (0..RUNS)
+                .map(|_| time_writes(w, workers, ops_per_worker))
+                .min()
+                .unwrap()
+        }
 
         let dir_serial = TempDir::new("cap-timing-serial");
         let w_serial = std::sync::Arc::new(
@@ -2271,7 +2430,7 @@ mod tests {
                 .unwrap()
                 .with_max_concurrent_disk_ops(1),
         );
-        let serial = time_writes(&w_serial, workers, ops_per_worker);
+        let serial = min_time_writes(&w_serial, workers, ops_per_worker);
 
         let dir_parallel = TempDir::new("cap-timing-parallel");
         let w_parallel = std::sync::Arc::new(
@@ -2279,12 +2438,13 @@ mod tests {
                 .unwrap()
                 .with_max_concurrent_disk_ops(workers as usize),
         );
-        let parallel = time_writes(&w_parallel, workers, ops_per_worker);
+        let parallel = min_time_writes(&w_parallel, workers, ops_per_worker);
 
         assert!(
             serial > parallel,
-            "serial (cap=1, {serial:?}) should be slower than parallel (cap={workers}, \
-             {parallel:?}) -- the cap doesn't seem to be limiting anything"
+            "serial (cap=1, best of {RUNS}: {serial:?}) should be slower than parallel \
+             (cap={workers}, best of {RUNS}: {parallel:?}) -- the cap doesn't seem to be \
+             limiting anything"
         );
     }
 
@@ -2344,5 +2504,105 @@ mod tests {
         // mistaken for a chunk file.
         w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
         assert_eq!(w.stats().unwrap().total_chunks, 1);
+    }
+
+    #[test]
+    fn list_cells_of_an_untouched_world_is_empty() {
+        let dir = TempDir::new("list-cells-empty");
+        let w = create(&dir);
+        assert_eq!(w.list_cells().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn list_cells_reports_a_single_cells_full_value_and_meta() {
+        let dir = TempDir::new("list-cells-single");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+            .unwrap();
+
+        let cells = w.list_cells().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].coord, coord3(1, 2, 3));
+        assert_eq!(cells[0].values.len(), 1);
+        let (key, value, meta) = &cells[0].values[0];
+        assert_eq!(key, "material");
+        assert_eq!(*value, Value::Str("stone".into()));
+        assert_eq!(meta.version, 0);
+        assert_eq!(meta.created_at_ms, meta.modified_at_ms);
+    }
+
+    #[test]
+    fn list_cells_groups_multiple_keys_at_the_same_cell_sorted_by_key_name() {
+        let dir = TempDir::new("list-cells-multi-key");
+        let w = create(&dir);
+        let c = coord3(5, 5, 5);
+        w.set(&c, "temperature", Value::F64(20.0)).unwrap();
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+
+        let cells = w.list_cells().unwrap();
+        assert_eq!(cells.len(), 1);
+        let keys: Vec<&str> = cells[0].values.iter().map(|(k, _, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["material", "temperature"]); // alphabetical
+    }
+
+    #[test]
+    fn list_cells_is_sorted_ascending_by_coordinate_across_chunks() {
+        let dir = TempDir::new("list-cells-sorted");
+        let w = create(&dir);
+        // Deliberately set out of order, and far enough apart (see
+        // DEFAULT_CHUNK_DIM) to land in different chunks.
+        w.set(&coord3(100, 0, 0), "k", Value::I64(2)).unwrap();
+        w.set(&coord3(0, 0, 0), "k", Value::I64(0)).unwrap();
+        w.set(&coord3(0, 100, 0), "k", Value::I64(1)).unwrap();
+
+        let cells = w.list_cells().unwrap();
+        let coords: Vec<Coord> = cells.into_iter().map(|c| c.coord).collect();
+        assert_eq!(
+            coords,
+            vec![coord3(0, 0, 0), coord3(0, 100, 0), coord3(100, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn list_cells_excludes_a_cell_after_its_only_key_is_removed() {
+        let dir = TempDir::new("list-cells-remove");
+        let w = create(&dir);
+        let c = coord3(1, 1, 1);
+        w.set(&c, "k", Value::I64(1)).unwrap();
+        assert_eq!(w.list_cells().unwrap().len(), 1);
+
+        w.remove(&c, "k").unwrap();
+        assert_eq!(w.list_cells().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn list_cells_reflects_a_removed_key_leaving_others_at_the_same_cell() {
+        let dir = TempDir::new("list-cells-partial-remove");
+        let w = create(&dir);
+        let c = coord3(2, 2, 2);
+        w.set(&c, "a", Value::I64(1)).unwrap();
+        w.set(&c, "b", Value::I64(2)).unwrap();
+        w.remove(&c, "a").unwrap();
+
+        let cells = w.list_cells().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].values.len(), 1);
+        assert_eq!(cells[0].values[0].0, "b");
+    }
+
+    #[test]
+    fn list_cells_persists_across_flush_and_reopen() {
+        let dir = TempDir::new("list-cells-persist");
+        {
+            let w = create(&dir);
+            w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.flush().unwrap();
+        }
+
+        let w = World::open(&dir).unwrap();
+        let cells = w.list_cells().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].coord, coord3(1, 2, 3));
     }
 }
