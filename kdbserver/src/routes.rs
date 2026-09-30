@@ -40,11 +40,11 @@ use utoipa_swagger_ui::SwaggerUi;
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route(
-            "/cells/:coords/:key",
+            "/cells/{coords}/{key}",
             get(get_cell).put(set_cell).delete(remove_cell),
         )
         .route(
-            "/regions/:origin/:extent/:key",
+            "/regions/{origin}/{extent}/{key}",
             get(get_region).put(set_region).delete(remove_region),
         )
         .route("/stats", get(stats))
