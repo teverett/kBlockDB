@@ -152,7 +152,10 @@ async fn binary_set_cell_scenario_runs_against_a_real_server_with_no_errors() {
     let client = test_client(&server);
     let health = client.health().await.expect("health check failed");
 
-    let binary_addr = server.binary_addr.as_deref().expect("binary protocol enabled");
+    let binary_addr = server
+        .binary_addr
+        .as_deref()
+        .expect("binary protocol enabled");
     let (mut bc, bhealth) = BinaryClient::connect(binary_addr, "admin", TEST_ADMIN_PASSWORD)
         .await
         .expect("failed to connect the binary client");
