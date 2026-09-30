@@ -1,0 +1,28 @@
+[package]
+name = "kblockdbserver"
+version = "0.1.0"
+edition = "2021"
+
+# A RESTful HTTP front end for the kblockdblib storage engine (embedded as a library,
+# see ../kblockdblib). Unlike kblockdblib itself, this crate takes on the standard modern
+# Rust web-service stack (axum + tokio + serde) rather than staying
+# dependency-free -- that constraint was specific to kblockdblib's storage format.
+
+[[bin]]
+name = "kblockdbserver"
+path = "src/main.rs"
+
+[dependencies]
+kblockdblib = { path = "../kblockdblib" }
+axum = "0.8"
+axum-extra = { version = "0.12", features = ["typed-header"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "1.1"
+utoipa = { version = "6", features = ["axum_extras"] }
+utoipa-swagger-ui = { version = "10", features = ["axum"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"

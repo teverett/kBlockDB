@@ -1,2 +1,2 @@
 
-target/release/kdbserver
+target/release/kblockdbserver

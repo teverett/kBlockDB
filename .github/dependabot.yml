@@ -1,6 +1,6 @@
 version: 2
 updates:
-  # kdb/kdbserver/kdbperf are one Cargo workspace rooted here -- Dependabot
+  # kblockdblib/kblockdbserver/kblockdbperf are one Cargo workspace rooted here -- Dependabot
   # resolves all three members' Cargo.toml files from this one entry.
   - package-ecosystem: "cargo"
     directory: "/"

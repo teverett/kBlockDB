@@ -1,36 +1,36 @@
-# kdb
+# kBlockDB
 
 A Cargo workspace with four crates:
 
-- **`kdb`** -- a prototype storage engine for a huge simulation grid where
+- **`kblockdblib`** -- a prototype storage engine for a huge simulation grid where
   every cell is its own key/value store (string keys; string, f64, or i64
   values), sized for something like 10,000 x 10,000 x 10,000 cells (1
   trillion cells) -- too big for one-file-per-cell or an RDBMS row-per-cell.
   Zero external dependencies -- pure `std`. A library first, with a small
-  demo/benchmark binary (`kdb`) built on top of it.
-- **`kdbserver`** -- a RESTful HTTP server that embeds `kdb` as a library
+  demo/benchmark binary (`kblockdblib`) built on top of it.
+- **`kblockdbserver`** -- a RESTful HTTP server that embeds `kblockdblib` as a library
   and exposes `get`/`set`/`remove` for individual cells and for
-  axis-aligned regions of cells over HTTP. Unlike `kdb`, it takes on the
+  axis-aligned regions of cells over HTTP. Unlike `kblockdblib`, it takes on the
   standard modern Rust web stack (axum + tokio + serde) -- that
-  dependency-free constraint was specific to `kdb`'s storage format, not to
+  dependency-free constraint was specific to `kblockdblib`'s storage format, not to
   everything built on top of it.
-- **`kdbperf`** -- a performance test suite that drives a real `kdbserver`
+- **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
   (or several) over real HTTP and measures it: single-cell and region
   throughput/latency, concurrency scaling, lock contention, and multi-process
   scaling across several instances sharing one data directory.
-- **`kdbcli`** -- a small command-line client for kdbserver's REST API:
+- **`kblockdbcli`** -- a small command-line client for kblockdbserver's REST API:
   `get`/`set`/`remove` a single cell's value from a shell, authenticating
-  like `curl -u` would. A pure HTTP client, same as `kdbperf` -- it treats
-  kdbserver as a black box over its REST API, not `kdb` directly.
+  like `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
+  kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
 
 ```
-kdb/         the storage engine (library `kdb` + demo binary `kdb`)
-kdbserver/   the REST server (binary `kdbserver`, depends on kdb)
-kdbperf/     the performance test suite (binary `kdbperf`, drives kdbserver over HTTP)
-kdbcli/      the command-line client (binary `kdbcli`, drives kdbserver over HTTP)
+kblockdblib/         the storage engine (library `kblockdblib` + demo binary `kblockdblib`)
+kblockdbserver/   the REST server (binary `kblockdbserver`, depends on kblockdblib)
+kblockdbperf/     the performance test suite (binary `kblockdbperf`, drives kblockdbserver over HTTP)
+kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdbserver over HTTP)
 ```
 
-## `kdb`: the storage engine
+## `kblockdblib`: the storage engine
 
 ### Design
 
@@ -84,11 +84,11 @@ kdbcli/      the command-line client (binary `kdbcli`, drives kdbserver over HTT
 
 ### Concurrency
 
-Any number of processes -- multiple `kdbserver` instances included -- can
+Any number of processes -- multiple `kblockdbserver` instances included -- can
 safely share one world directory. There's no in-process cache to go stale
 or to lose an update on eviction: every `get`/`set`/`remove` (and, at chunk
 granularity, every `*_region` call) takes an OS-level advisory lock
-(`kdb/src/lock.rs`, via `std::fs::File::lock`/`lock_shared` -- stable in
+(`kblockdblib/src/lock.rs`, via `std::fs::File::lock`/`lock_shared` -- stable in
 `std`, so this needs no dependency either) on exactly the chunk file(s) it
 touches, shared for a read and exclusive for a write, reads that chunk's
 *current* on-disk contents fresh, applies the change, and (for a write)
@@ -126,7 +126,7 @@ cache -- its only interior state is a locked `Schema` and a couple of
 atomic counters -- so a single process can share one `World` behind a
 plain `Arc` (no `Mutex<World>` needed) and let concurrent calls actually
 run concurrently, limited only by the same per-chunk file locks that
-already make concurrent *processes* safe. `kdbserver` does exactly this.
+already make concurrent *processes* safe. `kblockdbserver` does exactly this.
 
 **Concurrent filesystem operations don't scale indefinitely, though.**
 Measured on one real, fast, local SSD: going from 1 to 8-32 concurrent
@@ -134,15 +134,15 @@ Measured on one real, fast, local SSD: going from 1 to 8-32 concurrent
 roughly doubled throughput, as expected -- but pushing to 128 concurrent
 calls made aggregate throughput *worse* than at 1, not just diminishing --
 confirmed to be real OS/filesystem-level contention (reproduced with a
-synthetic probe doing only `create_dir_all`/`flock`/file I/O, no `kdb` code
+synthetic probe doing only `create_dir_all`/`flock`/file I/O, no `kblockdblib` code
 at all, and ruled out an in-memory `Mutex` bottleneck the same way: a pure
 lock-contention probe at the same thread count showed no degradation at
 all). `World` caps how many `with_chunk` calls run concurrently
 (`DEFAULT_MAX_CONCURRENT_DISK_OPS`, `World::with_max_concurrent_disk_ops`
 to override) for exactly this reason. The right cap is a property of the
-underlying filesystem/storage, not of `kdb` -- the default is a reasonable
+underlying filesystem/storage, not of `kblockdblib` -- the default is a reasonable
 starting point, not a measured optimum for any particular deployment;
-measure yours with `kdbperf`'s `concurrency_scan`.
+measure yours with `kblockdbperf`'s `concurrency_scan`.
 
 ### A real trade-off this prototype makes visible
 
@@ -202,68 +202,68 @@ packed value array. That costs two different things:
 
 ### Layout
 
-- `kdb/src/lib.rs`    -- the library crate root; re-exports `World`,
+- `kblockdblib/src/lib.rs`    -- the library crate root; re-exports `World`,
   `Value`, `Region`, `Coord`, `WorldParams`, `AXES`, `WORLD_DIM`.
-- `kdb/src/value.rs`  -- the `Value` enum (Str/F64/I64), its on-disk type
+- `kblockdblib/src/value.rs`  -- the `Value` enum (Str/F64/I64), its on-disk type
   tags, and `ValueType` (a `Value` without the value itself -- what
   `Schema` records per key).
-- `kdb/src/coord.rs`  -- `Coord`, a small-vec-style `u32` sequence (inline
+- `kblockdblib/src/coord.rs`  -- `Coord`, a small-vec-style `u32` sequence (inline
   up to 8 axes, heap beyond that) used for coordinates and chunk keys. A
   world's axis count is a runtime value (see `params.rs`), so a coordinate
   can't be a fixed-size array the way a single-world-shape version of this
   prototype could use -- `Coord` avoids a `Vec<u32>`-per-coordinate heap
   allocation for the common case (a handful of axes) without adding a
   `smallvec` dependency.
-- `kdb/src/lock.rs`   -- `FileLock`, the RAII wrapper around
+- `kblockdblib/src/lock.rs`   -- `FileLock`, the RAII wrapper around
   `std::fs::File::lock`/`lock_shared` everything else in this list uses for
   cross-process locking (see "Concurrency" above). Private to the crate --
   an implementation detail, not part of the public API.
-- `kdb/src/params.rs` -- `WorldParams` (axes, world_dim), read/written as
+- `kblockdblib/src/params.rs` -- `WorldParams` (axes, world_dim), read/written as
   `world.txt` at the world root, and `create_or_validate`, the one
   lock-guarded operation `World::create` needs.
-- `kdb/src/schema.rs` -- global key-string <-> id registry (`schema.txt`),
+- `kblockdblib/src/schema.rs` -- global key-string <-> id registry (`schema.txt`),
   lock-guarded so concurrent interning of different new keys can't collide.
   Also records each key's value type on first use and enforces it on every
   later `intern` call, world-wide (see `ValueType` in `value.rs`).
-- `kdb/src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
+- `kblockdblib/src/chunk.rs`  -- the columnar chunk: bitset, columns, binary
   serialization, unit tests. Its cell count (`chunk_cells(axes)`) is
   computed at runtime from the owning world's axis count.
-- `kdb/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
+- `kblockdblib/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
   mapping, chunk file paths, `with_chunk` (the lock-read-apply-write cycle
   every operation goes through), `get`/`set`/`remove`/`flush`, and their
   `*_region` counterparts for arbitrary axis-aligned boxes of cells
   (`Region`) that may span or partially cover any number of chunks.
   `get`/`set`/`remove` always validate the coordinate itself before
   consulting anything else (key existence, schema, ...) -- this crate is a
-  library other code (like `kdbserver`) calls with unvalidated/
+  library other code (like `kblockdbserver`) calls with unvalidated/
   attacker-controlled input, so a malformed coordinate is always rejected
   the same way rather than sometimes being silently absorbed by an
   unrelated short-circuit. Also `stats()` -- a live filesystem walk
   totaling chunk count, size, and disk-block usage into a `Stats`, which
-  `kdbserver` exposes as `/stats`.
-- `kdb/src/logger.rs` -- minimal dependency-free logger, appends to
-  `kdb.log` in the working directory.
-- `kdb/src/main.rs`   -- demo/benchmark driver (the `kdb` binary).
+  `kblockdbserver` exposes as `/stats`.
+- `kblockdblib/src/logger.rs` -- minimal dependency-free logger, appends to
+  `kblockdblib.log` in the working directory.
+- `kblockdblib/src/main.rs`   -- demo/benchmark driver (the `kblockdblib` binary).
 
-## `kdbserver`: the REST server
+## `kblockdbserver`: the REST server
 
 ### Build & run
 
 ```sh
 cargo build --release
-cargo run -p kdbserver -- --data-dir ./data --addr 127.0.0.1:8080
+cargo run -p kblockdbserver -- --data-dir ./data --addr 127.0.0.1:8080
 ```
 
-A default `kdbserver.toml` (admin/`changeme`, see below) is checked in at
+A default `kblockdbserver.toml` (admin/`changeme`, see below) is checked in at
 the repo root so this works out of the box -- **change `admin_password`
 before running this anywhere reachable by anyone you don't trust.**
 
 ```
 USAGE:
-    kdbserver [OPTIONS]
+    kblockdbserver [OPTIONS]
 
 OPTIONS:
-    --config <path>                Config file (default: ./kdbserver.toml). Required --
+    --config <path>                Config file (default: ./kblockdbserver.toml). Required --
                                     holds admin_password and, optionally, [[users]], plus
                                     optional addr/data_dir/axes/world_dim/
                                     max_concurrent_disk_ops (each overridden by the
@@ -273,9 +273,9 @@ OPTIONS:
     --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
     --addr <host:port>             Address to listen on (default: 127.0.0.1:8080)
     --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
-                                    (default: 32 -- see kdb's "Concurrency"
+                                    (default: 32 -- see kblockdblib's "Concurrency"
                                     section; measure the right value for your
-                                    filesystem with kdbperf's concurrency_scan)
+                                    filesystem with kblockdbperf's concurrency_scan)
     -h, --help                     Print help
 ```
 
@@ -283,15 +283,15 @@ OPTIONS:
 `--data-dir` (via `World::create`); reopening an existing one reads its
 real shape back from its `world.txt` and ignores these flags.
 
-**Multiple `kdbserver` instances can safely point `--data-dir` at the same
+**Multiple `kblockdbserver` instances can safely point `--data-dir` at the same
 directory** -- e.g. several instances behind a load balancer -- and read
-and write concurrently without corrupting anything. `kdb` itself is what
+and write concurrently without corrupting anything. `kblockdblib` itself is what
 makes that safe (see its "Concurrency" section above); this server doesn't
 need to know or do anything special.
 
 ### Config file
 
-`--config` (default `./kdbserver.toml`) is TOML and is required to start
+`--config` (default `./kblockdbserver.toml`) is TOML and is required to start
 the server -- it's the only place credentials can come from (never a CLI
 flag, so they don't end up in shell history or `ps` output):
 
@@ -324,7 +324,7 @@ entry defaults to full read/write access, same as `admin`; set
 An OpenAPI spec for everything below is generated (via
 [utoipa](https://github.com/juhaku/utoipa)) straight from the same
 `#[utoipa::path(...)]` annotations on each handler in
-`kdbserver/src/routes.rs` -- served as JSON at `GET /api-docs/openapi.json`
+`kblockdbserver/src/routes.rs` -- served as JSON at `GET /api-docs/openapi.json`
 and browsable interactively at `GET /swagger-ui/`, both unauthenticated
 (like `/health`, they describe the API, not any of its data). Because the
 spec is generated from the same annotations the router is built from,
@@ -366,7 +366,7 @@ A cell value on the wire is a small tagged JSON object:
 | `GET` | `/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
 
 `/stats` walks the on-disk chunk files under `--data-dir` and reports:
-`total_chunks` (chunk files currently on disk -- see `kdb`'s "Layout on
+`total_chunks` (chunk files currently on disk -- see `kblockdblib`'s "Layout on
 disk" doc comment, a chunk with no cells set in it is never written and an
 emptied one is deleted, not left behind empty), `total_bytes` (their
 combined size), and `total_blocks` (their combined actual disk-block
@@ -380,7 +380,7 @@ chunks currently exist. Like the cell/region endpoints (and unlike
 `read_only` accounts too.
 
 Region `values` arrays are in axis-0-fastest order (matching
-`kdb::World::get_region`/`set_region`): index `i` is offset
+`kblockdblib::World::get_region`/`set_region`): index `i` is offset
 `(i % extent[0], (i / extent[0]) % extent[1], ...)` from `origin`. A `PUT`
 to a region must supply exactly one value per cell (`extent[0] * extent[1]
 * ...`), in that order, or it fails with `400`.
@@ -388,7 +388,7 @@ to a region must supply exactly one value per cell (`extent[0] * extent[1]
 Errors are `{"error": "<message>"}`, with the status code reflecting the
 cause: `400` for a malformed/out-of-range coordinate, a region whose axis
 count doesn't match the world's, or a `values` array of the wrong length
-(all of these are `kdb`'s own validation surfacing through); `401` for
+(all of these are `kblockdblib`'s own validation surfacing through); `401` for
 missing/invalid credentials; `403` for a `read_only` account attempting a
 write; `404` for a `GET` that found nothing; `500` for anything on the
 server's side (disk I/O, ...).
@@ -420,57 +420,57 @@ curl -u admin:change-me localhost:8080/stats
 
 ### Layout
 
-- `kdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
+- `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
-- `kdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
+- `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
   (addr/data_dir/axes/world_dim/max_concurrent_disk_ops, admin_password,
   `[[users]]`) and its validation.
-- `kdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
+- `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
   to every route except `/health`, including the `read_only` write check.
-- `kdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each
+- `kblockdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each
   one's `#[utoipa::path(...)]` OpenAPI annotation.
-- `kdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
+- `kblockdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/api-docs/openapi.json`,
   plus the `basic_auth` security scheme those annotations reference.
-- `kdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
+- `kblockdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
   `World`, plus the configured accounts) and `with_world`, which runs each
   `World` call on a `spawn_blocking` thread so `World`'s synchronous file
   I/O never blocks the async runtime.
-- `kdbserver/src/value_json.rs` -- `ValueJson`, the JSON wire format for
-  `kdb::Value` (kept in this crate, not `kdb`, since `kdb` itself doesn't
+- `kblockdbserver/src/value_json.rs` -- `ValueJson`, the JSON wire format for
+  `kblockdblib::Value` (kept in this crate, not `kblockdblib`, since `kblockdblib` itself doesn't
   depend on `serde`), also `ToSchema` for its OpenAPI schema.
-- `kdbserver/src/coords.rs`     -- parses the comma-separated coordinate
+- `kblockdbserver/src/coords.rs`     -- parses the comma-separated coordinate
   path segments.
-- `kdbserver/src/error.rs`      -- `ApiError`, the one error type every
+- `kblockdbserver/src/error.rs`      -- `ApiError`, the one error type every
   handler returns, and its mapping to HTTP status codes (including
-  `From<std::io::Error>`, so `kdb`'s own `InvalidInput`/`NotFound` errors
+  `From<std::io::Error>`, so `kblockdblib`'s own `InvalidInput`/`NotFound` errors
   become `400`/`404` automatically).
-- `kdbserver/src/tests.rs`      -- HTTP-level integration tests (real
+- `kblockdbserver/src/tests.rs`      -- HTTP-level integration tests (real
   requests through the real `Router` via `tower::ServiceExt::oneshot`, no
   TCP socket needed).
 
-## `kdbperf`: the performance test suite
+## `kblockdbperf`: the performance test suite
 
-Drives a real `kdbserver` process (by default, one or more it spawns and
+Drives a real `kblockdbserver` process (by default, one or more it spawns and
 tears down itself) over real HTTP and measures it -- this is a measurement
-of what a client actually experiences, not a microbenchmark of `kdb`'s
+of what a client actually experiences, not a microbenchmark of `kblockdblib`'s
 internals.
 
 ### Build & run
 
 ```sh
 cargo build --workspace --release
-./target/release/kdbperf                       # spawns its own instance(s), runs every scenario
-./target/release/kdbperf --scenario set_cell    # just one scenario
-./target/release/kdbperf --json > results.json  # machine-readable output
+./target/release/kblockdbperf                       # spawns its own instance(s), runs every scenario
+./target/release/kblockdbperf --scenario set_cell    # just one scenario
+./target/release/kblockdbperf --json > results.json  # machine-readable output
 
 # target an already-running instance instead (its REST API requires login --
-# see kdbserver's config file above -- so --password is required here)
-./target/release/kdbperf --url http://localhost:8080 --user admin --password change-me
+# see kblockdbserver's config file above -- so --password is required here)
+./target/release/kblockdbperf --url http://localhost:8080 --user admin --password change-me
 ```
 
-When it spawns its own instance(s), kdbperf writes each one a minimal
+When it spawns its own instance(s), kblockdbperf writes each one a minimal
 config file itself (`admin_password` only) and authenticates as `admin`
 automatically -- `--user`/`--password` only matter with `--url`, against a
 server whose config you don't control. Pass `--password` to pin the
@@ -489,9 +489,9 @@ full run in well under a minute, and every default is overridable.
   they measure just the operation named, and are runnable on their own.
 - **`region`** -- `set_region`/`get_region` at each edge length in
   `--region-edges` (a cube of that edge on every axis), repeated
-  `--region-reps` times. Because `kdb`'s region methods touch each chunk a
+  `--region-reps` times. Because `kblockdblib`'s region methods touch each chunk a
   region spans exactly once regardless of how many cells land in it (see
-  `kdb`'s "Concurrency" section above), these routinely report far higher
+  `kblockdblib`'s "Concurrency" section above), these routinely report far higher
   effective cells/sec than the single-cell scenarios -- that gap *is* the
   batching win region operations exist for.
 - **`concurrency_scan`** -- `set` from `--concurrency` concurrent clients,
@@ -500,7 +500,7 @@ full run in well under a minute, and every default is overridable.
   requests don't contend for the same chunk.
 - **`contended_cell`** -- the same concurrency sweep, but every client
   targets the *same* cell (different keys, so it's not just racing an
-  identical overwrite). `kdb::World::set` takes an exclusive lock on that
+  identical overwrite). `kblockdblib::World::set` takes an exclusive lock on that
   cell's chunk file per call and must read-modify-write the *whole* chunk
   file every time (more expensive the more distinct keys have accumulated
   in it), so this is typically much slower than `concurrency_scan` even at
@@ -508,13 +508,13 @@ full run in well under a minute, and every default is overridable.
 - **`multi_instance`** -- the same disjoint-cell concurrency sweep, run
   once against one server and once against several servers (`--instances`,
   sharing one data directory, round-robin) at the same total concurrency.
-  A single `kdbserver` process serializes every request through one
-  `Mutex<World>` regardless of `kdb`'s own per-chunk locking (see
-  `kdbserver/src/state.rs`), so that lock only stops being the bottleneck
+  A single `kblockdbserver` process serializes every request through one
+  `Mutex<World>` regardless of `kblockdblib`'s own per-chunk locking (see
+  `kblockdbserver/src/state.rs`), so that lock only stops being the bottleneck
   once there's more than one *process* to spread load across -- this is
   the scenario that actually demonstrates multi-process scaling, and the
-  reason `kdbperf` spawns multiple instances by default. Interpreting the
-  result honestly: on one machine, multiple `kdbserver` processes also
+  reason `kblockdbperf` spawns multiple instances by default. Interpreting the
+  result honestly: on one machine, multiple `kblockdbserver` processes also
   compete for the same CPU cores and disk, so how much (if any) improvement
   shows up depends on real available headroom -- this scenario is most
   meaningful comparing genuinely separate deployments (e.g. `--url` pointed
@@ -523,43 +523,43 @@ full run in well under a minute, and every default is overridable.
 
 ### Layout
 
-- `kdbperf/src/main.rs`      -- CLI parsing and orchestration: spawn or
+- `kblockdbperf/src/main.rs`      -- CLI parsing and orchestration: spawn or
   connect to server(s), run the selected scenarios, print the report.
-- `kdbperf/src/client.rs`    -- a thin async HTTP client for kdbserver's
+- `kblockdbperf/src/client.rs`    -- a thin async HTTP client for kblockdbserver's
   REST API (every value used is an `i64`, so payload shape stays constant
   across scenarios).
-- `kdbperf/src/server.rs`    -- `ManagedServer`, which spawns a `kdbserver`
-  child process and kills it on drop, and locates the `kdbserver` binary
+- `kblockdbperf/src/server.rs`    -- `ManagedServer`, which spawns a `kblockdbserver`
+  child process and kills it on drop, and locates the `kblockdbserver` binary
   built alongside this one.
-- `kdbperf/src/scenarios.rs` -- the scenarios themselves.
-- `kdbperf/src/stats.rs`     -- latency percentiles and throughput,
+- `kblockdbperf/src/scenarios.rs` -- the scenarios themselves.
+- `kblockdbperf/src/stats.rs`     -- latency percentiles and throughput,
   computed from a plain sorted `Vec<Duration>` (sample counts here are
   thousands, not millions -- a histogram crate would be solving a problem
   this doesn't have).
-- `kdbperf/src/report.rs`    -- table/JSON output.
-- `kdbperf/src/tests.rs`     -- integration tests that spawn a real
-  `kdbserver` (or two, sharing one data dir) and run a real scenario
+- `kblockdbperf/src/report.rs`    -- table/JSON output.
+- `kblockdbperf/src/tests.rs`     -- integration tests that spawn a real
+  `kblockdbserver` (or two, sharing one data dir) and run a real scenario
   against it.
 
-## `kdbcli`: the command-line client
+## `kblockdbcli`: the command-line client
 
-A thin wrapper over kdbserver's `/cells/{coords}/{key}` endpoint -- `get`,
+A thin wrapper over kblockdbserver's `/cells/{coords}/{key}` endpoint -- `get`,
 `set`, and `remove` one cell's value from a shell, with the same HTTP
-Basic Auth every other client of kdbserver's REST API needs.
+Basic Auth every other client of kblockdbserver's REST API needs.
 
 ### Build & run
 
 ```sh
 cargo build --release
-./target/release/kdbcli --password change-me set 1,2,3 material str stone
-./target/release/kdbcli --password change-me get 1,2,3 material
+./target/release/kblockdbcli --password change-me set 1,2,3 material str stone
+./target/release/kblockdbcli --password change-me get 1,2,3 material
 # str stone
-./target/release/kdbcli --password change-me remove 1,2,3 material
+./target/release/kblockdbcli --password change-me remove 1,2,3 material
 ```
 
 ```
 USAGE:
-    kdbcli [OPTIONS] <COMMAND> [ARGS]
+    kblockdbcli [OPTIONS] <COMMAND> [ARGS]
 
 COMMANDS:
     get <coords> <key>                  Print a cell's value, as `<type> <value>`
@@ -567,9 +567,9 @@ COMMANDS:
     remove <coords> <key>               Clear a cell's value
 
 OPTIONS:
-    --url <url>        kdbserver base URL (default: http://127.0.0.1:8080)
+    --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)
     --user <name>      Username (default: admin)
-    --password <pw>    Password (or set the KDBCLI_PASSWORD env var, so it
+    --password <pw>    Password (or set the KBLOCKDBCLI_PASSWORD env var, so it
                         doesn't end up in shell history)
     -h, --help         Print this help
 ```
@@ -580,20 +580,20 @@ with -- same convention as the REST API itself.
 
 `get`'s output and `set`'s trailing two arguments share one format
 (`<type> <value>`, e.g. `str stone` or `i64 42`) on purpose, so the two
-compose directly: `kdbcli ... set 4,5,6 backup $(kdbcli ... get 1,2,3
+compose directly: `kblockdbcli ... set 4,5,6 backup $(kblockdbcli ... get 1,2,3
 material)` copies one cell's value to another. Errors (a malformed
-coordinate, wrong credentials, no value set, ...) print kdbserver's own
+coordinate, wrong credentials, no value set, ...) print kblockdbserver's own
 error message to stderr and exit non-zero -- nothing is swallowed or
 retried silently.
 
 ### Layout
 
-- `kdbcli/src/main.rs`  -- CLI parsing, the HTTP calls (via
+- `kblockdbcli/src/main.rs`  -- CLI parsing, the HTTP calls (via
   `reqwest::blocking`, so a one-shot command doesn't need an async
-  runtime), and the `<type> <value>` <-> kdbserver's tagged-JSON
+  runtime), and the `<type> <value>` <-> kblockdbserver's tagged-JSON
   conversion (`build_value_json`/`describe_value`).
-- `kdbcli/src/tests.rs` -- integration tests that spawn a real `kdbserver`
-  and run the actual compiled `kdbcli` binary against it via
+- `kblockdbcli/src/tests.rs` -- integration tests that spawn a real `kblockdbserver`
+  and run the actual compiled `kblockdbcli` binary against it via
   `std::process::Command`, checking real stdout and exit codes.
 
 ## Build & test everything

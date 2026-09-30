@@ -1,0 +1,16 @@
+# Default kblockdbserver config, checked in so `cargo run -p kblockdbserver` and
+# ./run.sh work out of the box.
+#
+# admin_password/the [[users]] entry are placeholders for local development
+# only. Change them (and don't commit your real ones) before running this
+# anywhere reachable by anyone you don't trust with access to the world.
+addr = "127.0.0.1:8080"
+data_dir = "data"
+axes = 4
+world_dim = 10000
+max_concurrent_disk_ops = 32
+admin_password = "changeme"
+
+[[users]]
+username = "user"
+password = "changeme"

@@ -42,19 +42,19 @@ jobs:
       - name: Test
         run: cargo test --workspace --verbose
 
-      - name: Run kdb demo binary (smoke test)
+      - name: Run kblockdblib demo binary (smoke test)
         run: |
-          rm -rf "$RUNNER_TEMP/kdb_ci_data"
-          ./target/debug/kdb "$RUNNER_TEMP/kdb_ci_data"
+          rm -rf "$RUNNER_TEMP/kblockdblib_ci_data"
+          ./target/debug/kblockdblib "$RUNNER_TEMP/kblockdblib_ci_data"
 
-      - name: Run kdbserver and kdbcli (smoke test)
+      - name: Run kblockdbserver and kblockdbcli (smoke test)
         run: |
-          rm -rf "$RUNNER_TEMP/kdbserver_ci_data"
-          cat > "$RUNNER_TEMP/kdbserver_ci_config.toml" <<'EOF'
+          rm -rf "$RUNNER_TEMP/kblockdbserver_ci_data"
+          cat > "$RUNNER_TEMP/kblockdbserver_ci_config.toml" <<'EOF'
           admin_password = "ci-smoke-test-password"
           EOF
-          ./target/debug/kdbserver --data-dir "$RUNNER_TEMP/kdbserver_ci_data" --addr 127.0.0.1:8099 \
-            --config "$RUNNER_TEMP/kdbserver_ci_config.toml" &
+          ./target/debug/kblockdbserver --data-dir "$RUNNER_TEMP/kblockdbserver_ci_data" --addr 127.0.0.1:8099 \
+            --config "$RUNNER_TEMP/kblockdbserver_ci_config.toml" &
           server_pid=$!
 
           ready=0
@@ -66,7 +66,7 @@ jobs:
             sleep 0.5
           done
           if [ "$ready" -ne 1 ]; then
-            echo "kdbserver never became ready" >&2
+            echo "kblockdbserver never became ready" >&2
             kill "$server_pid" 2>/dev/null || true
             exit 1
           fi
@@ -78,17 +78,17 @@ jobs:
           curl -sf -u admin:ci-smoke-test-password http://127.0.0.1:8099/cells/1,2,3/material
           echo
 
-          echo "kdbcli:"
-          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+          echo "kblockdbcli:"
+          ./target/debug/kblockdbcli --url http://127.0.0.1:8099 --user admin \
             --password ci-smoke-test-password set 4,5,6 material str dirt
-          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+          ./target/debug/kblockdbcli --url http://127.0.0.1:8099 --user admin \
             --password ci-smoke-test-password get 4,5,6 material
-          ./target/debug/kdbcli --url http://127.0.0.1:8099 --user admin \
+          ./target/debug/kblockdbcli --url http://127.0.0.1:8099 --user admin \
             --password ci-smoke-test-password remove 4,5,6 material
 
           kill "$server_pid"
 
-      - name: Run kdbperf (smoke test)
+      - name: Run kblockdbperf (smoke test)
         run: |
-          ./target/debug/kdbperf --cells 10 --concurrency 1,4 --ops-per-client 5 \
+          ./target/debug/kblockdbperf --cells 10 --concurrency 1,4 --ops-per-client 5 \
             --region-edges 2,4 --region-reps 1 --instances 2

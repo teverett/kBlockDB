@@ -1,0 +1,20 @@
+[package]
+name = "kblockdbcli"
+version = "0.1.0"
+edition = "2021"
+
+# A small interactive/scriptable command-line client for kblockdbserver's REST
+# API -- get/set/remove one cell's value, authenticating like curl -u
+# would. A pure HTTP client (no kblockdblib dependency): it treats kblockdbserver as a
+# black box over its REST API, the same way kblockdbperf does.
+
+[[bin]]
+name = "kblockdbcli"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP-only (no https:// target here), so no TLS backend is pulled in.
+# "blocking" gives a synchronous client, which fits a one-shot CLI command
+# better than pulling in tokio for a single request.
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
+serde_json = "1"

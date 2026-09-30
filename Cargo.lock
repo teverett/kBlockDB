@@ -538,11 +538,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kdb"
-version = "0.1.0"
-
-[[package]]
-name = "kdbcli"
+name = "kblockdbcli"
 version = "0.1.0"
 dependencies = [
  "reqwest",
@@ -550,7 +546,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "kdbperf"
+name = "kblockdblib"
+version = "0.1.0"
+
+[[package]]
+name = "kblockdbperf"
 version = "0.1.0"
 dependencies = [
  "reqwest",
@@ -560,13 +560,13 @@ dependencies = [
 ]
 
 [[package]]
-name = "kdbserver"
+name = "kblockdbserver"
 version = "0.1.0"
 dependencies = [
  "axum",
  "axum-extra",
  "http-body-util",
- "kdb",
+ "kblockdblib",
  "serde",
  "serde_json",
  "tokio",

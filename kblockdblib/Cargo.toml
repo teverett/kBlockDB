@@ -1,0 +1,19 @@
+[package]
+name = "kblockdblib"
+version = "0.1.0"
+edition = "2021"
+
+# Zero external dependencies on purpose: the whole point of this prototype is a
+# compact, hand-rolled binary chunk format. `cargo build --release` (or plain
+# `rustc`) needs nothing from crates.io. `kblockdbserver` (a separate crate in this
+# workspace) builds on top of this library and is free to take on its own
+# dependencies -- that's a choice about the server, not about the storage
+# engine underneath it.
+
+[lib]
+name = "kblockdblib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "kblockdblib"
+path = "src/main.rs"
