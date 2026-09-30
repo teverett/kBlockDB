@@ -1,8 +1,8 @@
 //! `kblockdbcli` -- a command-line client for kblockdbserver's REST API: get, set,
 //! and remove a single cell's value for a key. A thin wrapper over HTTP
-//! Basic Auth and `/cells/{coords}/{key}`, nothing more (see kblockdbserver's
+//! Basic Auth and `/rest/cells/{coords}/{key}`, nothing more (see kblockdbserver's
 //! README section for the fuller API this could grow into covering, e.g.
-//! `/regions`).
+//! `/rest/regions`).
 
 #[cfg(test)]
 mod tests;
@@ -172,7 +172,10 @@ fn print_help() {
 }
 
 fn cell_url(args: &Args, coords: &str, key: &str) -> String {
-    format!("{}/cells/{coords}/{key}", args.url.trim_end_matches('/'))
+    format!(
+        "{}/rest/cells/{coords}/{key}",
+        args.url.trim_end_matches('/')
+    )
 }
 
 fn run_get(

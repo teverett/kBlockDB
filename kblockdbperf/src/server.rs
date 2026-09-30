@@ -84,7 +84,7 @@ async fn wait_until_ready(url: &str) {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         if http
-            .get(format!("{url}/health"))
+            .get(format!("{url}/rest/health"))
             .send()
             .await
             .is_ok_and(|r| r.status().is_success())

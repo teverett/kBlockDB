@@ -1,26 +1,29 @@
-//! The REST API surface: two resources, `/cells/...` (a single cell) and
-//! `/regions/...` (an axis-aligned box of cells), each with GET (read),
-//! PUT (write) and DELETE (remove) -- plus read-only `/stats` and
-//! `/health`.
+//! The REST API surface, mounted under the `/rest` context path: two
+//! resources, `/rest/cells/...` (a single cell) and `/rest/regions/...`
+//! (an axis-aligned box of cells), each with GET (read), PUT (write) and
+//! DELETE (remove) -- plus read-only `/rest/stats` and `/rest/health`.
 //!
 //! Coordinates and region origin/extent are comma-separated path segments
-//! (`/cells/1,2,3/material`, `/regions/0,0,0/8,8,8/material`), matching
-//! however many axes the world was created with -- there's nothing
-//! 3-axis-specific here, same as in `kblockdblib` itself.
+//! (`/rest/cells/1,2,3/material`, `/rest/regions/0,0,0/8,8,8/material`),
+//! matching however many axes the world was created with -- there's
+//! nothing 3-axis-specific here, same as in `kblockdblib` itself.
 //!
 //! Every route below requires HTTP Basic Auth (see `auth.rs`) except
-//! `/health`, left open so load balancers/orchestrators can poll liveness
-//! without credentials -- it exposes nothing more sensitive than the
-//! world's shape and this server's clock. `/stats` is a `GET`, so a
-//! `read_only` account can use it same as any other account.
+//! `/rest/health`, left open so load balancers/orchestrators can poll
+//! liveness without credentials -- it exposes nothing more sensitive than
+//! the world's shape and this server's clock. `/rest/stats` is a `GET`, so
+//! a `read_only` account can use it same as any other account.
 //!
 //! Every handler below carries a `#[utoipa::path(...)]` annotation, which
-//! is how `openapi.rs`'s spec (served at `/api-docs/openapi.json` and
-//! browsable at `/swagger-ui`) stays in sync with the router: it's
+//! is how `openapi.rs`'s spec (served at `/rest/api-docs/openapi.json` and
+//! browsable at `/rest/swagger-ui`) stays in sync with the router: it's
 //! generated from these annotations, not hand-maintained separately, so
 //! adding/changing a route without updating its annotation is a compile
 //! error (`OpenApi` derive in `openapi.rs` lists every path below by
-//! name), not a spec that silently drifts from reality.
+//! name), not a spec that silently drifts from reality. Each annotation's
+//! `path = "..."` must include the `/rest` prefix too, since utoipa has no
+//! way to know about the `.nest("/rest", ...)` in `router()` below --
+//! it only ever sees the literal string given.
 
 use crate::auth::require_auth;
 use crate::coords::parse_coords;
@@ -50,13 +53,20 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    // Unauthenticated, like /health -- the spec/UI describe the API, they
-    // don't expose any of its data.
-    let docs = SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi());
+    let rest = Router::new().route("/health", get(health)).merge(protected);
+
+    // Built with the *final*, post-nesting absolute paths (`/rest/...`),
+    // not nested itself: utoipa_swagger_ui bakes whatever string `.url(...)`
+    // is given into the served page's own JS as an absolute fetch target,
+    // not something resolved relative to wherever this router ends up
+    // mounted -- nesting it under `/rest` a second time here would double
+    // the prefix. Unauthenticated, like /rest/health -- the spec/UI
+    // describe the API, they don't expose any of its data.
+    let docs =
+        SwaggerUi::new("/rest/swagger-ui").url("/rest/api-docs/openapi.json", ApiDoc::openapi());
 
     Router::new()
-        .route("/health", get(health))
-        .merge(protected)
+        .nest("/rest", rest)
         .merge(docs)
         .with_state(state)
 }
@@ -74,7 +84,7 @@ pub struct HealthResponse {
 
 #[utoipa::path(
     get,
-    path = "/health",
+    path = "/rest/health",
     tag = "health",
     responses(
         (status = 200, description = "The server is up", body = HealthResponse),
@@ -110,7 +120,7 @@ pub struct StatsResponse {
 
 #[utoipa::path(
     get,
-    path = "/stats",
+    path = "/rest/stats",
     tag = "stats",
     responses(
         (status = 200, description = "On-disk statistics for the world's data", body = StatsResponse),
@@ -146,7 +156,7 @@ pub struct CellResponse {
 
 #[utoipa::path(
     get,
-    path = "/cells/{coords}/{key}",
+    path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
         ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
@@ -184,7 +194,7 @@ async fn get_cell(
 
 #[utoipa::path(
     put,
-    path = "/cells/{coords}/{key}",
+    path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
         ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
@@ -214,7 +224,7 @@ async fn set_cell(
 
 #[utoipa::path(
     delete,
-    path = "/cells/{coords}/{key}",
+    path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
         ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
@@ -247,7 +257,7 @@ pub struct RegionValuesResponse {
 
 #[utoipa::path(
     get,
-    path = "/regions/{origin}/{extent}/{key}",
+    path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
         ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),
@@ -287,7 +297,7 @@ pub struct SetRegionBody {
 
 #[utoipa::path(
     put,
-    path = "/regions/{origin}/{extent}/{key}",
+    path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
         ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),
@@ -320,7 +330,7 @@ async fn set_region(
 
 #[utoipa::path(
     delete,
-    path = "/regions/{origin}/{extent}/{key}",
+    path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
         ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),

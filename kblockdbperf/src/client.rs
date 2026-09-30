@@ -51,7 +51,7 @@ impl Client {
     pub async fn health(&self) -> Option<HealthInfo> {
         let resp = self
             .http
-            .get(format!("{}/health", self.base_url))
+            .get(format!("{}/rest/health", self.base_url))
             .send()
             .await
             .ok()?;
@@ -74,7 +74,7 @@ impl Client {
     }
 
     pub async fn set_cell(&self, coord: &[u32], key: &str, value: i64) -> Timed {
-        let url = format!("{}/cells/{}/{key}", self.base_url, Self::coords(coord));
+        let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let body = json!({"type": "i64", "value": value});
         let t0 = Instant::now();
         let ok = self
@@ -92,7 +92,7 @@ impl Client {
     }
 
     pub async fn get_cell(&self, coord: &[u32], key: &str) -> Timed {
-        let url = format!("{}/cells/{}/{key}", self.base_url, Self::coords(coord));
+        let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let t0 = Instant::now();
         let ok = self
             .http
@@ -108,7 +108,7 @@ impl Client {
     }
 
     pub async fn remove_cell(&self, coord: &[u32], key: &str) -> Timed {
-        let url = format!("{}/cells/{}/{key}", self.base_url, Self::coords(coord));
+        let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let t0 = Instant::now();
         let ok = self
             .http
@@ -131,7 +131,7 @@ impl Client {
         values: &[i64],
     ) -> Timed {
         let url = format!(
-            "{}/regions/{}/{}/{key}",
+            "{}/rest/regions/{}/{}/{key}",
             self.base_url,
             Self::coords(origin),
             Self::coords(extent)
@@ -156,7 +156,7 @@ impl Client {
 
     pub async fn get_region(&self, origin: &[u32], extent: &[u32], key: &str) -> Timed {
         let url = format!(
-            "{}/regions/{}/{}/{key}",
+            "{}/rest/regions/{}/{}/{key}",
             self.base_url,
             Self::coords(origin),
             Self::coords(extent)

@@ -296,7 +296,7 @@ async fn main() {
 
     let primary = &client;
     let health = primary.health().await.unwrap_or_else(|| {
-        eprintln!("failed to query /health on the target server");
+        eprintln!("failed to query /rest/health on the target server");
         std::process::exit(1);
     });
     println!(

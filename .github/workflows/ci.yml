@@ -59,7 +59,7 @@ jobs:
 
           ready=0
           for _ in $(seq 1 20); do
-            if curl -sf http://127.0.0.1:8099/health > /dev/null; then
+            if curl -sf http://127.0.0.1:8099/rest/health > /dev/null; then
               ready=1
               break
             fi
@@ -71,11 +71,11 @@ jobs:
             exit 1
           fi
 
-          curl -sf http://127.0.0.1:8099/health
+          curl -sf http://127.0.0.1:8099/rest/health
           echo
-          curl -sf -u admin:ci-smoke-test-password -X PUT http://127.0.0.1:8099/cells/1,2,3/material \
+          curl -sf -u admin:ci-smoke-test-password -X PUT http://127.0.0.1:8099/rest/cells/1,2,3/material \
             -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
-          curl -sf -u admin:ci-smoke-test-password http://127.0.0.1:8099/cells/1,2,3/material
+          curl -sf -u admin:ci-smoke-test-password http://127.0.0.1:8099/rest/cells/1,2,3/material
           echo
 
           echo "kblockdbcli:"

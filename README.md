@@ -337,7 +337,7 @@ packed value array. That costs two different things:
   the same way rather than sometimes being silently absorbed by an
   unrelated short-circuit. Also `stats()` -- a live filesystem walk
   totaling chunk count, size, and disk-block usage into a `Stats`, which
-  `kblockdbserver` exposes as `/stats`.
+  `kblockdbserver` exposes as `/rest/stats`.
 - `kblockdblib/src/logger.rs` -- minimal dependency-free logger, appends to
   `kblockdblib.log` in the working directory.
 - `kblockdblib/src/main.rs`   -- demo/benchmark driver (the `kblockdblib` binary).
@@ -442,23 +442,28 @@ entry defaults to full read/write access, same as `admin`; set
 
 ### REST API
 
+Every route below is mounted under the `/rest` context path (`/rest/cells/...`,
+`/rest/health`, ...) -- kept separate from the binary protocol's own
+listener (see "Binary protocol" below) and from whatever else might one
+day share this HTTP server.
+
 An OpenAPI spec for everything below is generated (via
 [utoipa](https://github.com/juhaku/utoipa)) straight from the same
 `#[utoipa::path(...)]` annotations on each handler in
-`kblockdbserver/src/routes.rs` -- served as JSON at `GET /api-docs/openapi.json`
-and browsable interactively at `GET /swagger-ui/`, both unauthenticated
-(like `/health`, they describe the API, not any of its data). Because the
-spec is generated from the same annotations the router is built from,
+`kblockdbserver/src/routes.rs` -- served as JSON at `GET /rest/api-docs/openapi.json`
+and browsable interactively at `GET /rest/swagger-ui/`, both unauthenticated
+(like `/rest/health`, they describe the API, not any of its data). Because
+the spec is generated from the same annotations the router is built from,
 adding or changing a route without updating its annotation is a compile
 error, not documentation that silently drifts from what the server
 actually does.
 
-Every endpoint below except `/health` requires **HTTP Basic Auth** against
-one of the config file's accounts (`admin`/`admin_password`, or a
+Every endpoint below except `/rest/health` requires **HTTP Basic Auth**
+against one of the config file's accounts (`admin`/`admin_password`, or a
 `[[users]]` entry) -- a request with no `Authorization` header, an unknown
 username, or the wrong password gets `401`. A `read_only` account gets
-`403` on anything but `GET` (`PUT`/`DELETE` are writes). `/health` is left
-open so load balancers/orchestrators can poll liveness without
+`403` on anything but `GET` (`PUT`/`DELETE` are writes). `/rest/health` is
+left open so load balancers/orchestrators can poll liveness without
 credentials; it exposes nothing more sensitive than the world's shape and
 this server's clock.
 
@@ -477,16 +482,16 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/health` | | `200` `{"status":"ok","axes":3,"world_dim":10000,"timestamp":1735689600}` |
-| `GET` | `/cells/{coords}/{key}` | | `200 {"value": <value>}`, or `404` if unset |
-| `PUT` | `/cells/{coords}/{key}` | `<value>` | `204` |
-| `DELETE` | `/cells/{coords}/{key}` | | `204` |
-| `GET` | `/regions/{origin}/{extent}/{key}` | | `200 {"values": [<value or null>, ...]}` |
-| `PUT` | `/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
-| `DELETE` | `/regions/{origin}/{extent}/{key}` | | `204` |
-| `GET` | `/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
+| `GET` | `/rest/health` | | `200` `{"status":"ok","axes":3,"world_dim":10000,"timestamp":1735689600}` |
+| `GET` | `/rest/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset |
+| `PUT` | `/rest/cells/{coords}/{key}` | `<value>` | `204` |
+| `DELETE` | `/rest/cells/{coords}/{key}` | | `204` |
+| `GET` | `/rest/regions/{origin}/{extent}/{key}` | | `200 {"values": [<value or null>, ...]}` |
+| `PUT` | `/rest/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
+| `DELETE` | `/rest/regions/{origin}/{extent}/{key}` | | `204` |
+| `GET` | `/rest/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
 
-`/stats` walks the on-disk chunk files under `--data-dir` and reports:
+`/rest/stats` walks the on-disk chunk files under `--data-dir` and reports:
 `total_chunks` (chunk files currently on disk -- see `kblockdblib`'s "Layout on
 disk" doc comment, a chunk with no cells set in it is never written and an
 emptied one is deleted, not left behind empty), `total_bytes` (their
@@ -497,7 +502,7 @@ never-written, and so sparse, regions; on Windows this is instead
 than a real sparse-file measurement). It's a live filesystem walk each
 call, not a running counter, so it costs time proportional to how many
 chunks currently exist. Like the cell/region endpoints (and unlike
-`/health`), it requires auth, but being a `GET` it's available to
+`/rest/health`), it requires auth, but being a `GET` it's available to
 `read_only` accounts too.
 
 Region `values` arrays are in axis-0-fastest order (matching
@@ -525,27 +530,27 @@ currently report per-cell metadata, only the single-cell endpoint does.
 
 ```sh
 # set a cell
-curl -u admin:change-me -X PUT localhost:8080/cells/1,2,3/material \
+curl -u admin:change-me -X PUT localhost:8080/rest/cells/1,2,3/material \
   -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
 
 # read it back
-curl -u admin:change-me localhost:8080/cells/1,2,3/material
+curl -u admin:change-me localhost:8080/rest/cells/1,2,3/material
 # {"value":{"type":"str","value":"stone"},"created_at_ms":1735689600000,
 #  "modified_at_ms":1735689600000,"version":0}
 
 # fill an 8x8x8 region with distinct per-cell values (512 of them, omitted here)
-curl -u admin:change-me -X PUT localhost:8080/regions/0,0,0/8,8,8/material \
+curl -u admin:change-me -X PUT localhost:8080/rest/regions/0,0,0/8,8,8/material \
   -H 'content-type: application/json' -d '{"values":[...]}'
 
 # read the whole region back
-curl -u admin:change-me localhost:8080/regions/0,0,0/8,8,8/material
+curl -u admin:change-me localhost:8080/rest/regions/0,0,0/8,8,8/material
 
 # clear a cell / a region
-curl -u admin:change-me -X DELETE localhost:8080/cells/1,2,3/material
-curl -u admin:change-me -X DELETE localhost:8080/regions/0,0,0/8,8,8/material
+curl -u admin:change-me -X DELETE localhost:8080/rest/cells/1,2,3/material
+curl -u admin:change-me -X DELETE localhost:8080/rest/regions/0,0,0/8,8,8/material
 
 # on-disk stats
-curl -u admin:change-me localhost:8080/stats
+curl -u admin:change-me localhost:8080/rest/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
@@ -602,12 +607,13 @@ client can't depend on a Rust crate. `kblockdbcli` still speaks REST only.
   admin_password, `[[users]]`, and a `[worldparameters]` table for
   axes/world_dim/chunk_size) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
-  to every route except `/health`, including the `read_only` write check.
-- `kblockdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each
-  one's `#[utoipa::path(...)]` OpenAPI annotation.
+  to every route except `/rest/health`, including the `read_only` write check.
+- `kblockdbserver/src/routes.rs`     -- the router (mounted under `/rest`,
+  see "REST API" above), all HTTP handlers, and each one's
+  `#[utoipa::path(...)]` OpenAPI annotation.
 - `kblockdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
   that collects every handler's annotation (and every response type's
-  `#[derive(ToSchema)]`) into the spec served at `/api-docs/openapi.json`,
+  `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
   plus the `basic_auth` security scheme those annotations reference.
 - `kblockdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
   `World`, plus the configured accounts) and `with_world`, which runs each
@@ -729,7 +735,7 @@ well under a minute, and every default is overridable.
 
 ## `kblockdbcli`: the command-line client
 
-A thin wrapper over kblockdbserver's `/cells/{coords}/{key}` endpoint -- `get`,
+A thin wrapper over kblockdbserver's `/rest/cells/{coords}/{key}` endpoint -- `get`,
 `set`, and `remove` one cell's value from a shell, with the same HTTP
 Basic Auth every other client of kblockdbserver's REST API needs.
 

@@ -19,9 +19,10 @@ use utoipa::{Modify, OpenApi};
 #[openapi(
     info(
         title = "kblockdbserver",
-        description = "A RESTful HTTP front end for the kblockdblib storage engine. \
-                       Every path except /health requires HTTP Basic Auth \
-                       against an account from kblockdbserver's config file.",
+        description = "A RESTful HTTP front end for the kblockdblib storage engine, \
+                       mounted under /rest. Every path except /rest/health requires \
+                       HTTP Basic Auth against an account from kblockdbserver's \
+                       config file.",
     ),
     paths(
         routes::health,

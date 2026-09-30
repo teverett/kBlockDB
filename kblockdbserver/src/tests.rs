@@ -141,7 +141,7 @@ fn delete(path: &str) -> Request<Body> {
 
 #[tokio::test]
 async fn health_reports_the_worlds_shape() {
-    let (status, body) = send(test_app().0, get("/health")).await;
+    let (status, body) = send(test_app().0, get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
     assert_eq!(body["axes"], 3);
@@ -155,7 +155,7 @@ async fn health_includes_a_current_unix_timestamp() {
         .unwrap()
         .as_secs();
 
-    let (status, body) = send(test_app().0, get("/health")).await;
+    let (status, body) = send(test_app().0, get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
     let timestamp = body["timestamp"]
         .as_u64()
@@ -173,7 +173,7 @@ async fn health_includes_a_current_unix_timestamp() {
 
 #[tokio::test]
 async fn stats_of_an_untouched_world_are_all_zero() {
-    let (status, body) = send(test_app().0, get("/stats")).await;
+    let (status, body) = send(test_app().0, get("/rest/stats")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
@@ -187,13 +187,13 @@ async fn stats_reflect_data_written_through_the_api() {
     send(
         app.clone(),
         put(
-            "/cells/1,2,3/material",
+            "/rest/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, get("/stats")).await;
+    let (status, body) = send(app, get("/rest/stats")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_chunks"], 1);
     assert!(body["total_bytes"].as_u64().unwrap() > 0);
@@ -203,7 +203,7 @@ async fn stats_reflect_data_written_through_the_api() {
 async fn stats_requires_auth() {
     let req = Request::builder()
         .method("GET")
-        .uri("/stats")
+        .uri("/rest/stats")
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(test_app().0, req).await;
@@ -215,7 +215,7 @@ async fn a_read_only_user_can_get_stats() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/stats")
+            .uri("/rest/stats")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -227,7 +227,7 @@ async fn a_read_only_user_can_get_stats() {
 
 #[tokio::test]
 async fn get_on_a_never_set_cell_is_404() {
-    let (status, body) = send(test_app().0, get("/cells/1,2,3/material")).await;
+    let (status, body) = send(test_app().0, get("/rest/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].is_string());
 }
@@ -239,14 +239,14 @@ async fn set_then_get_a_cell_roundtrips() {
     let (status, _) = send(
         app.clone(),
         put(
-            "/cells/1,2,3/material",
+            "/rest/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
     // A fresh set: version 0, created_at/modified_at equal, both real
@@ -265,7 +265,7 @@ async fn get_cell_reports_incrementing_version_and_stable_created_at() {
         let (status, _) = send(
             app.clone(),
             put(
-                "/cells/1,2,3/material",
+                "/rest/cells/1,2,3/material",
                 json!({"type": "str", "value": value}),
             ),
         )
@@ -273,7 +273,7 @@ async fn get_cell_reports_incrementing_version_and_stable_created_at() {
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
-    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "dirt"}));
     assert_eq!(body["version"], 2); // 3 sets total: version 0, 1, 2
@@ -288,7 +288,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
     let (status, _) = send(
         app.clone(),
         put(
-            "/cells/1,2,3/material",
+            "/rest/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -300,7 +300,10 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
     // (see kblockdblib::Schema, which is what actually enforces this).
     let (status, body) = send(
         app.clone(),
-        put("/cells/9,9,9/material", json!({"type": "i64", "value": 7})),
+        put(
+            "/rest/cells/9,9,9/material",
+            json!({"type": "i64", "value": 7}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -308,7 +311,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
 
     // The connection survives, and the original value is untouched --
     // this really was handled as an ordinary rejected request.
-    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
@@ -318,34 +321,37 @@ async fn set_then_delete_then_get_a_cell_is_404_again() {
     let (app, _dir) = test_app();
     send(
         app.clone(),
-        put("/cells/5,5,5/hardness", json!({"type": "i64", "value": 10})),
+        put(
+            "/rest/cells/5,5,5/hardness",
+            json!({"type": "i64", "value": 10}),
+        ),
     )
     .await;
 
-    let (status, _) = send(app.clone(), delete("/cells/5,5,5/hardness")).await;
+    let (status, _) = send(app.clone(), delete("/rest/cells/5,5,5/hardness")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, _) = send(app, get("/cells/5,5,5/hardness")).await;
+    let (status, _) = send(app, get("/rest/cells/5,5,5/hardness")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn a_cell_coordinate_with_the_wrong_axis_count_is_400() {
-    let (status, body) = send(test_app().0, get("/cells/1,2/material")).await; // 2 coords, 3-axis world
+    let (status, body) = send(test_app().0, get("/rest/cells/1,2/material")).await; // 2 coords, 3-axis world
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
 
 #[tokio::test]
 async fn a_non_numeric_coordinate_is_400() {
-    let (status, _) = send(test_app().0, get("/cells/1,x,3/material")).await;
+    let (status, _) = send(test_app().0, get("/rest/cells/1,x,3/material")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn an_out_of_bounds_coordinate_is_400() {
     // world_dim is 100 in test_app().
-    let (status, _) = send(test_app().0, get("/cells/999,0,0/material")).await;
+    let (status, _) = send(test_app().0, get("/rest/cells/999,0,0/material")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -354,7 +360,7 @@ async fn malformed_json_body_is_a_client_error() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/cells/0,0,0/material")
+            .uri("/rest/cells/0,0,0/material")
             .header("content-type", "application/json")
             .body(Body::from("not json"))
             .unwrap(),
@@ -380,10 +386,10 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
         {"type": "i64", "value": 2},
         {"type": "i64", "value": 3},
     ]});
-    let (status, _) = send(app.clone(), put("/regions/0,0,0/2,2,1/n", values)).await;
+    let (status, _) = send(app.clone(), put("/rest/regions/0,0,0/2,2,1/n", values)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app, get("/regions/0,0,0/2,2,1/n")).await;
+    let (status, body) = send(app, get("/rest/regions/0,0,0/2,2,1/n")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
@@ -398,7 +404,7 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
 
 #[tokio::test]
 async fn get_region_on_an_untouched_area_is_all_null() {
-    let (status, body) = send(test_app().0, get("/regions/0,0,0/2,2,2/material")).await;
+    let (status, body) = send(test_app().0, get("/rest/regions/0,0,0/2,2,2/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["values"].as_array().unwrap().len(), 8);
     assert!(body["values"].as_array().unwrap().iter().all(Json::is_null));
@@ -407,7 +413,11 @@ async fn get_region_on_an_untouched_area_is_all_null() {
 #[tokio::test]
 async fn set_region_with_the_wrong_number_of_values_is_400() {
     let values = json!({"values": [{"type": "i64", "value": 0}]}); // region holds 8 cells
-    let (status, body) = send(test_app().0, put("/regions/0,0,0/2,2,2/material", values)).await;
+    let (status, body) = send(
+        test_app().0,
+        put("/rest/regions/0,0,0/2,2,2/material", values),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
@@ -419,18 +429,22 @@ async fn remove_region_clears_every_cell_in_it() {
         {"type": "str", "value": "stone"},
         {"type": "str", "value": "stone"},
     ]});
-    send(app.clone(), put("/regions/0,0,0/2,1,1/material", values)).await;
+    send(
+        app.clone(),
+        put("/rest/regions/0,0,0/2,1,1/material", values),
+    )
+    .await;
 
-    let (status, _) = send(app.clone(), delete("/regions/0,0,0/2,1,1/material")).await;
+    let (status, _) = send(app.clone(), delete("/rest/regions/0,0,0/2,1,1/material")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (_, body) = send(app, get("/regions/0,0,0/2,1,1/material")).await;
+    let (_, body) = send(app, get("/rest/regions/0,0,0/2,1,1/material")).await;
     assert!(body["values"].as_array().unwrap().iter().all(Json::is_null));
 }
 
 #[tokio::test]
 async fn a_region_with_mismatched_origin_and_extent_axes_is_400() {
-    let (status, _) = send(test_app().0, get("/regions/0,0,0/2,2/material")).await; // 3 vs 2 axes
+    let (status, _) = send(test_app().0, get("/rest/regions/0,0,0/2,2/material")).await; // 3 vs 2 axes
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -438,7 +452,7 @@ async fn a_region_with_mismatched_origin_and_extent_axes_is_400() {
 async fn health_does_not_require_auth() {
     let req = Request::builder()
         .method("GET")
-        .uri("/health")
+        .uri("/rest/health")
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(test_app().0, req).await;
@@ -449,7 +463,7 @@ async fn health_does_not_require_auth() {
 async fn a_protected_endpoint_without_credentials_is_401() {
     let req = Request::builder()
         .method("GET")
-        .uri("/cells/1,2,3/material")
+        .uri("/rest/cells/1,2,3/material")
         .body(Body::empty())
         .unwrap();
     let (status, body) = send(test_app().0, req).await;
@@ -462,7 +476,7 @@ async fn a_protected_endpoint_with_the_wrong_password_is_401() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_ADMIN,
@@ -477,7 +491,7 @@ async fn a_protected_endpoint_with_an_unknown_username_is_401() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         "nobody",
@@ -493,7 +507,7 @@ async fn a_non_admin_configured_user_can_use_protected_endpoints() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({"type": "str", "value": "stone"}).to_string(),
@@ -512,7 +526,7 @@ async fn a_read_only_user_can_get_a_cell() {
     send(
         app.clone(),
         put(
-            "/cells/1,2,3/material",
+            "/rest/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -521,7 +535,7 @@ async fn a_read_only_user_can_get_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -537,7 +551,7 @@ async fn a_read_only_user_cannot_put_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({"type": "str", "value": "stone"}).to_string(),
@@ -557,7 +571,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
     send(
         app.clone(),
         put(
-            "/cells/1,2,3/material",
+            "/rest/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -566,7 +580,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("DELETE")
-            .uri("/cells/1,2,3/material")
+            .uri("/rest/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -577,7 +591,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
 
     // The value survives -- the DELETE was actually refused, not silently
     // accepted and ignored.
-    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
@@ -588,7 +602,7 @@ async fn a_read_only_user_cannot_put_a_region() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/regions/0,0,0/2,2,2/material")
+            .uri("/rest/regions/0,0,0/2,2,2/material")
             .header("content-type", "application/json")
             .body(Body::from(json!({"values": values}).to_string()))
             .unwrap(),
@@ -603,7 +617,7 @@ async fn a_read_only_user_cannot_put_a_region() {
 async fn openapi_json_is_served_without_auth_and_describes_every_path() {
     let req = Request::builder()
         .method("GET")
-        .uri("/api-docs/openapi.json")
+        .uri("/rest/api-docs/openapi.json")
         .body(Body::empty())
         .unwrap();
     let (status, body) = send(test_app().0, req).await;
@@ -614,10 +628,10 @@ async fn openapi_json_is_served_without_auth_and_describes_every_path() {
         .as_object()
         .expect("openapi spec should have a paths object");
     for path in [
-        "/health",
-        "/stats",
-        "/cells/{coords}/{key}",
-        "/regions/{origin}/{extent}/{key}",
+        "/rest/health",
+        "/rest/stats",
+        "/rest/cells/{coords}/{key}",
+        "/rest/regions/{origin}/{extent}/{key}",
     ] {
         assert!(paths.contains_key(path), "spec is missing path {path}");
     }
@@ -627,7 +641,7 @@ async fn openapi_json_is_served_without_auth_and_describes_every_path() {
 async fn swagger_ui_is_served_without_auth() {
     let req = Request::builder()
         .method("GET")
-        .uri("/swagger-ui/")
+        .uri("/rest/swagger-ui/")
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(test_app().0, req).await;
