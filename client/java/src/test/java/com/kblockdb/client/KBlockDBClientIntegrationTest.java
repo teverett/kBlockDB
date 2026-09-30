@@ -137,7 +137,13 @@ class KBlockDBClientIntegrationTest {
     // --- Test server plumbing ---
 
     private static Path findKblockdbserverBinary() {
-        Path repoRoot = Path.of(System.getProperty("user.dir")).toAbsolutePath().getParent();
+        // user.dir is this Maven module's own directory (client/java) --
+        // the Cargo workspace root (where target/<profile>/ actually is)
+        // is two levels up from there.
+        Path repoRoot = Path.of(System.getProperty("user.dir"))
+                .toAbsolutePath()
+                .getParent()
+                .getParent();
         for (String profile : List.of("debug", "release")) {
             for (String name : List.of("kblockdbserver", "kblockdbserver.exe")) {
                 Path candidate = repoRoot.resolve("target").resolve(profile).resolve(name);

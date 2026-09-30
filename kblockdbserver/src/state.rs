@@ -117,7 +117,7 @@ mod tests {
             "kblockdbserver-state-test-{n}-{}",
             std::process::id()
         ));
-        let world = World::create(&dir, 1, 1).unwrap();
+        let world = World::create(&dir, 1, 1, 32).unwrap();
         let mut credentials = HashMap::new();
         credentials.insert(
             "admin".to_string(),

@@ -1,0 +1,47 @@
+name: Java client
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v7
+
+      # The client's integration test (KBlockDBClientIntegrationTest) spawns
+      # a real kblockdbserver, so it needs the binary built first -- just
+      # this one crate, not the whole workspace, since that's all this job
+      # needs.
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build kblockdbserver
+        run: cargo build -p kblockdbserver
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+          cache: maven
+
+      - name: Build and test the Java client
+        working-directory: client/java
+        run: mvn --batch-mode --no-transfer-progress package

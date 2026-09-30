@@ -2,16 +2,13 @@ use crate::value::Value;
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
 
-/// Cells per axis within one chunk. With the default 3 axes, that's
-/// 32^3 = 32,768 cells/chunk. The *number* of axes is a per-world runtime
-/// parameter (see `world::WorldParams`/`World::create`), so a chunk's total
-/// cell count -- `chunk_cells(axes)` -- is a runtime value too, not a
-/// compile-time constant.
-pub const CHUNK_DIM: u32 = 32;
-
-/// Cells in one chunk, for a world with `axes` axes: `CHUNK_DIM^axes`.
-pub fn chunk_cells(axes: usize) -> usize {
-    (CHUNK_DIM as usize).pow(axes as u32)
+/// Cells in one chunk, for a world with `axes` axes and `chunk_dim` cells
+/// per axis within a chunk: `chunk_dim^axes`. With the default 3 axes and
+/// `chunk_dim` 32, that's 32^3 = 32,768 cells/chunk. Both are per-world
+/// runtime parameters (see `world::WorldParams`/`World::create`), so this
+/// is always a runtime value, never a compile-time constant.
+pub fn chunk_cells(axes: usize, chunk_dim: u32) -> usize {
+    (chunk_dim as usize).pow(axes as u32)
 }
 
 /// Bytes per `rank`-acceleration block -- see `Bitset::block_counts`. 64 is
@@ -23,9 +20,9 @@ const RANK_BLOCK_BYTES: usize = 64;
 
 /// A bitmap, one bit per cell in the chunk, marking whether that cell has a
 /// value in a given column. Sized at construction from the owning world's
-/// `chunk_cells(axes)` -- `axes` isn't known until a `World` is opened, so
-/// this can't be a fixed-size array the way a single-world-shape version of
-/// this prototype could use.
+/// `chunk_cells(axes, chunk_dim)` -- neither is known until a `World` is
+/// opened, so this can't be a fixed-size array the way a single-world-shape
+/// version of this prototype could use.
 #[derive(Clone)]
 struct Bitset {
     bits: Vec<u8>,
@@ -36,9 +33,10 @@ struct Bitset {
 }
 
 impl Bitset {
-    /// `byte_len` must be `cell_count / 8` for whatever `cell_count` this
-    /// bitmap is meant to cover (always a whole number for `CHUNK_DIM`'s
-    /// power-of-two cell counts).
+    /// `byte_len` must be `cell_count.div_ceil(8)` for whatever `cell_count`
+    /// this bitmap is meant to cover -- with a configurable `chunk_dim`,
+    /// `cell_count` is no longer guaranteed to be a multiple of 8, so the
+    /// last byte may have a handful of trailing unused (always-0) bits.
     fn new(byte_len: usize) -> Self {
         Bitset {
             bits: vec![0u8; byte_len],
@@ -129,17 +127,18 @@ struct Column {
     data: ColumnData,
 }
 
-/// A `chunk_cells(axes)`-cell block of cells, stored columnarly: one sparse
-/// array per key that actually appears *somewhere in this chunk*, rather
-/// than one hashmap per cell. Columns are created lazily on first write, so
-/// a chunk that only ever sees 2 distinct keys allocates exactly 2 columns,
-/// no matter how many keys exist elsewhere in the world.
+/// A `chunk_cells(axes, chunk_dim)`-cell block of cells, stored columnarly:
+/// one sparse array per key that actually appears *somewhere in this
+/// chunk*, rather than one hashmap per cell. Columns are created lazily on
+/// first write, so a chunk that only ever sees 2 distinct keys allocates
+/// exactly 2 columns, no matter how many keys exist elsewhere in the world.
 ///
 /// `Chunk` itself doesn't know the world's coordinate system -- `local_idx`
-/// is an opaque flat cell index within `[0, chunk_cells(axes))`;
+/// is an opaque flat cell index within `[0, chunk_cells(axes, chunk_dim))`;
 /// `World::split` is what maps a coordinate to one. It does need to know
-/// `axes` indirectly, though: `presence_bytes` (`chunk_cells(axes) / 8`) is
-/// how big a newly-created column's presence bitmap must be.
+/// the chunk's cell count indirectly, though: `presence_bytes`
+/// (`chunk_cells(axes, chunk_dim).div_ceil(8)`) is how big a newly-created
+/// column's presence bitmap must be.
 pub struct Chunk {
     columns: HashMap<u32, Column>,
     presence_bytes: usize,
@@ -149,7 +148,7 @@ impl Chunk {
     pub fn new(cell_count: usize) -> Self {
         Chunk {
             columns: HashMap::new(),
-            presence_bytes: cell_count / 8,
+            presence_bytes: cell_count.div_ceil(8),
         }
     }
 
@@ -292,11 +291,12 @@ impl Chunk {
         Ok(())
     }
 
-    /// `cell_count` must be the owning world's `chunk_cells(axes)` -- the
-    /// caller (`World`) knows this from its own `axes`, persisted in
-    /// `world.txt`, so it isn't stored redundantly in every chunk file.
+    /// `cell_count` must be the owning world's `chunk_cells(axes, chunk_dim)`
+    /// -- the caller (`World`) knows this from its own `axes`/`chunk_dim`,
+    /// persisted in `world.txt`, so it isn't stored redundantly in every
+    /// chunk file.
     pub fn read_from<R: Read>(r: &mut R, cell_count: usize) -> io::Result<Self> {
-        let presence_bytes = cell_count / 8;
+        let presence_bytes = cell_count.div_ceil(8);
         let num_columns = read_u32(r)?;
         let mut columns = HashMap::with_capacity(num_columns as usize);
 
@@ -392,7 +392,7 @@ fn read_arr8<R: Read>(r: &mut R) -> io::Result<[u8; 8]> {
 mod tests {
     use super::*;
 
-    /// A default-shaped chunk's cell count (3 axes, `CHUNK_DIM = 32`): the
+    /// A default-shaped chunk's cell count (3 axes, chunk_dim 32): the
     /// tests below use cell indices that only need to fit within this.
     const CELLS: usize = 32 * 32 * 32;
 
@@ -441,14 +441,39 @@ mod tests {
     fn different_axis_counts_get_different_sized_chunks() {
         // 2 axes: 32^2 = 1024 cells/chunk, a much smaller presence bitmap
         // than the 3-axis default.
-        let mut c = Chunk::new(chunk_cells(2));
+        let mut c = Chunk::new(chunk_cells(2, 32));
         c.set(0, 0, Value::I64(1));
         let mut buf = Vec::new();
         c.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), c.byte_len());
 
-        let c2 = Chunk::read_from(&mut &buf[..], chunk_cells(2)).unwrap();
+        let c2 = Chunk::read_from(&mut &buf[..], chunk_cells(2, 32)).unwrap();
         assert_eq!(c2.get(0, 0), Some(Value::I64(1)));
+    }
+
+    #[test]
+    fn a_chunk_dim_giving_a_cell_count_not_a_multiple_of_8_is_handled_correctly() {
+        // chunk_dim=3, 2 axes: 9 cells, not a multiple of 8 -- exercises the
+        // `div_ceil(8)` presence-byte sizing (a plain `/ 8` would floor to 1
+        // byte for 9 cells and panic indexing bit 8 into it).
+        let cells = chunk_cells(2, 3);
+        assert_eq!(cells, 9);
+
+        let mut c = Chunk::new(cells);
+        for idx in 0..cells {
+            c.set(idx, 0, Value::I64(idx as i64));
+        }
+        for idx in 0..cells {
+            assert_eq!(c.get(idx, 0), Some(Value::I64(idx as i64)));
+        }
+
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), c.byte_len());
+        let c2 = Chunk::read_from(&mut &buf[..], cells).unwrap();
+        for idx in 0..cells {
+            assert_eq!(c2.get(idx, 0), Some(Value::I64(idx as i64)));
+        }
     }
 
     // --- Bitset::rank's block-count acceleration ---

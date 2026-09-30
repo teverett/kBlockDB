@@ -24,6 +24,7 @@ struct Args {
     data_dir: Option<String>,
     axes: Option<usize>,
     world_dim: Option<u32>,
+    chunk_size: Option<u32>,
     http_addr: Option<String>,
     binary_addr: Option<String>,
     max_concurrent_disk_ops: Option<usize>,
@@ -35,6 +36,7 @@ fn parse_args() -> Args {
     let mut data_dir = None;
     let mut axes = None;
     let mut world_dim = None;
+    let mut chunk_size = None;
     let mut http_addr = None;
     let mut binary_addr = None;
     let mut max_concurrent_disk_ops = None;
@@ -61,6 +63,16 @@ fn parse_args() -> Args {
                         .parse()
                         .unwrap_or_else(|_| {
                             eprintln!("--world-dim must be a positive integer");
+                            std::process::exit(1);
+                        }),
+                )
+            }
+            "--chunk-size" => {
+                chunk_size = Some(
+                    expect_value(&mut args, "--chunk-size")
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            eprintln!("--chunk-size must be a positive integer");
                             std::process::exit(1);
                         }),
                 )
@@ -104,6 +116,7 @@ fn parse_args() -> Args {
         data_dir,
         axes,
         world_dim,
+        chunk_size,
         http_addr,
         binary_addr,
         max_concurrent_disk_ops,
@@ -125,13 +138,18 @@ fn print_help() {
          OPTIONS:\n    \
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
          holds admin_password and, optionally, [[users]], plus optional\n                          \
-         http_addr/binary_addr/data_dir/axes/world_dim/max_concurrent_disk_ops/\n                          \
-         max_cached_chunks (each overridden by the matching CLI flag\n                          \
-         below, if given). Example:\n                          \
+         http_addr/binary_addr/data_dir/max_concurrent_disk_ops/\n                          \
+         max_cached_chunks and a [worldparameters] table (each overridden\n                          \
+         by the matching CLI flag below, if given). Example:\n                          \
          \n                          \
          http_addr = \"127.0.0.1:8080\"\n                          \
          data_dir = \"./data\"\n                          \
          admin_password = \"change-me\"\n                          \
+         \n                          \
+         [worldparameters]\n                          \
+         axes = 3\n                          \
+         world_dim = 10000\n                          \
+         chunk_size = 32\n                          \
          \n                          \
          [[users]]\n                          \
          username = \"alice\"\n                          \
@@ -139,6 +157,11 @@ fn print_help() {
          --data-dir <path>    World data directory (default: ./data)\n    \
          --axes <n>           Axis count for a brand-new world (default: {})\n    \
          --world-dim <n>      Cells per axis for a brand-new world (default: {})\n    \
+         --chunk-size <n>     Cells per axis within a chunk, for a brand-new world\n                          \
+         (default: {}; see kblockdblib::DEFAULT_CHUNK_DIM -- a\n                          \
+         bigger chunk means fewer, larger chunk files, so more\n                          \
+         bytes rewritten per single-cell write but less filesystem\n                          \
+         metadata overhead; measure the right value for yours)\n    \
          --http-addr <host:port>\n                          \
          Address to listen on for the REST API (default: 127.0.0.1:8080)\n    \
          --binary-addr <host:port>\n                          \
@@ -157,15 +180,17 @@ fn print_help() {
          kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
          cache's benefit without disabling the server)\n    \
          -h, --help           Print this help\n\n\
-         --axes/--world-dim only matter the first time a world is created at\n\
-         --data-dir; reopening an existing one reads its real shape from its\n\
-         world.txt and ignores these flags (World::open does, not create).\n\n\
+         --axes/--world-dim/--chunk-size only matter the first time a world is\n\
+         created at --data-dir; reopening an existing one reads its real shape\n\
+         from its world.txt and ignores these flags (World::open does, not\n\
+         create).\n\n\
          Every REST endpoint except /health requires HTTP Basic Auth against\n\
          an account from the config file (admin_password, or a [[users]] entry).\n\
          admin_password/users are config-file-only -- never CLI flags -- so\n\
          credentials don't end up in shell history or `ps` output.",
         kblockdblib::AXES,
         kblockdblib::WORLD_DIM,
+        kblockdblib::DEFAULT_CHUNK_DIM,
         kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS,
         kblockdblib::DEFAULT_MAX_CACHED_CHUNKS
     );
@@ -187,11 +212,18 @@ async fn main() {
         .data_dir
         .or_else(|| config.data_dir.clone())
         .unwrap_or_else(|| "./data".to_string());
-    let axes = args.axes.or(config.axes).unwrap_or(kblockdblib::AXES);
+    let axes = args
+        .axes
+        .or(config.worldparameters.axes)
+        .unwrap_or(kblockdblib::AXES);
     let world_dim = args
         .world_dim
-        .or(config.world_dim)
+        .or(config.worldparameters.world_dim)
         .unwrap_or(kblockdblib::WORLD_DIM);
+    let chunk_size = args
+        .chunk_size
+        .or(config.worldparameters.chunk_size)
+        .unwrap_or(kblockdblib::DEFAULT_CHUNK_DIM);
     let http_addr = args
         .http_addr
         .or_else(|| config.http_addr.clone())
@@ -202,10 +234,11 @@ async fn main() {
         .or(config.max_concurrent_disk_ops);
     let max_cached_chunks = args.max_cached_chunks.or(config.max_cached_chunks);
 
-    let mut world = kblockdblib::World::create(&data_dir, axes, world_dim).unwrap_or_else(|e| {
-        eprintln!("failed to open world at {data_dir}: {e}");
-        std::process::exit(1);
-    });
+    let mut world = kblockdblib::World::create(&data_dir, axes, world_dim, chunk_size)
+        .unwrap_or_else(|e| {
+            eprintln!("failed to open world at {data_dir}: {e}");
+            std::process::exit(1);
+        });
     if let Some(n) = max_concurrent_disk_ops {
         world = world.with_max_concurrent_disk_ops(n);
     }
@@ -214,10 +247,11 @@ async fn main() {
     }
     let credentials = config.credentials();
     println!(
-        "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, max_concurrent_disk_ops={}, \
-         max_cached_chunks={}), {} account(s) configured",
+        "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, chunk_size={}, \
+         max_concurrent_disk_ops={}, max_cached_chunks={}), {} account(s) configured",
         world.axes(),
         world.world_dim(),
+        world.chunk_dim(),
         world.max_concurrent_disk_ops(),
         world.max_cached_chunks(),
         credentials.len()

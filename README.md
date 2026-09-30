@@ -35,11 +35,16 @@ kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdb
 
 ### Design
 
-- **Chunking, not one file per cell.** The world is split into 32x32x32
-  cell chunks (32,768 cells/chunk). A 10,000^3 world needs 313 chunks/axis
-  (313^3 ~= 30.6M chunks total), and each chunk is at most one file. Chunks
-  with no data at all are never written, so a mostly-empty world costs disk
-  space proportional to what's actually populated.
+- **Chunking, not one file per cell.** The world is split into
+  `chunk_dim`^axes cell chunks -- 32x32x32 (32,768 cells/chunk) by default.
+  A 10,000^3 world at that default needs 313 chunks/axis (313^3 ~= 30.6M
+  chunks total), and each chunk is at most one file. Chunks with no data at
+  all are never written, so a mostly-empty world costs disk space
+  proportional to what's actually populated. `chunk_dim` is a per-world
+  parameter, not a compile-time constant (see the axis-count bullet below)
+  -- a bigger value means fewer, larger chunk files (more bytes rewritten
+  per single-cell write, since writes are write-through -- see
+  "Concurrency" below); a smaller value is the opposite trade.
 
 - **Columnar storage per chunk, not a hashmap per cell.** Each chunk holds
   one sparse array ("column") per key that actually appears somewhere in
@@ -72,16 +77,17 @@ kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdb
   (one path segment per axis), which keeps any one directory to at most
   `chunks_per_axis()` entries no matter how large the world gets.
 
-- **Axis count and per-axis size are a world property, not a build-time
-  constant.** A world can have any number of axes (2D, 3D, 4D, ...) and any
-  `world_dim`; both are chosen once, when the world is created
-  (`World::create(root, axes, world_dim)`), and persisted to `world.txt` at
-  the world root. `World::open` reads them back from that file rather than
-  assuming a default, and a later `World::create` against the same
-  directory must pass matching numbers or it fails with `InvalidInput`
-  *without touching anything* -- a world's shape can't silently change out
-  from under data already written for it. `world::AXES`/`world::WORLD_DIM`
-  are only the defaults `main`'s demo happens to call `create` with.
+- **Axis count, per-axis size, and chunk size are a world property, not a
+  build-time constant.** A world can have any number of axes (2D, 3D, 4D,
+  ...), any `world_dim`, and any `chunk_dim`; all three are chosen once,
+  when the world is created (`World::create(root, axes, world_dim,
+  chunk_dim)`), and persisted to `world.txt` at the world root. `World::open`
+  reads them back from that file rather than assuming a default, and a
+  later `World::create` against the same directory must pass matching
+  numbers or it fails with `InvalidInput` *without touching anything* -- a
+  world's shape can't silently change out from under data already written
+  for it. `world::AXES`/`world::WORLD_DIM`/`world::DEFAULT_CHUNK_DIM` are
+  only the defaults `main`'s demo happens to call `create` with.
 
 ### Concurrency
 
@@ -347,12 +353,17 @@ USAGE:
 OPTIONS:
     --config <path>                Config file (default: ./kblockdbserver.toml). Required --
                                     holds admin_password and, optionally, [[users]], plus
-                                    optional http_addr/binary_addr/data_dir/axes/world_dim/
-                                    max_concurrent_disk_ops/max_cached_chunks (each
-                                    overridden by the matching CLI flag below, if given)
+                                    optional http_addr/binary_addr/data_dir/
+                                    max_concurrent_disk_ops/max_cached_chunks and a
+                                    [worldparameters] table (each overridden by the
+                                    matching CLI flag below, if given)
     --data-dir <path>              World data directory (default: ./data)
     --axes <n>                     Axis count for a brand-new world (default: 3)
     --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
+    --chunk-size <n>               Cells per axis within a chunk, for a brand-new world
+                                    (default: 32 -- see kblockdblib's chunking design;
+                                    bigger means fewer/larger chunk files, smaller
+                                    means the opposite trade)
     --http-addr <host:port>        Address to listen on for the REST API (default: 127.0.0.1:8080)
     --binary-addr <host:port>      Also listen on this address for the binary protocol
                                     (see "Binary protocol" below); disabled unless given
@@ -368,9 +379,9 @@ OPTIONS:
     -h, --help                     Print help
 ```
 
-`--axes`/`--world-dim` only matter the *first* time a world is created at
-`--data-dir` (via `World::create`); reopening an existing one reads its
-real shape back from its `world.txt` and ignores these flags.
+`--axes`/`--world-dim`/`--chunk-size` only matter the *first* time a world
+is created at `--data-dir` (via `World::create`); reopening an existing one
+reads its real shape back from its `world.txt` and ignores these flags.
 
 **Run exactly one `kblockdbserver` process per `--data-dir`.** `kblockdblib`'s
 locking is in-process only now (see its "Concurrency" section above), so a
@@ -390,11 +401,19 @@ flag, so they don't end up in shell history or `ps` output):
 http_addr = "127.0.0.1:8080" # optional; same defaults/precedence as the CLI flags
 binary_addr = "127.0.0.1:8081" # optional; disabled unless given (see "Binary protocol" below)
 data_dir = "./data"          # optional
-axes = 3                     # optional
-world_dim = 10000            # optional
 max_concurrent_disk_ops = 32 # optional
 max_cached_chunks = 100000   # optional
 admin_password = "change-me" # required
+
+# Only matters the first time a world is created at data_dir above --
+# reopening an existing one reads its real shape from its world.txt and
+# ignores these (World::open does, not create). Each field, and the whole
+# table, is optional; any missing field falls back to the matching CLI
+# flag, then to kblockdblib's own default.
+[worldparameters]
+axes = 3
+world_dim = 10000
+chunk_size = 32
 
 [[users]]
 username = "alice"
@@ -555,8 +574,9 @@ reimplementing the format.
 - `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
-  (http_addr/binary_addr/data_dir/axes/world_dim/max_concurrent_disk_ops/
-  max_cached_chunks, admin_password, `[[users]]`) and its validation.
+  (http_addr/binary_addr/data_dir/max_concurrent_disk_ops/max_cached_chunks,
+  admin_password, `[[users]]`, and a `[worldparameters]` table for
+  axes/world_dim/chunk_size) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
   to every route except `/health`, including the `read_only` write check.
 - `kblockdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each

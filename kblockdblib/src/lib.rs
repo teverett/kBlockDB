@@ -6,7 +6,7 @@
 //! meant to be embedded: `kblockdbserver` (a sibling crate in this workspace)
 //! wraps a [`World`] in a REST API. The most-used items are re-exported at
 //! the crate root; the individual modules are public too for anything more
-//! specific (e.g. `kblockdblib::chunk::CHUNK_DIM`).
+//! specific (e.g. `kblockdblib::chunk::chunk_cells`).
 
 pub mod chunk;
 mod chunk_cache;
@@ -22,6 +22,6 @@ pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::{Value, ValueType};
 pub use world::{
-    Region, Stats, World, AXES, DEFAULT_MAX_CACHED_CHUNKS, DEFAULT_MAX_CONCURRENT_DISK_OPS,
-    WORLD_DIM,
+    Region, Stats, World, AXES, DEFAULT_CHUNK_DIM, DEFAULT_MAX_CACHED_CHUNKS,
+    DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM,
 };

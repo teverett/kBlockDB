@@ -1,4 +1,4 @@
-use crate::chunk::{self, Chunk, CHUNK_DIM};
+use crate::chunk::{self, Chunk};
 use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
 use crate::params::WorldParams;
@@ -25,6 +25,18 @@ pub const AXES: usize = 3;
 /// the same "default at create time, persisted and authoritative
 /// afterward" rule applies.
 pub const WORLD_DIM: u32 = 10_000;
+
+/// Default cells per axis *within a chunk* for a *new* world -- see
+/// `AXES`'s doc comment; the same "default at create time, persisted and
+/// authoritative afterward" rule applies. With the default 3 axes, that's
+/// 32^3 = 32,768 cells/chunk (see `chunk::chunk_cells`). A larger value
+/// means fewer, bigger chunk files (each write-through write rewrites the
+/// *whole* chunk -- see `World`'s "Concurrency" doc comment -- so bigger
+/// chunks mean more bytes rewritten per single-cell write, but fewer
+/// distinct chunk files/directories for a given world); a smaller value is
+/// the opposite trade. Not a measured optimum for any particular
+/// deployment -- measure it for yours (e.g. with `kblockdbperf`).
+pub const DEFAULT_CHUNK_DIM: u32 = 32;
 
 /// Default cap on how many `with_chunk` calls -- i.e. real concurrent
 /// filesystem operations (`create_dir_all`/file I/O) -- a `World`
@@ -59,6 +71,10 @@ pub const DEFAULT_MAX_CONCURRENT_DISK_OPS: usize = 32;
 pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 100_000;
 
 const _: () = assert!(AXES >= 1, "AXES must be at least 1");
+const _: () = assert!(
+    DEFAULT_CHUNK_DIM >= 1,
+    "DEFAULT_CHUNK_DIM must be at least 1"
+);
 
 type ChunkKey = Coord;
 
@@ -248,6 +264,7 @@ pub struct World {
     root: PathBuf,
     axes: usize,
     world_dim: u32,
+    chunk_dim: u32,
     chunk_cells: usize,
     schema: Mutex<Schema>,
     /// Number of chunk files this `World` has actually opened and read
@@ -290,28 +307,43 @@ impl World {
     /// Creates a new world at `root`, or validates an existing one there.
     ///
     /// If `root/world.txt` doesn't exist yet, this world is brand new: it's
-    /// created with exactly the given `axes`/`world_dim`, persisted so every
-    /// later `open`/`create` of this directory sees the same shape. If
-    /// `root/world.txt` already exists, `axes` and `world_dim` must match it
-    /// exactly, or this fails with `InvalidInput` *without creating or
+    /// created with exactly the given `axes`/`world_dim`/`chunk_dim`,
+    /// persisted so every later `open`/`create` of this directory sees the
+    /// same shape. If `root/world.txt` already exists, all three must match
+    /// it exactly, or this fails with `InvalidInput` *without creating or
     /// opening anything* -- a world's shape can never change underneath
     /// data already written for it.
-    pub fn create<P: AsRef<Path>>(root: P, axes: usize, world_dim: u32) -> io::Result<Self> {
+    pub fn create<P: AsRef<Path>>(
+        root: P,
+        axes: usize,
+        world_dim: u32,
+        chunk_dim: u32,
+    ) -> io::Result<Self> {
         if axes == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "axes must be at least 1",
             ));
         }
+        if chunk_dim == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "chunk_dim must be at least 1",
+            ));
+        }
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
-        let requested = WorldParams { axes, world_dim };
+        let requested = WorldParams {
+            axes,
+            world_dim,
+            chunk_dim,
+        };
 
         // Atomic with respect to any other process doing the same thing at
         // the same moment -- see `WorldParams::create_or_validate`.
         if WorldParams::create_or_validate(&root, requested)? {
             crate::logger::info(format!(
-                "created world at {} (axes={axes}, world_dim={world_dim})",
+                "created world at {} (axes={axes}, world_dim={world_dim}, chunk_dim={chunk_dim})",
                 root.display()
             ));
         }
@@ -341,17 +373,19 @@ impl World {
         fs::create_dir_all(&root)?;
         let schema = Schema::open(&root)?;
         crate::logger::info(format!(
-            "world opened at {} (axes={}, world_dim={}, {} keys already interned)",
+            "world opened at {} (axes={}, world_dim={}, chunk_dim={}, {} keys already interned)",
             root.display(),
             params.axes,
             params.world_dim,
+            params.chunk_dim,
             schema.len()
         ));
         Ok(World {
             root,
             axes: params.axes,
             world_dim: params.world_dim,
-            chunk_cells: chunk::chunk_cells(params.axes),
+            chunk_dim: params.chunk_dim,
+            chunk_cells: chunk::chunk_cells(params.axes, params.chunk_dim),
             schema: Mutex::new(schema),
             chunks_read_from_disk: AtomicU64::new(0),
             chunks_written_to_disk: AtomicU64::new(0),
@@ -371,7 +405,7 @@ impl World {
     /// `Self`:
     /// ```no_run
     /// # fn main() -> std::io::Result<()> {
-    /// let world = kblockdblib::World::create("./data", 3, 10_000)?
+    /// let world = kblockdblib::World::create("./data", 3, 10_000, 32)?
     ///     .with_max_concurrent_disk_ops(8);
     /// # Ok(())
     /// # }
@@ -393,7 +427,7 @@ impl World {
     /// `with_max_concurrent_disk_ops`:
     /// ```no_run
     /// # fn main() -> std::io::Result<()> {
-    /// let world = kblockdblib::World::create("./data", 3, 10_000)?
+    /// let world = kblockdblib::World::create("./data", 3, 10_000, 32)?
     ///     .with_max_cached_chunks(1_000_000);
     /// # Ok(())
     /// # }
@@ -446,8 +480,13 @@ impl World {
         self.world_dim
     }
 
+    /// Cells per axis within a chunk -- see `DEFAULT_CHUNK_DIM`.
+    pub fn chunk_dim(&self) -> u32 {
+        self.chunk_dim
+    }
+
     pub fn chunks_per_axis(&self) -> u32 {
-        self.world_dim.div_ceil(CHUNK_DIM)
+        self.world_dim.div_ceil(self.chunk_dim)
     }
 
     pub fn schema_len(&self) -> usize {
@@ -500,9 +539,9 @@ impl World {
         let mut local_idx = 0usize;
         let mut mult = 1usize;
         for (a, c) in coord.iter().enumerate() {
-            ckey[a] = c / CHUNK_DIM;
-            local_idx += (c % CHUNK_DIM) as usize * mult;
-            mult *= CHUNK_DIM as usize;
+            ckey[a] = c / self.chunk_dim;
+            local_idx += (c % self.chunk_dim) as usize * mult;
+            mult *= self.chunk_dim as usize;
         }
         Ok((ckey, local_idx))
     }
@@ -919,10 +958,10 @@ mod tests {
         }
     }
 
-    /// Creates a fresh 3-axis, `WORLD_DIM`-sized world at `dir` -- the
-    /// default shape every test below assumes.
+    /// Creates a fresh 3-axis, `WORLD_DIM`-sized, `DEFAULT_CHUNK_DIM`-chunked
+    /// world at `dir` -- the default shape every test below assumes.
     fn create(dir: &TempDir) -> World {
-        World::create(dir, AXES, WORLD_DIM).unwrap()
+        World::create(dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM).unwrap()
     }
 
     fn coord3(x: u32, y: u32, z: u32) -> Coord {
@@ -933,14 +972,16 @@ mod tests {
     fn create_writes_world_txt_and_open_reads_it_back() {
         let dir = TempDir::new("create-basic");
         {
-            let w = World::create(&dir, 3, 10_000).unwrap();
+            let w = World::create(&dir, 3, 10_000, 32).unwrap();
             assert_eq!(w.axes(), 3);
             assert_eq!(w.world_dim(), 10_000);
+            assert_eq!(w.chunk_dim(), 32);
         }
 
         let w = World::open(&dir).unwrap();
         assert_eq!(w.axes(), 3);
         assert_eq!(w.world_dim(), 10_000);
+        assert_eq!(w.chunk_dim(), 32);
     }
 
     #[test]
@@ -953,9 +994,9 @@ mod tests {
     #[test]
     fn create_is_idempotent_with_matching_params() {
         let dir = TempDir::new("create-idempotent");
-        World::create(&dir, 3, 100).unwrap();
+        World::create(&dir, 3, 100, 32).unwrap();
         // Calling create again with the same params re-opens cleanly.
-        let w = World::create(&dir, 3, 100).unwrap();
+        let w = World::create(&dir, 3, 100, 32).unwrap();
         assert_eq!(w.axes(), 3);
         assert_eq!(w.world_dim(), 100);
     }
@@ -963,14 +1004,18 @@ mod tests {
     #[test]
     fn create_with_mismatched_params_fails_without_changing_anything() {
         let dir = TempDir::new("create-mismatch");
-        World::create(&dir, 3, 100).unwrap();
+        World::create(&dir, 3, 100, 32).unwrap();
 
         assert_eq!(
-            World::create(&dir, 4, 100).err().unwrap().kind(),
+            World::create(&dir, 4, 100, 32).err().unwrap().kind(),
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            World::create(&dir, 3, 200).err().unwrap().kind(),
+            World::create(&dir, 3, 200, 32).err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        assert_eq!(
+            World::create(&dir, 3, 100, 16).err().unwrap().kind(),
             io::ErrorKind::InvalidInput
         );
 
@@ -979,21 +1024,59 @@ mod tests {
         let w = World::open(&dir).unwrap();
         assert_eq!(w.axes(), 3);
         assert_eq!(w.world_dim(), 100);
+        assert_eq!(w.chunk_dim(), 32);
     }
 
     #[test]
     fn create_rejects_zero_axes() {
         let dir = TempDir::new("create-zero-axes");
         assert_eq!(
-            World::create(&dir, 0, 100).err().unwrap().kind(),
+            World::create(&dir, 0, 100, 32).err().unwrap().kind(),
             io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn create_rejects_zero_chunk_dim() {
+        let dir = TempDir::new("create-zero-chunk-dim");
+        assert_eq!(
+            World::create(&dir, 3, 100, 0).err().unwrap().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_world_can_have_a_different_chunk_dim() {
+        let dir = TempDir::new("create-small-chunk-dim");
+        let w = World::create(&dir, 3, 100, 4).unwrap();
+        assert_eq!(w.chunk_dim(), 4);
+        // 100 cells per axis, 4 cells/chunk -> 25 chunks per axis exactly.
+        assert_eq!(w.chunks_per_axis(), 25);
+
+        w.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        // Cell 4 is the first cell of the *second* chunk on axis 0 (a
+        // chunk_dim of 4, not the default 32) -- a distinct cell, not the
+        // one just set.
+        assert_eq!(w.get(&[4, 0, 0], "material").unwrap(), None);
+        assert_eq!(
+            w.get(&[0, 0, 0], "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+
+        w.flush().unwrap();
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(reopened.chunk_dim(), 4);
+        assert_eq!(
+            reopened.get(&[0, 0, 0], "material").unwrap(),
+            Some(Value::Str("stone".into()))
         );
     }
 
     #[test]
     fn a_world_can_have_a_different_axis_count() {
         let dir = TempDir::new("create-2d");
-        let w = World::create(&dir, 2, 50).unwrap();
+        let w = World::create(&dir, 2, 50, 32).unwrap();
 
         w.set(&[1, 2], "material", Value::Str("stone".into()))
             .unwrap();
@@ -1149,9 +1232,9 @@ mod tests {
         let dir = TempDir::new("multi-chunk");
         let w = create(&dir);
 
-        // CHUNK_DIM cells apart on axis 0 guarantees these land in different
-        // chunks.
-        let far = coord3(CHUNK_DIM, 0, 0);
+        // DEFAULT_CHUNK_DIM cells apart on axis 0 guarantees these land in
+        // different chunks.
+        let far = coord3(DEFAULT_CHUNK_DIM, 0, 0);
         w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
             .unwrap();
         w.set(&far, "material", Value::Str("air".into())).unwrap();
@@ -1431,8 +1514,8 @@ mod tests {
         // Starts 5 cells before a chunk boundary and ends 5 cells past the
         // next one, on every axis: covers the tail of one chunk, all of a
         // second, and the head of a third, on each axis.
-        let x0 = CHUNK_DIM - 5;
-        let d = CHUNK_DIM + 10;
+        let x0 = DEFAULT_CHUNK_DIM - 5;
+        let d = DEFAULT_CHUNK_DIM + 10;
         let region = Region::new(vec![x0; 3], vec![d; 3]);
 
         w.set_region(
@@ -1462,7 +1545,7 @@ mod tests {
         let dir = TempDir::new("region-remove");
         let w = create(&dir);
 
-        let x0 = CHUNK_DIM - 2;
+        let x0 = DEFAULT_CHUNK_DIM - 2;
         let region = Region::new(coord3(x0, 0, 0), coord3(5, 5, 5));
         w.set_region(
             &region,
@@ -1853,7 +1936,7 @@ mod tests {
     #[test]
     fn with_max_cached_chunks_overrides_the_default() {
         let dir = TempDir::new("cache-cap-override");
-        let w = World::create(&dir, AXES, WORLD_DIM)
+        let w = World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
             .unwrap()
             .with_max_cached_chunks(3);
         assert_eq!(w.max_cached_chunks(), 3);
@@ -1869,13 +1952,13 @@ mod tests {
         // really did go back to disk rather than getting a lucky
         // in-memory hit.
         let dir = TempDir::new("cache-eviction-reread");
-        let w = World::create(&dir, AXES, WORLD_DIM)
+        let w = World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
             .unwrap()
             .with_max_cached_chunks(2);
 
-        // Each of these is CHUNK_DIM apart on axis 0, so each lands in a
+        // Each of these is DEFAULT_CHUNK_DIM apart on axis 0, so each lands in a
         // distinct chunk.
-        let chunk_coord = |n: u32| coord3(n * CHUNK_DIM, 0, 0);
+        let chunk_coord = |n: u32| coord3(n * DEFAULT_CHUNK_DIM, 0, 0);
 
         w.set(&chunk_coord(0), "material", Value::I64(0)).unwrap(); // cache: {0}
         w.set(&chunk_coord(1), "material", Value::I64(1)).unwrap(); // cache: {0, 1} -- full
@@ -1903,7 +1986,7 @@ mod tests {
     #[test]
     fn with_max_concurrent_disk_ops_overrides_the_default() {
         let dir = TempDir::new("cap-override");
-        let w = World::create(&dir, AXES, WORLD_DIM)
+        let w = World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
             .unwrap()
             .with_max_concurrent_disk_ops(3);
         assert_eq!(w.max_concurrent_disk_ops(), 3);
@@ -1912,7 +1995,7 @@ mod tests {
     #[test]
     fn zero_max_concurrent_disk_ops_is_treated_as_one_not_a_deadlock() {
         let dir = TempDir::new("cap-zero");
-        let w = World::create(&dir, AXES, WORLD_DIM)
+        let w = World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
             .unwrap()
             .with_max_concurrent_disk_ops(0);
         assert_eq!(w.max_concurrent_disk_ops(), 1);
@@ -1933,7 +2016,7 @@ mod tests {
         // change, not a correctness one.
         let dir = TempDir::new("cap-one-correctness");
         let w = std::sync::Arc::new(
-            World::create(&dir, AXES, WORLD_DIM)
+            World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
                 .unwrap()
                 .with_max_concurrent_disk_ops(1),
         );
@@ -2003,7 +2086,7 @@ mod tests {
 
         let dir_serial = TempDir::new("cap-timing-serial");
         let w_serial = std::sync::Arc::new(
-            World::create(&dir_serial, AXES, WORLD_DIM)
+            World::create(&dir_serial, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
                 .unwrap()
                 .with_max_concurrent_disk_ops(1),
         );
@@ -2011,7 +2094,7 @@ mod tests {
 
         let dir_parallel = TempDir::new("cap-timing-parallel");
         let w_parallel = std::sync::Arc::new(
-            World::create(&dir_parallel, AXES, WORLD_DIM)
+            World::create(&dir_parallel, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
                 .unwrap()
                 .with_max_concurrent_disk_ops(workers as usize),
         );
@@ -2035,7 +2118,7 @@ mod tests {
     fn stats_count_one_chunk_per_touched_chunk_not_per_cell() {
         let dir = TempDir::new("stats-one-chunk");
         let w = create(&dir);
-        // All within CHUNK_DIM (32) of each other, and of (0,0,0) -- same
+        // All within DEFAULT_CHUNK_DIM (32) of each other, and of (0,0,0) -- same
         // one chunk, whether one cell or many are set in it.
         w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
         w.set(&coord3(1, 2, 3), "k", Value::I64(2)).unwrap();
@@ -2051,7 +2134,7 @@ mod tests {
     fn stats_count_distinct_chunks_across_far_apart_cells() {
         let dir = TempDir::new("stats-many-chunks");
         let w = create(&dir);
-        // Each at least CHUNK_DIM (32) apart on every axis -- three
+        // Each at least DEFAULT_CHUNK_DIM (32) apart on every axis -- three
         // distinct chunks.
         w.set(&coord3(0, 0, 0), "k", Value::I64(1)).unwrap();
         w.set(&coord3(100, 0, 0), "k", Value::I64(2)).unwrap();

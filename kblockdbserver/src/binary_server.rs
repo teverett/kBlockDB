@@ -199,7 +199,7 @@ mod tests {
             "kblockdbserver-binary-test-{n}-{}",
             std::process::id()
         ));
-        let world = World::create(&dir, axes, world_dim).unwrap();
+        let world = World::create(&dir, axes, world_dim, 32).unwrap();
 
         let mut credentials = HashMap::new();
         credentials.insert(

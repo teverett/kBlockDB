@@ -7,11 +7,17 @@
 http_addr = "127.0.0.1:8080"
 binary_addr = "127.0.0.1:8081"
 data_dir = "data"
-axes = 4
-world_dim = 10000
 max_concurrent_disk_ops = 32
 admin_password = "changeme"
 max_cached_chunks = 10000
+
+# Only matters the first time a world is created at data_dir above --
+# reopening an existing one reads its real shape from its world.txt and
+# ignores these (World::open does, not create).
+[worldparameters]
+axes = 4
+world_dim = 10000
+chunk_size = 32
 
 [[users]]
 username = "user"

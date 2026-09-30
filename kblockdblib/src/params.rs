@@ -13,17 +13,20 @@ use std::sync::{Mutex, PoisonError};
 /// for no measurable cost.
 static LOCK: Mutex<()> = Mutex::new(());
 
-/// The two numbers that fix a world's shape for its entire lifetime: how
-/// many axes it has, and how many cells wide each axis is. Persisted as
-/// `world.txt` at the world root (`axes\t<n>\nworld_dim\t<n>\n`), written
-/// once by `World::create` (via `create_or_validate`) and never rewritten,
-/// so reopening a world -- or a second thread `create`-ing one in the same
+/// The three numbers that fix a world's shape for its entire lifetime: how
+/// many axes it has, how many cells wide each axis is, and how many cells
+/// wide each axis is *within a chunk* (see `chunk::chunk_cells`). Persisted
+/// as `world.txt` at the world root
+/// (`axes\t<n>\nworld_dim\t<n>\nchunk_dim\t<n>\n`), written once by
+/// `World::create` (via `create_or_validate`) and never rewritten, so
+/// reopening a world -- or a second thread `create`-ing one in the same
 /// directory with different numbers, possibly at the very same moment --
 /// can't silently change its shape out from under data already on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldParams {
     pub axes: usize,
     pub world_dim: u32,
+    pub chunk_dim: u32,
 }
 
 impl WorldParams {
@@ -50,6 +53,7 @@ impl WorldParams {
 
         let mut axes = None;
         let mut world_dim = None;
+        let mut chunk_dim = None;
         for line in text.lines() {
             if line.is_empty() {
                 continue;
@@ -72,13 +76,25 @@ impl WorldParams {
                             .map_err(|_| corrupt(&path, "non-numeric world_dim"))?,
                     );
                 }
+                "chunk_dim" => {
+                    chunk_dim = Some(
+                        value
+                            .parse::<u32>()
+                            .map_err(|_| corrupt(&path, "non-numeric chunk_dim"))?,
+                    );
+                }
                 other => return Err(corrupt(&path, &format!("unknown key '{other}'"))),
             }
         }
 
         let axes = axes.ok_or_else(|| corrupt(&path, "missing 'axes'"))?;
         let world_dim = world_dim.ok_or_else(|| corrupt(&path, "missing 'world_dim'"))?;
-        Ok(Some(WorldParams { axes, world_dim }))
+        let chunk_dim = chunk_dim.ok_or_else(|| corrupt(&path, "missing 'chunk_dim'"))?;
+        Ok(Some(WorldParams {
+            axes,
+            world_dim,
+            chunk_dim,
+        }))
     }
 
     /// The one operation `World::create` needs: if `world_root` has no
@@ -96,21 +112,23 @@ impl WorldParams {
             Some(existing) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "world at {} already exists with axes={}, world_dim={} -- requested \
-                     axes={}, world_dim={}",
+                    "world at {} already exists with axes={}, world_dim={}, chunk_dim={} -- \
+                     requested axes={}, world_dim={}, chunk_dim={}",
                     world_root.display(),
                     existing.axes,
                     existing.world_dim,
+                    existing.chunk_dim,
                     requested.axes,
-                    requested.world_dim
+                    requested.world_dim,
+                    requested.chunk_dim
                 ),
             )),
             None => {
                 fs::write(
                     Self::path(world_root),
                     format!(
-                        "axes\t{}\nworld_dim\t{}\n",
-                        requested.axes, requested.world_dim
+                        "axes\t{}\nworld_dim\t{}\nchunk_dim\t{}\n",
+                        requested.axes, requested.world_dim, requested.chunk_dim
                     ),
                 )?;
                 Ok(true)
@@ -165,6 +183,7 @@ mod tests {
         let params = WorldParams {
             axes: 4,
             world_dim: 777,
+            chunk_dim: 16,
         };
         assert!(
             WorldParams::create_or_validate(&dir.0, params).unwrap(),
@@ -179,6 +198,7 @@ mod tests {
         let params = WorldParams {
             axes: 3,
             world_dim: 100,
+            chunk_dim: 32,
         };
         assert!(WorldParams::create_or_validate(&dir.0, params).unwrap());
         assert!(
@@ -193,17 +213,40 @@ mod tests {
         let original = WorldParams {
             axes: 3,
             world_dim: 100,
+            chunk_dim: 32,
         };
         WorldParams::create_or_validate(&dir.0, original).unwrap();
 
         let different = WorldParams {
             axes: 4,
             world_dim: 100,
+            chunk_dim: 32,
         };
         let err = WorldParams::create_or_validate(&dir.0, different).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
 
         // Untouched: still reads back as the original.
+        assert_eq!(WorldParams::read(&dir.0).unwrap(), Some(original));
+    }
+
+    #[test]
+    fn create_or_validate_rejects_a_mismatched_chunk_dim_alone() {
+        let dir = TempDir::new("chunk-dim-mismatch");
+        let original = WorldParams {
+            axes: 3,
+            world_dim: 100,
+            chunk_dim: 32,
+        };
+        WorldParams::create_or_validate(&dir.0, original).unwrap();
+
+        let different = WorldParams {
+            chunk_dim: 16,
+            ..original
+        };
+        let err = WorldParams::create_or_validate(&dir.0, different).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(err.to_string().contains("chunk_dim"), "{err}");
+
         assert_eq!(WorldParams::read(&dir.0).unwrap(), Some(original));
     }
 
@@ -224,6 +267,15 @@ mod tests {
     }
 
     #[test]
+    fn read_missing_only_chunk_dim_is_an_error() {
+        let dir = TempDir::new("missing-chunk-dim");
+        fs::write(dir.0.join("world.txt"), "axes\t3\nworld_dim\t100\n").unwrap();
+        let err = WorldParams::read(&dir.0).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("chunk_dim"), "{err}");
+    }
+
+    #[test]
     fn concurrent_create_or_validate_with_the_same_params_creates_exactly_once() {
         // Regression: World::create used to check "does world.txt exist"
         // then, separately, write it -- a classic TOCTOU race between two
@@ -235,6 +287,7 @@ mod tests {
         let params = WorldParams {
             axes: 3,
             world_dim: 50,
+            chunk_dim: 32,
         };
 
         let handles: Vec<_> = (0..16)

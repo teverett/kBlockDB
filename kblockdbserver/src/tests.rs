@@ -47,7 +47,7 @@ fn test_app() -> (axum::Router, TestDir) {
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir: PathBuf =
         std::env::temp_dir().join(format!("kblockdbserver-test-{n}-{}", std::process::id()));
-    let world = World::create(&dir, 3, 100).unwrap();
+    let world = World::create(&dir, 3, 100, 32).unwrap();
     let mut credentials = HashMap::new();
     credentials.insert(
         TEST_ADMIN.to_string(),

@@ -23,6 +23,28 @@ pub struct UserConfig {
     pub read_only: bool,
 }
 
+/// The `[worldparameters]` table: the three numbers that fix a *new*
+/// world's shape (see `kblockdblib::params::WorldParams`) -- meaningless,
+/// and ignored, when reopening an existing one (`World::open` reads the
+/// real shape back from `world.txt` instead; see `main.rs`). Grouped under
+/// their own table, rather than flat keys on `Config` like `http_addr`/
+/// `data_dir`, because the three only ever make sense together -- a config
+/// setting one without the others is a different kind of setting than one
+/// setting only `binary_addr`, say.
+///
+/// The field name `worldparameters` (one word, not `world_parameters`) is
+/// deliberate: it's the literal TOML table name below, and `serde` matches
+/// TOML keys to field names by exact spelling with no `rename` in play.
+#[derive(Debug, Deserialize, Default)]
+pub struct WorldParametersConfig {
+    #[serde(default)]
+    pub axes: Option<usize>,
+    #[serde(default)]
+    pub world_dim: Option<u32>,
+    #[serde(default)]
+    pub chunk_size: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
@@ -32,9 +54,7 @@ pub struct Config {
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default)]
-    pub axes: Option<usize>,
-    #[serde(default)]
-    pub world_dim: Option<u32>,
+    pub worldparameters: WorldParametersConfig,
     #[serde(default)]
     pub max_concurrent_disk_ops: Option<usize>,
     #[serde(default)]
@@ -121,6 +141,9 @@ mod tests {
         assert_eq!(config.admin_password, "secret");
         assert!(config.http_addr.is_none());
         assert!(config.users.is_empty());
+        assert!(config.worldparameters.axes.is_none());
+        assert!(config.worldparameters.world_dim.is_none());
+        assert!(config.worldparameters.chunk_size.is_none());
     }
 
     #[test]
@@ -130,11 +153,14 @@ mod tests {
             http_addr = "0.0.0.0:9090"
             binary_addr = "0.0.0.0:9091"
             data_dir = "/var/lib/kblockdblib"
-            axes = 4
-            world_dim = 500
             max_concurrent_disk_ops = 16
             max_cached_chunks = 5000
             admin_password = "secret"
+
+            [worldparameters]
+            axes = 4
+            world_dim = 500
+            chunk_size = 16
 
             [[users]]
             username = "alice"
@@ -149,11 +175,41 @@ mod tests {
         assert_eq!(config.http_addr.as_deref(), Some("0.0.0.0:9090"));
         assert_eq!(config.binary_addr.as_deref(), Some("0.0.0.0:9091"));
         assert_eq!(config.data_dir.as_deref(), Some("/var/lib/kblockdblib"));
-        assert_eq!(config.axes, Some(4));
-        assert_eq!(config.world_dim, Some(500));
+        assert_eq!(config.worldparameters.axes, Some(4));
+        assert_eq!(config.worldparameters.world_dim, Some(500));
+        assert_eq!(config.worldparameters.chunk_size, Some(16));
         assert_eq!(config.max_concurrent_disk_ops, Some(16));
         assert_eq!(config.max_cached_chunks, Some(5000));
         assert_eq!(config.users.len(), 2);
+    }
+
+    #[test]
+    fn worldparameters_table_can_be_omitted_entirely() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            max_cached_chunks = 5000
+            "#,
+        )
+        .unwrap();
+        assert!(config.worldparameters.axes.is_none());
+        assert!(config.worldparameters.world_dim.is_none());
+        assert!(config.worldparameters.chunk_size.is_none());
+    }
+
+    #[test]
+    fn worldparameters_table_can_set_only_some_of_its_fields() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            [worldparameters]
+            chunk_size = 8
+            "#,
+        )
+        .unwrap();
+        assert!(config.worldparameters.axes.is_none());
+        assert!(config.worldparameters.world_dim.is_none());
+        assert_eq!(config.worldparameters.chunk_size, Some(8));
     }
 
     #[test]

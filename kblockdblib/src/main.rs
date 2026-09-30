@@ -49,7 +49,12 @@ fn run() -> io::Result<()> {
     // this data dir) and validates an existing one (every later run): if
     // `root/world.txt` already holds different axes/world_dim, this fails
     // loudly instead of silently reinterpreting whatever's on disk.
-    let w = World::create(&root, world::AXES, world::WORLD_DIM)?;
+    let w = World::create(
+        &root,
+        world::AXES,
+        world::WORLD_DIM,
+        world::DEFAULT_CHUNK_DIM,
+    )?;
     let axes = w.axes();
     let world_dim = w.world_dim();
 
@@ -62,9 +67,9 @@ fn run() -> io::Result<()> {
     );
     println!(
         "chunk:  {0}^{1} cells  ({2} cells/chunk)",
-        chunk::CHUNK_DIM,
+        w.chunk_dim(),
         axes,
-        chunk::chunk_cells(axes)
+        chunk::chunk_cells(axes, w.chunk_dim())
     );
     println!(
         "grid:   {0}^{1} chunks ({2} chunks total, if every one were populated)",
@@ -164,7 +169,7 @@ fn run() -> io::Result<()> {
     // set_region takes one value per cell (not a single fill value), so a
     // vein can vary cell-to-cell in one call: every 4th cell is "ore", the
     // rest are "stone".
-    let r = chunk::CHUNK_DIM - 3;
+    let r = w.chunk_dim() - 3;
     let d = 8;
     let region = world::Region::new(vec![r; axes], vec![d; axes]);
     let vein_values: Vec<Value> = (0..region.volume())
