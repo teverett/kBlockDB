@@ -8,12 +8,14 @@ A Cargo workspace with four crates:
   trillion cells) -- too big for one-file-per-cell or an RDBMS row-per-cell.
   Zero external dependencies -- pure `std`. A library first, with a small
   demo/benchmark binary (`kblockdblib`) built on top of it.
-- **`kblockdbserver`** -- a RESTful HTTP server that embeds `kblockdblib` as a library
-  and exposes `get`/`set`/`remove` for individual cells and for
-  axis-aligned regions of cells over HTTP. Unlike `kblockdblib`, it takes on the
-  standard modern Rust web stack (axum + tokio + serde) -- that
-  dependency-free constraint was specific to `kblockdblib`'s storage format, not to
-  everything built on top of it.
+- **`kblockdbserver`** -- a server that embeds `kblockdblib` as a library and
+  exposes `get`/`set`/`remove` for individual cells and for axis-aligned
+  regions of cells, over a RESTful HTTP API and (optionally, as a peer to
+  it, not a replacement) a minimal binary protocol with less per-call
+  overhead. Unlike `kblockdblib`, it takes on the standard modern Rust web
+  stack (axum + tokio + serde) -- that dependency-free constraint was
+  specific to `kblockdblib`'s storage format, not to everything built on
+  top of it.
 - **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
   over real HTTP and measures it: single-cell and region throughput/latency,
   concurrency scaling, and lock contention.
@@ -331,7 +333,7 @@ packed value array. That costs two different things:
 
 ```sh
 cargo build --release
-cargo run -p kblockdbserver -- --data-dir ./data --addr 127.0.0.1:8080
+cargo run -p kblockdbserver -- --data-dir ./data --http-addr 127.0.0.1:8080
 ```
 
 A default `kblockdbserver.toml` (admin/`changeme`, see below) is checked in at
@@ -345,13 +347,15 @@ USAGE:
 OPTIONS:
     --config <path>                Config file (default: ./kblockdbserver.toml). Required --
                                     holds admin_password and, optionally, [[users]], plus
-                                    optional addr/data_dir/axes/world_dim/
+                                    optional http_addr/binary_addr/data_dir/axes/world_dim/
                                     max_concurrent_disk_ops/max_cached_chunks (each
                                     overridden by the matching CLI flag below, if given)
     --data-dir <path>              World data directory (default: ./data)
     --axes <n>                     Axis count for a brand-new world (default: 3)
     --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
-    --addr <host:port>             Address to listen on (default: 127.0.0.1:8080)
+    --http-addr <host:port>        Address to listen on for the REST API (default: 127.0.0.1:8080)
+    --binary-addr <host:port>      Also listen on this address for the binary protocol
+                                    (see "Binary protocol" below); disabled unless given
     --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
                                     (default: 32 -- see kblockdblib's "Concurrency"
                                     section; measure the right value for your
@@ -383,7 +387,8 @@ the server -- it's the only place credentials can come from (never a CLI
 flag, so they don't end up in shell history or `ps` output):
 
 ```toml
-addr = "127.0.0.1:8080"      # optional; same defaults/precedence as the CLI flags
+http_addr = "127.0.0.1:8080" # optional; same defaults/precedence as the CLI flags
+binary_addr = "127.0.0.1:8081" # optional; disabled unless given (see "Binary protocol" below)
 data_dir = "./data"          # optional
 axes = 3                     # optional
 world_dim = 10000            # optional
@@ -506,13 +511,52 @@ curl -u admin:change-me localhost:8080/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
+### Binary protocol
+
+A minimal binary protocol, as a *peer* to the REST API above, not a
+replacement for it -- same `World`, same accounts, same `get`/`set`/
+`remove` semantics, just without HTTP/JSON's per-call overhead (see the
+"Measured effect of the cache" numbers earlier in this README for why
+that overhead is worth caring about in the first place: on a cache-hit
+`get`, roughly three-quarters of the total call time measured there was
+HTTP/transport, not the actual work). Disabled by default -- enable it
+with `--binary-addr <host:port>` (or `binary_addr` in the config file)
+alongside the REST API's own `--http-addr`; both can run at once, against
+the same `World`.
+
+Authentication here is per-*connection*, not per-request the way HTTP
+Basic Auth is: a client sends one `Hello` right after connecting
+(username/password), and every request after that on the same connection
+is treated as that account until the connection closes (or a later
+`Hello` re-authenticates as someone else -- allowed, not required). One
+request, one response, strictly in order -- this minimal version doesn't
+pipeline multiple in-flight requests on one connection; a client that
+wants more throughput than one connection's round-trip latency allows
+should open more connections, the same way it would against the REST
+API.
+
+Every message, either direction, is a length-prefixed frame
+(`[u32 LE payload_len][payload_len bytes]`) -- see
+`kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
+of every request (`Hello`/`Get`/`Set`/`Remove`) and response kind.
+Framing only depends on that length prefix, never on understanding the
+payload, so a malformed request (an unknown opcode, a bad coordinate,
+...) becomes an error response, not a closed connection.
+
+`kblockdbperf/src/binary_client.rs` is the one client for this protocol in
+the workspace so far (used to drive the `binary_*` scenarios below --
+see "`kblockdbperf`: the performance test suite"); `kblockdbcli` still
+speaks REST only. It uses `kblockdbserver`'s published `wire` module
+directly (`encode_request`/`decode_response`, ...) rather than
+reimplementing the format.
+
 ### Layout
 
 - `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
-  (addr/data_dir/axes/world_dim/max_concurrent_disk_ops/max_cached_chunks,
-  admin_password, `[[users]]`) and its validation.
+  (http_addr/binary_addr/data_dir/axes/world_dim/max_concurrent_disk_ops/
+  max_cached_chunks, admin_password, `[[users]]`) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
   to every route except `/health`, including the `read_only` write check.
 - `kblockdbserver/src/routes.rs`     -- the router, all HTTP handlers, and each
@@ -537,12 +581,19 @@ curl -u admin:change-me localhost:8080/stats
 - `kblockdbserver/src/tests.rs`      -- HTTP-level integration tests (real
   requests through the real `Router` via `tower::ServiceExt::oneshot`, no
   TCP socket needed).
+- `kblockdbserver/src/wire.rs`       -- the binary protocol's wire format
+  (see "Binary protocol" above): frame I/O, and every request/response
+  kind's encode/decode, plus their own round-trip tests.
+- `kblockdbserver/src/binary_server.rs` -- the binary protocol's TCP
+  listener and per-connection handler, reusing the same `AppState` the
+  REST API's handlers do.
 
 ## `kblockdbperf`: the performance test suite
 
 Drives a real `kblockdbserver` process (by default, one it spawns and tears
-down itself) over real HTTP and measures it -- this is a measurement of
-what a client actually experiences, not a microbenchmark of `kblockdblib`'s
+down itself) over real HTTP -- and, for the `binary_*` scenarios, its
+binary protocol too -- and measures it: this is a measurement of what a
+client actually experiences, not a microbenchmark of `kblockdblib`'s
 internals.
 
 ### Build & run
@@ -564,6 +615,14 @@ automatically -- `--user`/`--password` only matter with `--url`, against a
 server whose config you don't control. Pass `--password` to pin the
 generated instance's password too (e.g. to `curl` it mid-run); otherwise
 it's a random one-off.
+
+A spawned instance always has its binary protocol enabled too (default
+`127.0.0.1:<port + 1>`, overridable with `--binary-addr`), so the
+`binary_*` scenarios always have something to run against. Against an
+existing instance (`--url`), pass `--binary-addr <host:port>` to point at
+its binary listener as well -- without it, `binary_*` scenarios are
+skipped (or, if explicitly requested with `--scenario`, kblockdbperf exits
+with an error rather than silently produce an incomplete report).
 
 Run `--help` for the full flag list (concurrency levels, op counts, region
 sizes, etc.) -- everything has a default chosen to finish a full run in
@@ -595,6 +654,12 @@ well under a minute, and every default is overridable.
   expensive the more distinct keys have accumulated in the chunk), so this
   is typically much slower than `concurrency_scan` even at the same
   concurrency level -- contrasting the two is the point.
+- **`binary_set_cell` / `binary_get_cell` / `binary_remove_cell`** -- the
+  same sequential single-cell workload as `set_cell`/`get_cell`/
+  `remove_cell`, but over the binary protocol (see "Binary protocol"
+  above) instead of REST, via `binary_client.rs`. Comparing these against
+  their REST counterparts is the point -- same `World`, same semantics,
+  just without HTTP/JSON's per-call overhead.
 
 ### Layout
 
@@ -603,9 +668,12 @@ well under a minute, and every default is overridable.
 - `kblockdbperf/src/client.rs`    -- a thin async HTTP client for kblockdbserver's
   REST API (every value used is an `i64`, so payload shape stays constant
   across scenarios).
+- `kblockdbperf/src/binary_client.rs` -- the binary-protocol counterpart to
+  `client.rs`, built on `kblockdbserver::wire` so it never reimplements the
+  wire format itself.
 - `kblockdbperf/src/server.rs`    -- `ManagedServer`, which spawns a `kblockdbserver`
-  child process and kills it on drop, and locates the `kblockdbserver` binary
-  built alongside this one.
+  child process (REST API and, always, its binary protocol) and kills it on
+  drop, and locates the `kblockdbserver` binary built alongside this one.
 - `kblockdbperf/src/scenarios.rs` -- the scenarios themselves.
 - `kblockdbperf/src/stats.rs`     -- latency percentiles and throughput,
   computed from a plain sorted `Vec<Duration>` (sample counts here are

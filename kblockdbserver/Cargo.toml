@@ -8,6 +8,10 @@ edition = "2021"
 # Rust web-service stack (axum + tokio + serde) rather than staying
 # dependency-free -- that constraint was specific to kblockdblib's storage format.
 
+[lib]
+name = "kblockdbserver"
+path = "src/lib.rs"
+
 [[bin]]
 name = "kblockdbserver"
 path = "src/main.rs"
@@ -16,7 +20,7 @@ path = "src/main.rs"
 kblockdblib = { path = "../kblockdblib" }
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["typed-header"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "1.1"

@@ -6,6 +6,7 @@
 //! `kblockdbserver` binary isn't built yet, since `cargo test -p kblockdbperf` alone
 //! doesn't imply `cargo build -p kblockdbserver` ran first.
 
+use crate::binary_client::BinaryClient;
 use crate::client::Client;
 use crate::scenarios;
 use crate::server::{default_kblockdbserver_bin, ManagedServer};
@@ -32,7 +33,9 @@ fn temp_data_dir(tag: &str) -> PathBuf {
 }
 
 /// `None` (the test should skip, not fail) if `kblockdbserver` hasn't been
-/// built into this same `target/<profile>/` directory yet.
+/// built into this same `target/<profile>/` directory yet. Always brings up
+/// the binary protocol alongside the REST API (see `ManagedServer::binary_addr`),
+/// so every test can exercise either without needing a separate spawn path.
 async fn spawn_test_server(dir: &std::path::Path) -> Option<ManagedServer> {
     let bin = default_kblockdbserver_bin();
     if !bin.exists() {
@@ -42,11 +45,13 @@ async fn spawn_test_server(dir: &std::path::Path) -> Option<ManagedServer> {
         );
         return None;
     }
+    let binary_addr = format!("127.0.0.1:{}", next_port());
     Some(
         ManagedServer::spawn(
             &bin,
             dir,
             &format!("127.0.0.1:{}", next_port()),
+            Some(&binary_addr),
             TEST_ADMIN_PASSWORD,
         )
         .await,
@@ -134,6 +139,30 @@ async fn concurrency_scan_scenario_runs_concurrently_with_no_errors() {
     for r in &results {
         assert_eq!(r.latency.errors, 0);
     }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn binary_set_cell_scenario_runs_against_a_real_server_with_no_errors() {
+    let dir = temp_data_dir("binary-set-cell");
+    let Some(server) = spawn_test_server(&dir).await else {
+        return;
+    };
+    let client = test_client(&server);
+    let health = client.health().await.expect("health check failed");
+
+    let binary_addr = server.binary_addr.as_deref().expect("binary protocol enabled");
+    let (mut bc, bhealth) = BinaryClient::connect(binary_addr, "admin", TEST_ADMIN_PASSWORD)
+        .await
+        .expect("failed to connect the binary client");
+    assert_eq!(bhealth.axes, health.axes);
+    assert_eq!(bhealth.world_dim, health.world_dim);
+
+    let result = scenarios::binary_set_cell(&mut bc, health.axes, health.world_dim, 20).await;
+    assert_eq!(result.throughput.ops, 20);
+    assert_eq!(result.latency.count, 20);
+    assert_eq!(result.latency.errors, 0);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -1,4 +1,5 @@
 mod auth;
+mod binary_server;
 mod config;
 mod coords;
 mod error;
@@ -23,7 +24,8 @@ struct Args {
     data_dir: Option<String>,
     axes: Option<usize>,
     world_dim: Option<u32>,
-    addr: Option<String>,
+    http_addr: Option<String>,
+    binary_addr: Option<String>,
     max_concurrent_disk_ops: Option<usize>,
     max_cached_chunks: Option<usize>,
 }
@@ -33,7 +35,8 @@ fn parse_args() -> Args {
     let mut data_dir = None;
     let mut axes = None;
     let mut world_dim = None;
-    let mut addr = None;
+    let mut http_addr = None;
+    let mut binary_addr = None;
     let mut max_concurrent_disk_ops = None;
     let mut max_cached_chunks = None;
 
@@ -62,7 +65,8 @@ fn parse_args() -> Args {
                         }),
                 )
             }
-            "--addr" => addr = Some(expect_value(&mut args, "--addr")),
+            "--http-addr" => http_addr = Some(expect_value(&mut args, "--http-addr")),
+            "--binary-addr" => binary_addr = Some(expect_value(&mut args, "--binary-addr")),
             "--max-concurrent-disk-ops" => {
                 max_concurrent_disk_ops = Some(
                     expect_value(&mut args, "--max-concurrent-disk-ops")
@@ -100,7 +104,8 @@ fn parse_args() -> Args {
         data_dir,
         axes,
         world_dim,
-        addr,
+        http_addr,
+        binary_addr,
         max_concurrent_disk_ops,
         max_cached_chunks,
     }
@@ -120,11 +125,11 @@ fn print_help() {
          OPTIONS:\n    \
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
          holds admin_password and, optionally, [[users]], plus optional\n                          \
-         addr/data_dir/axes/world_dim/max_concurrent_disk_ops/\n                          \
+         http_addr/binary_addr/data_dir/axes/world_dim/max_concurrent_disk_ops/\n                          \
          max_cached_chunks (each overridden by the matching CLI flag\n                          \
          below, if given). Example:\n                          \
          \n                          \
-         addr = \"127.0.0.1:8080\"\n                          \
+         http_addr = \"127.0.0.1:8080\"\n                          \
          data_dir = \"./data\"\n                          \
          admin_password = \"change-me\"\n                          \
          \n                          \
@@ -134,7 +139,13 @@ fn print_help() {
          --data-dir <path>    World data directory (default: ./data)\n    \
          --axes <n>           Axis count for a brand-new world (default: {})\n    \
          --world-dim <n>      Cells per axis for a brand-new world (default: {})\n    \
-         --addr <host:port>   Address to listen on (default: 127.0.0.1:8080)\n    \
+         --http-addr <host:port>\n                          \
+         Address to listen on for the REST API (default: 127.0.0.1:8080)\n    \
+         --binary-addr <host:port>\n                          \
+         Also listen on this address for the binary protocol (see\n                          \
+         wire.rs and the README's \"Binary protocol\" section) --\n                          \
+         disabled unless given; same World, same accounts as the\n                          \
+         REST API, just without HTTP/JSON overhead\n    \
          --max-concurrent-disk-ops <n>\n                          \
          Cap on concurrent filesystem operations\n                          \
          (default: {}; see kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS --\n                          \
@@ -181,10 +192,11 @@ async fn main() {
         .world_dim
         .or(config.world_dim)
         .unwrap_or(kblockdblib::WORLD_DIM);
-    let addr = args
-        .addr
-        .or_else(|| config.addr.clone())
+    let http_addr = args
+        .http_addr
+        .or_else(|| config.http_addr.clone())
         .unwrap_or_else(|| "127.0.0.1:8080".to_string());
+    let binary_addr = args.binary_addr.or_else(|| config.binary_addr.clone());
     let max_concurrent_disk_ops = args
         .max_concurrent_disk_ops
         .or(config.max_concurrent_disk_ops);
@@ -211,15 +223,31 @@ async fn main() {
         credentials.len()
     );
 
-    let app = routes::router(AppState::new(world, std::sync::Arc::new(credentials)));
+    let state = AppState::new(world, std::sync::Arc::new(credentials));
 
-    let listener = tokio::net::TcpListener::bind(&addr)
+    if let Some(binary_addr) = binary_addr {
+        let binary_listener = tokio::net::TcpListener::bind(&binary_addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to bind binary protocol address {binary_addr}: {e}");
+                std::process::exit(1);
+            });
+        println!("kblockdbserver binary protocol listening on {binary_addr}");
+        let binary_state = state.clone();
+        tokio::spawn(async move {
+            binary_server::serve(binary_listener, binary_state).await;
+        });
+    }
+
+    let app = routes::router(state);
+
+    let listener = tokio::net::TcpListener::bind(&http_addr)
         .await
         .unwrap_or_else(|e| {
-            eprintln!("failed to bind {addr}: {e}");
+            eprintln!("failed to bind {http_addr}: {e}");
             std::process::exit(1);
         });
-    println!("kblockdbserver listening on http://{addr}");
+    println!("kblockdbserver listening on http://{http_addr}");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

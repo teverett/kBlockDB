@@ -6,6 +6,7 @@
 //! actually has (queried via `/health`), the same way `kblockdblib`'s own demo
 //! spreads points across a volume -- nothing here is 3-axis-specific.
 
+use crate::binary_client::BinaryClient;
 use crate::client::Client;
 use crate::stats::{LatencyStats, Throughput};
 use serde::Serialize;
@@ -134,6 +135,94 @@ pub async fn remove_cell(client: &Client, axes: usize, world_dim: u32, n: usize)
     }
     ScenarioResult {
         name: "remove_cell".into(),
+        detail: format!("n={n}, sequential"),
+        throughput: Throughput::new(n, t0.elapsed()),
+        latency: LatencyStats::from_samples(samples, errors),
+    }
+}
+
+/// The binary protocol's counterpart to `set_cell` -- same shape, same
+/// sequential single-cell workload, just over `BinaryClient` instead of
+/// `Client`, so the two are directly comparable (see the README's "Binary
+/// protocol" section). A distinct salt (11, not 1) from `set_cell`'s so
+/// the two don't hammer the exact same cells when both run in the same
+/// suite -- not a correctness issue either way (same `World` either way),
+/// just keeps each scenario's own numbers about its own writes.
+pub async fn binary_set_cell(
+    client: &mut BinaryClient,
+    axes: usize,
+    world_dim: u32,
+    n: usize,
+) -> ScenarioResult {
+    let mut samples = Vec::with_capacity(n);
+    let mut errors = 0;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let coord = spread_coord(axes, world_dim, i as u64, 11);
+        let t = client.set_cell(&coord, "bench", i as i64).await;
+        errors += usize::from(!t.ok);
+        samples.push(t.elapsed);
+    }
+    ScenarioResult {
+        name: "binary_set_cell".into(),
+        detail: format!("n={n}, sequential"),
+        throughput: Throughput::new(n, t0.elapsed()),
+        latency: LatencyStats::from_samples(samples, errors),
+    }
+}
+
+/// The binary protocol's counterpart to `get_cell`.
+pub async fn binary_get_cell(
+    client: &mut BinaryClient,
+    axes: usize,
+    world_dim: u32,
+    n: usize,
+) -> ScenarioResult {
+    for i in 0..n {
+        let coord = spread_coord(axes, world_dim, i as u64, 12);
+        client.set_cell(&coord, "bench", i as i64).await;
+    }
+
+    let mut samples = Vec::with_capacity(n);
+    let mut errors = 0;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let coord = spread_coord(axes, world_dim, i as u64, 12);
+        let t = client.get_cell(&coord, "bench").await;
+        errors += usize::from(!t.ok);
+        samples.push(t.elapsed);
+    }
+    ScenarioResult {
+        name: "binary_get_cell".into(),
+        detail: format!("n={n}, sequential"),
+        throughput: Throughput::new(n, t0.elapsed()),
+        latency: LatencyStats::from_samples(samples, errors),
+    }
+}
+
+/// The binary protocol's counterpart to `remove_cell`.
+pub async fn binary_remove_cell(
+    client: &mut BinaryClient,
+    axes: usize,
+    world_dim: u32,
+    n: usize,
+) -> ScenarioResult {
+    for i in 0..n {
+        let coord = spread_coord(axes, world_dim, i as u64, 13);
+        client.set_cell(&coord, "bench", i as i64).await;
+    }
+
+    let mut samples = Vec::with_capacity(n);
+    let mut errors = 0;
+    let t0 = Instant::now();
+    for i in 0..n {
+        let coord = spread_coord(axes, world_dim, i as u64, 13);
+        let t = client.remove_cell(&coord, "bench").await;
+        errors += usize::from(!t.ok);
+        samples.push(t.elapsed);
+    }
+    ScenarioResult {
+        name: "binary_remove_cell".into(),
         detail: format!("n={n}, sequential"),
         throughput: Throughput::new(n, t0.elapsed()),
         latency: LatencyStats::from_samples(samples, errors),

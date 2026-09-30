@@ -22,10 +22,10 @@ struct ManagedServer {
 }
 
 impl ManagedServer {
-    fn spawn(kblockdbserver_bin: &Path, data_dir: &Path, addr: &str) -> ManagedServer {
+    fn spawn(kblockdbserver_bin: &Path, data_dir: &Path, http_addr: &str) -> ManagedServer {
         let config_path = std::env::temp_dir().join(format!(
             "kblockdbcli-test-kblockdbserver-config-{}.toml",
-            addr.replace(':', "-")
+            http_addr.replace(':', "-")
         ));
         std::fs::write(
             &config_path,
@@ -41,8 +41,8 @@ impl ManagedServer {
         let child = Command::new(kblockdbserver_bin)
             .arg("--data-dir")
             .arg(data_dir)
-            .arg("--addr")
-            .arg(addr)
+            .arg("--http-addr")
+            .arg(http_addr)
             .arg("--config")
             .arg(&config_path)
             .stdout(Stdio::null())
@@ -50,7 +50,7 @@ impl ManagedServer {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", kblockdbserver_bin.display()));
 
-        let url = format!("http://{addr}");
+        let url = format!("http://{http_addr}");
         wait_until_ready(&url);
         ManagedServer {
             child,

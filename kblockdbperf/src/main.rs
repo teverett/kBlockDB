@@ -1,3 +1,4 @@
+mod binary_client;
 mod client;
 mod report;
 mod scenarios;
@@ -6,6 +7,7 @@ mod stats;
 #[cfg(test)]
 mod tests;
 
+use binary_client::BinaryClient;
 use client::Client;
 use server::{default_kblockdbserver_bin, ManagedServer};
 use std::path::PathBuf;
@@ -14,6 +16,7 @@ struct Args {
     url: Option<String>,
     kblockdbserver_bin: Option<PathBuf>,
     port: u16,
+    binary_addr: Option<String>,
     concurrency: Vec<usize>,
     ops_per_client: usize,
     cells: usize,
@@ -32,6 +35,7 @@ impl Default for Args {
             url: None,
             kblockdbserver_bin: None,
             port: 18_080,
+            binary_addr: None,
             concurrency: vec![1, 8, 32, 128],
             ops_per_client: 50,
             cells: 500,
@@ -53,6 +57,9 @@ const SCENARIO_NAMES: &[&str] = &[
     "region",
     "concurrency_scan",
     "contended_cell",
+    "binary_set_cell",
+    "binary_get_cell",
+    "binary_remove_cell",
 ];
 
 fn parse_args() -> Args {
@@ -66,6 +73,7 @@ fn parse_args() -> Args {
                     Some(PathBuf::from(expect_value(&mut it, "--kblockdbserver-bin")))
             }
             "--port" => args.port = expect_parsed(&mut it, "--port"),
+            "--binary-addr" => args.binary_addr = Some(expect_value(&mut it, "--binary-addr")),
             "--concurrency" => args.concurrency = expect_list(&mut it, "--concurrency"),
             "--ops-per-client" => args.ops_per_client = expect_parsed(&mut it, "--ops-per-client"),
             "--cells" => args.cells = expect_parsed(&mut it, "--cells"),
@@ -132,7 +140,8 @@ where
 fn print_help() {
     let default = Args::default();
     println!(
-        "kblockdbperf -- a performance test suite that drives a real kblockdbserver over HTTP\n\n\
+        "kblockdbperf -- a performance test suite that drives a real kblockdbserver over HTTP\n\
+         and (optionally) its binary protocol\n\n\
          USAGE:\n    kblockdbperf [OPTIONS]\n\n\
          By default, spawns its own kblockdbserver instance against a fresh temp data\n\
          dir and tears it down when done. Pass --url to target an already-running\n\
@@ -142,6 +151,11 @@ fn print_help() {
          --kblockdbserver-bin <path>   kblockdbserver binary to spawn (default: next to kblockdbperf's\n                              \
          own binary)\n    \
          --port <n>               Port for the spawned instance (default: {})\n    \
+         --binary-addr <host:port>\n                              \
+         With --url, the target's binary protocol address -- binary_*\n                              \
+         scenarios are skipped if not given. Without --url, overrides\n                              \
+         the spawned instance's binary protocol address (default:\n                              \
+         127.0.0.1:<port + 1>) -- a spawned instance always has one.\n    \
          --concurrency <list>     Comma-separated concurrency levels (default: {})\n    \
          --ops-per-client <n>     Ops each concurrent client runs per level (default: {})\n    \
          --cells <n>              Cells for sequential single-cell scenarios (default: {})\n    \
@@ -200,6 +214,12 @@ async fn main() {
     let _data_dir: Option<TempDataDir>;
     let _server: Option<ManagedServer>;
     let client: Client;
+    // The address to try a `BinaryClient` against, if any -- `None` means
+    // "don't bother", not "connection failed" (that's handled separately
+    // below, once we actually try).
+    let binary_target_addr: Option<String>;
+    let binary_user: String;
+    let binary_password: String;
 
     if let Some(url) = args.url.clone() {
         let password = args.password.clone().unwrap_or_else(|| {
@@ -208,6 +228,9 @@ async fn main() {
         });
         _data_dir = None;
         _server = None;
+        binary_target_addr = args.binary_addr.clone();
+        binary_user = args.user.clone();
+        binary_password = password.clone();
         client = Client::new(url, args.user.clone(), password);
         println!("targeting existing instance\n");
     } else {
@@ -247,8 +270,22 @@ async fn main() {
             .clone()
             .unwrap_or_else(|| format!("kblockdbperf-{}", rand_suffix()));
 
-        let addr = format!("127.0.0.1:{}", args.port);
-        let server = ManagedServer::spawn(&bin, &data_dir, &addr, &admin_password).await;
+        let http_addr = format!("127.0.0.1:{}", args.port);
+        let spawned_binary_addr = args
+            .binary_addr
+            .clone()
+            .unwrap_or_else(|| format!("127.0.0.1:{}", args.port + 1));
+        let server = ManagedServer::spawn(
+            &bin,
+            &data_dir,
+            &http_addr,
+            Some(&spawned_binary_addr),
+            &admin_password,
+        )
+        .await;
+        binary_target_addr = server.binary_addr.clone();
+        binary_user = "admin".to_string();
+        binary_password = admin_password.clone();
         client = Client::new(server.url.clone(), "admin", admin_password);
         _server = Some(server);
         _data_dir = Some(TempDataDir {
@@ -266,6 +303,47 @@ async fn main() {
         "target world: axes={}, world_dim={}\n",
         health.axes, health.world_dim
     );
+
+    let want_binary = SCENARIO_NAMES
+        .iter()
+        .filter(|n| n.starts_with("binary_"))
+        .any(|n| args.scenarios.is_empty() || args.scenarios.iter().any(|s| s == n));
+    let mut binary_client = if want_binary {
+        match &binary_target_addr {
+            Some(addr) => match BinaryClient::connect(addr, &binary_user, &binary_password).await {
+                Some((client, bh)) => {
+                    println!(
+                        "binary protocol reachable at {addr} (axes={}, world_dim={})\n",
+                        bh.axes, bh.world_dim
+                    );
+                    Some(client)
+                }
+                None => {
+                    println!(
+                        "note: couldn't reach the binary protocol at {addr} -- \
+                         skipping binary_* scenarios\n"
+                    );
+                    None
+                }
+            },
+            None => {
+                if !args.scenarios.is_empty() {
+                    // Explicitly asked for a binary_* scenario with nothing
+                    // to run it against -- worth failing loudly rather than
+                    // silently producing an incomplete report.
+                    eprintln!(
+                        "a binary_* scenario was requested, but there's no binary protocol \
+                         target -- pass --binary-addr (required alongside --url; optional, \
+                         to override the default, when spawning an instance)"
+                    );
+                    std::process::exit(1);
+                }
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     let mut results = Vec::new();
     let run_all = args.scenarios.is_empty();
@@ -304,6 +382,23 @@ async fn main() {
             scenarios::contended_cell(primary, health.axes, &args.concurrency, args.ops_per_client)
                 .await,
         );
+    }
+    if let Some(bc) = binary_client.as_mut() {
+        if want("binary_set_cell") {
+            results.push(
+                scenarios::binary_set_cell(bc, health.axes, health.world_dim, args.cells).await,
+            );
+        }
+        if want("binary_get_cell") {
+            results.push(
+                scenarios::binary_get_cell(bc, health.axes, health.world_dim, args.cells).await,
+            );
+        }
+        if want("binary_remove_cell") {
+            results.push(
+                scenarios::binary_remove_cell(bc, health.axes, health.world_dim, args.cells).await,
+            );
+        }
     }
     println!();
     if args.json {

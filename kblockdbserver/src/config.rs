@@ -26,7 +26,9 @@ pub struct UserConfig {
 #[derive(Debug, Deserialize)]
 pub struct Config {
     #[serde(default)]
-    pub addr: Option<String>,
+    pub http_addr: Option<String>,
+    #[serde(default)]
+    pub binary_addr: Option<String>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default)]
@@ -117,7 +119,7 @@ mod tests {
     fn parses_a_minimal_config() {
         let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
         assert_eq!(config.admin_password, "secret");
-        assert!(config.addr.is_none());
+        assert!(config.http_addr.is_none());
         assert!(config.users.is_empty());
     }
 
@@ -125,7 +127,8 @@ mod tests {
     fn parses_every_field() {
         let config = Config::from_toml_str(
             r#"
-            addr = "0.0.0.0:9090"
+            http_addr = "0.0.0.0:9090"
+            binary_addr = "0.0.0.0:9091"
             data_dir = "/var/lib/kblockdblib"
             axes = 4
             world_dim = 500
@@ -143,7 +146,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.addr.as_deref(), Some("0.0.0.0:9090"));
+        assert_eq!(config.http_addr.as_deref(), Some("0.0.0.0:9090"));
+        assert_eq!(config.binary_addr.as_deref(), Some("0.0.0.0:9091"));
         assert_eq!(config.data_dir.as_deref(), Some("/var/lib/kblockdblib"));
         assert_eq!(config.axes, Some(4));
         assert_eq!(config.world_dim, Some(500));

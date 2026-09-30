@@ -16,6 +16,10 @@ path = "src/main.rs"
 [dependencies]
 # HTTP-only (no https:// target here), so no TLS backend is pulled in.
 reqwest = { version = "0.13", default-features = false, features = ["json"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Only for its published `wire` module (the binary protocol's wire format)
+# -- see `binary_client.rs`. Everything else about that crate (its own
+# HTTP server, auth, ...) is irrelevant here.
+kblockdbserver = { path = "../kblockdbserver" }
