@@ -16,5 +16,5 @@ path = "src/main.rs"
 # HTTP-only (no https:// target here), so no TLS backend is pulled in.
 # "blocking" gives a synchronous client, which fits a one-shot CLI command
 # better than pulling in tokio for a single request.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "json"] }
 serde_json = "1"
