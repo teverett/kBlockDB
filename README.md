@@ -1,4 +1,4 @@
-# kBlockDB
+# kblockdb
 
 A Cargo workspace with four crates:
 
