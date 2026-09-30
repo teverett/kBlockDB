@@ -4,21 +4,26 @@
 //! read-only account's write (anything but `GET`) never does either.
 
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{Account, AppState};
 use axum::extract::{Request, State};
-use axum::http::{header, Method};
+use axum::http::{header, HeaderMap, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum_extra::headers::authorization::Basic;
 use axum_extra::headers::{Authorization, HeaderMapExt};
 
-pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
-    let account = req
-        .headers()
+/// The account `headers` authenticates as, if any -- the same Basic Auth
+/// check `require_auth` applies to every `/rest` route, factored out so
+/// `routes.rs`'s query handler (which can't use `require_auth` itself; see
+/// its own doc comment on why) can run the identical check.
+pub fn account_from_headers(headers: &HeaderMap, state: &AppState) -> Option<Account> {
+    headers
         .typed_get::<Authorization<Basic>>()
-        .and_then(|auth| state.authenticate(auth.username(), auth.password()));
+        .and_then(|auth| state.authenticate(auth.username(), auth.password()))
+}
 
-    let Some(account) = account else {
+pub async fn require_auth(State(state): State<AppState>, req: Request, next: Next) -> Response {
+    let Some(account) = account_from_headers(req.headers(), &state) else {
         return unauthorized_response();
     };
 
@@ -29,7 +34,11 @@ pub async fn require_auth(State(state): State<AppState>, req: Request, next: Nex
     next.run(req).await
 }
 
-fn unauthorized_response() -> Response {
+/// A `401` with the `WWW-Authenticate` header a browser/curl needs to know
+/// this wants Basic Auth credentials -- `pub(crate)` so the query handler
+/// (see `account_from_headers`'s doc comment) gets the exact same response
+/// shape a `require_auth`-gated route would.
+pub(crate) fn unauthorized_response() -> Response {
     let mut resp = ApiError::Unauthorized("authentication required".to_string()).into_response();
     // Standard signal to a browser/curl that this 401 wants Basic Auth
     // credentials, not some other authorization scheme.

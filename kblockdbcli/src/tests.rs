@@ -315,6 +315,105 @@ fn the_wrong_password_is_rejected() {
 }
 
 #[test]
+fn query_select_set_delete_round_trip_through_a_real_server() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("query-round-trip") else {
+        return;
+    };
+
+    let set = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["set", "1,2,3", "material", "str", "stone"],
+    );
+    assert!(set.status.success(), "set failed: {}", stderr(&set));
+
+    let select = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &[
+            "query",
+            "SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'",
+        ],
+    );
+    assert!(
+        select.status.success(),
+        "select failed: {}",
+        stderr(&select)
+    );
+    let select_out = stdout(&select);
+    assert!(
+        select_out.contains("(1,2,3) material=stone (str)"),
+        "unexpected select output: {select_out}"
+    );
+    assert!(
+        select_out.ends_with("1 row(s)"),
+        "unexpected select output: {select_out}"
+    );
+
+    let set_query = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &[
+            "query",
+            "SET (material='dirt') WHERE material = 'stone' IN (0,0,0) TO (9,9,9)",
+        ],
+    );
+    assert!(
+        set_query.status.success(),
+        "set query failed: {}",
+        stderr(&set_query)
+    );
+    assert_eq!(stdout(&set_query), "1 cell(s) affected");
+
+    let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
+    assert!(get.status.success(), "get failed: {}", stderr(&get));
+    assert!(stdout(&get).starts_with("str dirt (created="));
+
+    let delete_query = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &[
+            "query",
+            "DELETE WHERE material = 'dirt' IN (0,0,0) TO (9,9,9)",
+        ],
+    );
+    assert!(
+        delete_query.status.success(),
+        "delete query failed: {}",
+        stderr(&delete_query)
+    );
+    assert_eq!(stdout(&delete_query), "1 cell(s) affected");
+
+    let get_after_delete =
+        run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
+    assert!(!get_after_delete.status.success());
+    assert!(
+        stderr(&get_after_delete).contains("404"),
+        "expected a 404 in stderr, got: {}",
+        stderr(&get_after_delete)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_malformed_query_is_rejected_with_the_servers_error_message() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("bad-query") else {
+        return;
+    };
+
+    let output = run_kblockdbcli(&kblockdbcli_bin, &server, &["query", "SELECT FROM WHERE"]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("400"),
+        "expected a 400 in stderr, got: {}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn an_invalid_value_type_is_rejected_before_any_request_is_sent() {
     let Some((server, dir, kblockdbcli_bin)) = test_fixture("bad-type") else {
         return;

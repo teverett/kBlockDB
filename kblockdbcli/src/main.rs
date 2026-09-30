@@ -1,8 +1,9 @@
 //! `kblockdbcli` -- a command-line client for kblockdbserver's REST API: get, set,
-//! and remove a single cell's value for a key. A thin wrapper over HTTP
-//! Basic Auth and `/rest/cells/{coords}/{key}`, nothing more (see kblockdbserver's
-//! README section for the fuller API this could grow into covering, e.g.
-//! `/rest/regions`).
+//! and remove a single cell's value for a key, plus `query` for the
+//! `SELECT`/`SET`/`DELETE` query language over `POST /rest/query`. A thin
+//! wrapper over HTTP Basic Auth and those two endpoints, nothing more (see
+//! kblockdbserver's README section for the fuller API this could grow into
+//! covering, e.g. `/rest/regions`).
 
 #[cfg(test)]
 mod tests;
@@ -32,6 +33,9 @@ enum Command {
         coords: String,
         key: String,
     },
+    Query {
+        query: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -47,6 +51,7 @@ fn main() -> ExitCode {
             value,
         } => run_set(&client, &args, coords, key, value_type, value),
         Command::Remove { coords, key } => run_remove(&client, &args, coords, key),
+        Command::Query { query } => run_query(&client, &args, query),
     };
 
     match result {
@@ -81,7 +86,7 @@ fn parse_args() -> Args {
     }
 
     let command_name = command_name.unwrap_or_else(|| {
-        eprintln!("missing command -- expected one of: get, set, remove\n");
+        eprintln!("missing command -- expected one of: get, set, remove, query\n");
         print_help();
         std::process::exit(1);
     });
@@ -110,8 +115,17 @@ fn parse_args() -> Args {
             },
             _ => usage_error("remove <coords> <key>", &positional),
         },
+        "query" => {
+            if positional.is_empty() {
+                usage_error("query <query-text>", &positional)
+            } else {
+                Command::Query {
+                    query: positional.join(" "),
+                }
+            }
+        }
         other => {
-            eprintln!("unknown command '{other}' -- expected one of: get, set, remove\n");
+            eprintln!("unknown command '{other}' -- expected one of: get, set, remove, query\n");
             print_help();
             std::process::exit(1);
         }
@@ -155,7 +169,8 @@ fn print_help() {
          get <coords> <key>                  Print a cell's value and metadata, as\n                                              \
          `<type> <value> (created=<ms> modified=<ms> version=<n>)`\n    \
          set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)\n    \
-         remove <coords> <key>               Clear a cell's value\n\n\
+         remove <coords> <key>               Clear a cell's value\n    \
+         query <query-text>                  Run a SELECT/SET/DELETE query (see below)\n\n\
          OPTIONS:\n    \
          --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)\n    \
          --user <name>      Username (default: admin)\n    \
@@ -167,7 +182,13 @@ fn print_help() {
          EXAMPLES:\n    \
          kblockdbcli --password change-me set 1,2,3 material str stone\n    \
          kblockdbcli --password change-me get 1,2,3 material\n    \
-         kblockdbcli --password change-me remove 1,2,3 material"
+         kblockdbcli --password change-me remove 1,2,3 material\n    \
+         kblockdbcli --password change-me query \"SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'\"\n    \
+         kblockdbcli --password change-me query \"SET (material='stone') WHERE x0 < 10\"\n    \
+         kblockdbcli --password change-me query \"DELETE WHERE material = 'air'\"\n\n\
+         Wrap the whole query in one shell-quoted argument -- it may contain\n\
+         spaces and single-quoted string literals of its own. SET and DELETE\n\
+         require a non-read-only account."
     );
 }
 
@@ -232,6 +253,64 @@ fn run_remove(
         .send()
         .map_err(|e| format!("request failed: {e}"))?;
     check_success(resp)
+}
+
+fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Result<(), String> {
+    let resp = client
+        .post(format!("{}/rest/query", args.url.trim_end_matches('/')))
+        .basic_auth(&args.user, Some(&args.password))
+        .json(&json!({"query": query}))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let body: Json = resp
+        .json()
+        .map_err(|e| format!("couldn't parse the server's response: {e}"))?;
+    if !status.is_success() {
+        return Err(server_error_message(status, &body));
+    }
+    print_query_response(&body)
+}
+
+/// Renders a `/rest/query` response (kblockdbserver's `QueryResponse`), which
+/// is shaped one way for `SELECT` (`rows`) and another for `SET`/`DELETE`
+/// (`affected_cells`).
+fn print_query_response(body: &Json) -> Result<(), String> {
+    if let Some(rows) = body.get("rows").and_then(Json::as_array) {
+        for row in rows {
+            println!("{}", describe_query_row(row)?);
+        }
+        println!("{} row(s)", rows.len());
+        Ok(())
+    } else if let Some(affected) = body.get("affected_cells").and_then(Json::as_u64) {
+        println!("{affected} cell(s) affected");
+        Ok(())
+    } else {
+        Err("unrecognized query response shape".to_string())
+    }
+}
+
+/// Renders one `QueryResponse` row as `(c0,c1,...) key=value (type), ...`.
+fn describe_query_row(row: &Json) -> Result<String, String> {
+    let coord = row["coord"]
+        .as_array()
+        .ok_or("query row is missing 'coord'")?
+        .iter()
+        .map(Json::to_string)
+        .collect::<Vec<_>>()
+        .join(",");
+    let values = row["values"]
+        .as_array()
+        .ok_or("query row is missing 'values'")?;
+    let mut parts = Vec::with_capacity(values.len());
+    for kv in values {
+        let key = kv["key"]
+            .as_str()
+            .ok_or("query row entry is missing 'key'")?;
+        let (value_type, rendered) = describe_value(&kv["value"])?;
+        parts.push(format!("{key}={rendered} ({value_type})"));
+    }
+    Ok(format!("({coord}) {}", parts.join(", ")))
 }
 
 fn check_success(resp: reqwest::blocking::Response) -> Result<(), String> {
@@ -389,5 +468,43 @@ mod unit_tests {
     fn server_error_message_tolerates_a_body_with_no_error_field() {
         let msg = server_error_message(reqwest::StatusCode::INTERNAL_SERVER_ERROR, &Json::Null);
         assert!(msg.contains("500"));
+    }
+
+    #[test]
+    fn describe_query_row_renders_coord_and_values() {
+        let row = json!({
+            "coord": [1, 2, 3],
+            "values": [
+                {"key": "material", "value": {"type": "str", "value": "stone"}},
+                {"key": "hardness", "value": {"type": "f64", "value": 2.6}},
+            ],
+        });
+        assert_eq!(
+            describe_query_row(&row).unwrap(),
+            "(1,2,3) material=stone (str), hardness=2.6 (f64)"
+        );
+    }
+
+    #[test]
+    fn describe_query_row_rejects_a_row_missing_coord_or_values() {
+        assert!(describe_query_row(&json!({"values": []})).is_err());
+        assert!(describe_query_row(&json!({"coord": [0]})).is_err());
+    }
+
+    #[test]
+    fn print_query_response_accepts_a_select_shape() {
+        let body = json!({"total_rows": 0, "rows": []});
+        assert!(print_query_response(&body).is_ok());
+    }
+
+    #[test]
+    fn print_query_response_accepts_a_write_shape() {
+        let body = json!({"affected_cells": 3});
+        assert!(print_query_response(&body).is_ok());
+    }
+
+    #[test]
+    fn print_query_response_rejects_an_unrecognized_shape() {
+        assert!(print_query_response(&json!({})).is_err());
     }
 }

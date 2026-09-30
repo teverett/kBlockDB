@@ -5,6 +5,7 @@ mod config;
 mod coords;
 mod error;
 mod openapi;
+mod query;
 mod routes;
 mod state;
 #[cfg(test)]

@@ -9,7 +9,8 @@
 
 use crate::error::ErrorBody;
 use crate::routes::{
-    self, CellResponse, HealthResponse, RegionValuesResponse, SetRegionBody, StatsResponse,
+    self, CellResponse, HealthResponse, QueryKeyValue, QueryRequest, QueryResponse, QueryRow,
+    RegionValuesResponse, SetRegionBody, StatsResponse,
 };
 use crate::value_json::ValueJson;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -33,6 +34,7 @@ use utoipa::{Modify, OpenApi};
         routes::get_region,
         routes::set_region,
         routes::remove_region,
+        routes::run_query,
     ),
     components(schemas(
         HealthResponse,
@@ -40,6 +42,10 @@ use utoipa::{Modify, OpenApi};
         CellResponse,
         RegionValuesResponse,
         SetRegionBody,
+        QueryRequest,
+        QueryResponse,
+        QueryRow,
+        QueryKeyValue,
         ValueJson,
         ErrorBody,
     )),
@@ -48,6 +54,7 @@ use utoipa::{Modify, OpenApi};
         (name = "stats", description = "On-disk statistics for the world's data"),
         (name = "cells", description = "Single-cell reads and writes"),
         (name = "regions", description = "Axis-aligned box-of-cells reads and writes"),
+        (name = "query", description = "The SELECT/SET/DELETE query language -- see the README"),
     ),
     modifiers(&SecurityAddon),
 )]

@@ -127,6 +127,19 @@ fn put(path: &str, body: Json) -> Request<Body> {
     )
 }
 
+fn post(path: &str, body: Json) -> Request<Body> {
+    with_auth(
+        Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+        TEST_ADMIN,
+        TEST_ADMIN_PASSWORD,
+    )
+}
+
 fn delete(path: &str) -> Request<Body> {
     with_auth(
         Request::builder()
@@ -848,4 +861,290 @@ async fn rows_reflects_a_removed_cell() {
 
     let (_, body) = send(app, get("/rows")).await;
     assert_eq!(body["total_rows"], 0);
+}
+
+// --- /rest/query ---
+
+fn query(q: &str) -> Json {
+    json!({"query": q})
+}
+
+#[tokio::test]
+async fn query_requires_auth() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/rest/query")
+        .header("content-type", "application/json")
+        .body(Body::from(query("SELECT *").to_string()))
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn select_star_returns_every_cell_with_every_key() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/hardness",
+            json!({"type": "i64", "value": 7}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(app, post("/rest/query", query("SELECT *"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    let row = &body["rows"][0];
+    assert_eq!(row["coord"], json!([1, 2, 3]));
+    assert_eq!(row["values"].as_array().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn select_named_columns_omits_the_rest() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/hardness",
+            json!({"type": "i64", "value": 7}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(app, post("/rest/query", query("SELECT material"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let values = body["rows"][0]["values"].as_array().unwrap();
+    assert_eq!(values.len(), 1);
+    assert_eq!(values[0]["key"], "material");
+}
+
+#[tokio::test]
+async fn select_where_filters_by_value() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/4,5,6/material",
+            json!({"type": "str", "value": "air"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app,
+        post("/rest/query", query("SELECT * WHERE material = 'stone'")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn select_where_filters_by_axis_coordinate() {
+    let (app, _dir) = test_app();
+    for coords in ["1,1,1", "50,50,50"] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/cells/{coords}/k"),
+                json!({"type": "i64", "value": 1}),
+            ),
+        )
+        .await;
+    }
+
+    let (_, body) = send(app, post("/rest/query", query("SELECT * WHERE x0 >= 10"))).await;
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([50, 50, 50]));
+}
+
+#[tokio::test]
+async fn select_from_range_scopes_to_the_box() {
+    let (app, _dir) = test_app();
+    for coords in ["1,1,1", "50,50,50"] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/cells/{coords}/k"),
+                json!({"type": "i64", "value": 1}),
+            ),
+        )
+        .await;
+    }
+
+    let (_, body) = send(
+        app,
+        post("/rest/query", query("SELECT * FROM (0,0,0) TO (10,10,10)")),
+    )
+    .await;
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 1, 1]));
+}
+
+#[tokio::test]
+async fn a_malformed_query_is_400() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, post("/rest/query", query("NOT VALID SQL AT ALL"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body["error"].is_string());
+}
+
+#[tokio::test]
+async fn a_range_with_the_wrong_axis_count_is_400() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(
+        app,
+        post("/rest/query", query("SELECT * FROM (0,0) TO (10,10)")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn set_writes_the_given_keys_to_every_matching_cell() {
+    let (app, _dir) = test_app();
+    for coords in ["1,1,1", "2,2,2"] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/cells/{coords}/k"),
+                json!({"type": "i64", "value": 1}),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/query",
+            query("SET (material='stone', hardness=7) WHERE k = 1"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 2);
+
+    let (_, cell) = send(app, get("/rest/cells/1,1,1/material")).await;
+    assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
+}
+
+#[tokio::test]
+async fn a_read_only_account_cannot_set() {
+    let (app, _dir) = test_app();
+    let req = with_auth(
+        post("/rest/query", query("SET (k = 1)")),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_read_only_account_can_select() {
+    let (app, _dir) = test_app();
+    let req = with_auth(
+        post("/rest/query", query("SELECT *")),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn delete_removes_every_key_at_matching_cells() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/hardness",
+            json!({"type": "i64", "value": 7}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/9,9,9/material",
+            json!({"type": "str", "value": "air"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post("/rest/query", query("DELETE WHERE material = 'stone'")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 1);
+
+    let (status, _) = send(app.clone(), get("/rest/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = send(app, get("/rest/cells/9,9,9/material")).await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn a_read_only_account_cannot_delete() {
+    let (app, _dir) = test_app();
+    let req = with_auth(
+        post("/rest/query", query("DELETE")),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn query_is_documented_in_the_openapi_spec() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/api-docs/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (_, body) = send(test_app().0, req).await;
+    let paths = body["paths"].as_object().unwrap();
+    assert!(
+        paths.contains_key("/rest/query"),
+        "spec is missing /rest/query"
+    );
 }

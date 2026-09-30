@@ -29,18 +29,29 @@
 //! `/rows`, see that module) -- a read-only data browser over this same
 //! world, deliberately kept outside `/rest` since it isn't part of the
 //! versioned REST API surface.
+//!
+//! `POST /rest/query` (see `run_query` below) is the one route here that
+//! doesn't use `require_auth`: that middleware's `read_only` check is
+//! purely a function of HTTP method (`GET` = read, anything else = write),
+//! but one `POST /rest/query` can be *either* depending on the query text
+//! itself (`SELECT` vs `SET`/`DELETE` -- see `query.rs`'s
+//! `Statement::is_write`). `run_query` authenticates the same way
+//! `require_auth` does (`auth::account_from_headers`) and only then checks
+//! `read_only` against the parsed statement, not the HTTP method.
 
 use crate::auth::require_auth;
 use crate::browser;
 use crate::coords::parse_coords;
 use crate::error::{ApiError, ErrorBody};
 use crate::openapi::ApiDoc;
+use crate::query;
 use crate::state::AppState;
 use crate::value_json::ValueJson;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
-use axum::routing::get;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use utoipa::{OpenApi, ToSchema};
@@ -59,7 +70,14 @@ pub fn router(state: AppState) -> Router {
         .route("/stats", get(stats))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
-    let rest = Router::new().route("/health", get(health)).merge(protected);
+    // Not under `protected` -- see this module's doc comment on why
+    // `/query` needs its own auth check instead of `require_auth`'s.
+    let query_route = Router::new().route("/query", post(run_query));
+
+    let rest = Router::new()
+        .route("/health", get(health))
+        .merge(protected)
+        .merge(query_route);
 
     // Built with the *final*, post-nesting absolute paths (`/rest/...`),
     // not nested itself: utoipa_swagger_ui bakes whatever string `.url(...)`
@@ -363,4 +381,215 @@ async fn remove_region(
         .with_world(move |w| w.remove_region(&region, &key))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct QueryRequest {
+    /// e.g. `SELECT material, density WHERE x0 >= 10 AND x0 < 20` -- see
+    /// the README's "Query language" section for the full grammar and
+    /// more examples (`SET`/`DELETE`, ranges, `AND`/`OR`/`NOT`).
+    query: String,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct QueryKeyValue {
+    key: String,
+    value: ValueJson,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct QueryRow {
+    coord: Vec<u32>,
+    values: Vec<QueryKeyValue>,
+}
+
+/// `SELECT` populates `total_rows`/`rows`; `SET`/`DELETE` populate
+/// `affected_cells` instead -- one statement, one endpoint, but a
+/// different result shape depending on which kind was sent (fields the
+/// statement kind doesn't produce are omitted, not null).
+#[derive(Serialize, ToSchema)]
+pub struct QueryResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    total_rows: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rows: Option<Vec<QueryRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    affected_cells: Option<usize>,
+}
+
+impl QueryResponse {
+    fn rows(rows: Vec<QueryRow>) -> Self {
+        QueryResponse {
+            total_rows: Some(rows.len()),
+            rows: Some(rows),
+            affected_cells: None,
+        }
+    }
+
+    fn affected(n: usize) -> Self {
+        QueryResponse {
+            total_rows: None,
+            rows: None,
+            affected_cells: Some(n),
+        }
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/rest/query",
+    tag = "query",
+    request_body = QueryRequest,
+    responses(
+        (status = 200, description = "SELECT: the matching rows. SET/DELETE: how many cells were affected", body = QueryResponse),
+        (status = 400, description = "Malformed query, or a range whose axis count doesn't match the world's", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "A read-only account attempted a SET or DELETE", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn run_query(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<QueryRequest>,
+) -> Response {
+    let Some(account) = crate::auth::account_from_headers(&headers, &state) else {
+        return crate::auth::unauthorized_response();
+    };
+    match execute_query(&state, &account, &body.query).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn execute_query(
+    state: &AppState,
+    account: &crate::state::Account,
+    query_text: &str,
+) -> Result<QueryResponse, ApiError> {
+    let stmt = query::parse(query_text)
+        .map_err(|e| ApiError::BadRequest(format!("invalid query: {e}")))?;
+
+    // Checked by statement kind, not HTTP method -- see this module's doc
+    // comment.
+    if stmt.is_write() && account.read_only {
+        return Err(ApiError::Forbidden("this account is read-only".to_string()));
+    }
+    check_range_axes(&stmt, state.world.axes())?;
+
+    match stmt {
+        query::Statement::Select {
+            columns,
+            range,
+            where_clause,
+        } => {
+            let cells = state.with_world(kblockdblib::World::list_cells).await?;
+            let rows = cells
+                .iter()
+                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
+                .map(|c| project_row(&columns, c))
+                .collect();
+            Ok(QueryResponse::rows(rows))
+        }
+        query::Statement::Set {
+            assignments,
+            where_clause,
+            range,
+        } => {
+            let cells = state.with_world(kblockdblib::World::list_cells).await?;
+            // Snapshotted here, then mutated in a second `with_world` call
+            // below -- not atomic with respect to a concurrent writer
+            // touching the same cells in between (a classic find-then-
+            // mutate race), same honest caveat as any bulk operation built
+            // on a point-in-time `list_cells` scan rather than a
+            // world-wide lock.
+            let matching: Vec<Vec<u32>> = cells
+                .iter()
+                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
+                .map(|c| c.coord.to_vec())
+                .collect();
+            let affected = matching.len();
+            state
+                .with_world(move |w| {
+                    for coord in &matching {
+                        for (key, literal) in &assignments {
+                            w.set(coord, key, literal.to_value())?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            Ok(QueryResponse::affected(affected))
+        }
+        query::Statement::Delete {
+            where_clause,
+            range,
+        } => {
+            let cells = state.with_world(kblockdblib::World::list_cells).await?;
+            let matching: Vec<(Vec<u32>, Vec<String>)> = cells
+                .iter()
+                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
+                .map(|c| {
+                    (
+                        c.coord.to_vec(),
+                        c.values.iter().map(|(k, _, _)| k.clone()).collect(),
+                    )
+                })
+                .collect();
+            let affected = matching.len();
+            state
+                .with_world(move |w| {
+                    for (coord, keys) in &matching {
+                        for key in keys {
+                            w.remove(coord, key)?;
+                        }
+                    }
+                    Ok(())
+                })
+                .await?;
+            Ok(QueryResponse::affected(affected))
+        }
+    }
+}
+
+/// A query's optional `FROM`/`IN` range must name exactly as many axes as
+/// the target world has -- `query.rs` itself can't check this (it has no
+/// `World` to check against), so `execute_query` does, before running
+/// anything, the same "reject up front, don't touch any data" policy
+/// `check_region` (used by the region endpoints above) follows.
+fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError> {
+    let range = match stmt {
+        query::Statement::Select { range, .. }
+        | query::Statement::Set { range, .. }
+        | query::Statement::Delete { range, .. } => range,
+    };
+    match range {
+        Some(r) if r.from.len() != axes => Err(ApiError::BadRequest(format!(
+            "range has {} axes but this world has {axes}",
+            r.from.len()
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn project_row(columns: &query::Columns, cell: &kblockdblib::CellEntry) -> QueryRow {
+    let selected: Box<dyn Iterator<Item = &(String, kblockdblib::Value, kblockdblib::CellMeta)>> =
+        match columns {
+            query::Columns::All => Box::new(cell.values.iter()),
+            query::Columns::Named(names) => Box::new(
+                names
+                    .iter()
+                    .filter_map(|name| cell.values.iter().find(|(k, _, _)| k == name)),
+            ),
+        };
+    let values = selected
+        .map(|(k, v, _)| QueryKeyValue {
+            key: k.clone(),
+            value: ValueJson::from(v.clone()),
+        })
+        .collect();
+    QueryRow {
+        coord: cell.coord.to_vec(),
+        values,
+    }
 }

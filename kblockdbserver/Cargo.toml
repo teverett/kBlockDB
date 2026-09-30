@@ -5,7 +5,7 @@ edition = "2021"
 
 # A RESTful HTTP front end for the kblockdblib storage engine (embedded as a library,
 # see ../kblockdblib). Unlike kblockdblib itself, this crate takes on the standard modern
-# Rust web-service stack (axum + tokio + serde) rather than staying
+# Rust web-service stack (axum + tokio + serde + pest) rather than staying
 # dependency-free -- that constraint was specific to kblockdblib's storage format.
 
 [lib]
@@ -26,6 +26,9 @@ serde_json = "1"
 toml = "1.1"
 utoipa = { version = "6", features = ["axum_extras"] }
 utoipa-swagger-ui = { version = "10", features = ["axum"] }
+# The query language's grammar (query.pest) -- see query.rs.
+pest = "2"
+pest_derive = "2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

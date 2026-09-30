@@ -12,17 +12,19 @@ A Cargo workspace with four crates:
   exposes `get`/`set`/`remove` for individual cells and for axis-aligned
   regions of cells, over a RESTful HTTP API and (optionally, as a peer to
   it, not a replacement) a minimal binary protocol with less per-call
-  overhead. Unlike `kblockdblib`, it takes on the standard modern Rust web
-  stack (axum + tokio + serde) -- that dependency-free constraint was
-  specific to `kblockdblib`'s storage format, not to everything built on
-  top of it.
+  overhead. Also a small SQL-like query language (`SELECT`/`SET`/`DELETE`
+  over `POST /rest/query`) and a read-only web data browser at `/`. Unlike
+  `kblockdblib`, it takes on the standard modern Rust web stack (axum +
+  tokio + serde + pest) -- that dependency-free constraint was specific to
+  `kblockdblib`'s storage format, not to everything built on top of it.
 - **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
   over real HTTP and measures it: single-cell and region throughput/latency,
   concurrency scaling, and lock contention.
 - **`kblockdbcli`** -- a small command-line client for kblockdbserver's REST API:
-  `get`/`set`/`remove` a single cell's value from a shell, authenticating
-  like `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
-  kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
+  `get`/`set`/`remove` a single cell's value, or run a `SELECT`/`SET`/`DELETE`
+  query, from a shell, authenticating like `curl -u` would. A pure HTTP client,
+  same as `kblockdbperf` -- it treats kblockdbserver as a black box over its
+  REST API, not `kblockdblib` directly.
 
 Plus a standalone (non-Cargo) Java client at `client/java`: `KBlockDBClient`
 speaks kblockdbserver's binary protocol (see "Binary protocol" below),
@@ -566,6 +568,78 @@ curl -u admin:change-me localhost:8080/rest/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
+### Query language
+
+`POST /rest/query` runs a small SQL-like query language over the world's
+populated cells, parsed with a [pest](https://pest.rs) grammar
+(`kblockdbserver/src/query.pest`/`query.rs`). Three statement kinds:
+
+```text
+SELECT <columns> [FROM <range>] [WHERE <criteria>]
+SET (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
+DELETE [WHERE <criteria>] [IN <range>]
+```
+
+- `<columns>` is `*` or a comma-separated key list (`material, density`).
+- `<range>` is `(o0,o1,...) TO (e0,e1,...)` -- an axis-aligned box, `o`
+  inclusive/`e` exclusive on every axis, same convention as
+  `kblockdblib::Region` (origin + extent), just written as two corners.
+  Its axis count must match the world's, or the query is rejected with
+  `400` before touching any data.
+- `<criteria>` is a boolean expression: comparisons (`=`, `!=`, `<`, `<=`,
+  `>`, `>=`) combined with `AND`/`OR`/`NOT` and parentheses, standard
+  precedence (`NOT` binds tightest, then `AND`, then `OR`). A comparison's
+  left side is either `x<N>` (coordinate axis `N`, zero-indexed) or a key
+  name; its right side is a string (`'stone'`), integer, or float literal.
+  Keywords are case-insensitive; key/axis names are not. A key literally
+  named e.g. `x0` can't be addressed this way -- a known limitation of a
+  generic axis-count grammar.
+- A comparison against a key that isn't set at a given cell, or whose
+  value's type doesn't match the literal's (a string literal against a
+  numeric key, say), simply doesn't match that cell -- never an error, the
+  same "total, not partial" philosophy `kblockdblib` itself uses.
+
+`SELECT` is a read; `SET`/`DELETE` are writes. Both are behind the same
+`POST /rest/query`, so this is the one route in the whole REST API where
+`read_only` isn't decided by HTTP method the way it is everywhere
+else (see `routes.rs`'s doc comment) -- it's decided by which kind of
+statement was actually sent, checked after parsing, before touching
+anything.
+
+```sh
+curl -u admin:change-me -X POST localhost:8080/rest/query \
+  -H 'content-type: application/json' \
+  -d '{"query": "SELECT material, density WHERE x0 >= 10 AND x0 < 20 AND material = '"'"'stone'"'"'"}'
+# {"total_rows":1,"rows":[{"coord":[15,3,7],"values":[
+#   {"key":"density","value":{"type":"f64","value":2.6}},
+#   {"key":"material","value":{"type":"str","value":"stone"}}]}]}
+
+curl -u admin:change-me -X POST localhost:8080/rest/query \
+  -H 'content-type: application/json' \
+  -d '{"query": "SET (material='"'"'basalt'"'"', hardness=9) WHERE material = '"'"'stone'"'"' IN (0,0,0) TO (20,20,20)"}'
+# {"affected_cells":1}
+
+curl -u admin:change-me -X POST localhost:8080/rest/query \
+  -H 'content-type: application/json' \
+  -d '{"query": "DELETE WHERE material = '"'"'air'"'"'"}'
+# {"affected_cells":1}
+```
+
+`SELECT`'s response has `total_rows`/`rows`; `SET`/`DELETE`'s has
+`affected_cells` instead (the fields the statement kind doesn't produce
+are omitted, not null). `DELETE` clears *every* key set at each matching
+cell -- there's no column list to delete only some of them.
+
+All three statement kinds run on `kblockdblib::World::list_cells` under
+the hood (the same full-chunk-decode walk the `/` data browser below uses)
+-- `SELECT` filters and projects it directly; `SET`/`DELETE` use it to
+find matching coordinates, then apply the write in a second pass. That
+second pass isn't atomic with the first: a concurrent writer touching the
+same cells in between is a real (if narrow) race, same honest trade-off
+`list_cells`'s own doc comment already makes for reads. Fine for the
+occasional bulk edit; not meant for a world with millions of populated
+cells or for `SET`/`DELETE` queries racing each other at high frequency.
+
 ### Data browser
 
 `GET /` (note: *not* under `/rest` -- see below) serves a small
@@ -648,10 +722,17 @@ client can't depend on a Rust crate. `kblockdbcli` still speaks REST only.
   admin_password, `[[users]]`, and a `[worldparameters]` table for
   axes/world_dim/chunk_size) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
-  to every route except `/rest/health`, including the `read_only` write check.
+  to every route except `/rest/health`, including the `read_only` write
+  check; also `account_from_headers`, the same check factored out for
+  `/rest/query`'s handler, which can't use the middleware itself (see
+  `routes.rs`'s doc comment).
 - `kblockdbserver/src/routes.rs`     -- the router (mounted under `/rest`,
   see "REST API" above), all HTTP handlers, and each one's
   `#[utoipa::path(...)]` OpenAPI annotation.
+- `kblockdbserver/src/query.pest`/`query.rs` -- the query language (see
+  "Query language" above): grammar, AST, parsing, and in-memory evaluation
+  against a `kblockdblib::CellEntry` (no I/O -- `routes.rs`'s query handler
+  owns every actual `World` call the parsed statement implies).
 - `kblockdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
@@ -782,9 +863,10 @@ well under a minute, and every default is overridable.
 
 ## `kblockdbcli`: the command-line client
 
-A thin wrapper over kblockdbserver's `/rest/cells/{coords}/{key}` endpoint -- `get`,
-`set`, and `remove` one cell's value from a shell, with the same HTTP
-Basic Auth every other client of kblockdbserver's REST API needs.
+A thin wrapper over kblockdbserver's `/rest/cells/{coords}/{key}` and
+`/rest/query` endpoints -- `get`, `set`, and `remove` one cell's value, or run
+a `SELECT`/`SET`/`DELETE` query, from a shell, with the same HTTP Basic Auth
+every other client of kblockdbserver's REST API needs.
 
 ### Build & run
 
@@ -794,6 +876,10 @@ cargo build --release
 ./target/release/kblockdbcli --password change-me get 1,2,3 material
 # str stone (created=1735689600000 modified=1735689600000 version=0)
 ./target/release/kblockdbcli --password change-me remove 1,2,3 material
+./target/release/kblockdbcli --password change-me query \
+    "SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'"
+# (1,2,3) material=stone (str)
+# 1 row(s)
 ```
 
 ```
@@ -805,6 +891,7 @@ COMMANDS:
                                          `<type> <value> (created=<ms> modified=<ms> version=<n>)`
     set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)
     remove <coords> <key>               Clear a cell's value
+    query <query-text>                  Run a SELECT/SET/DELETE query (see below)
 
 OPTIONS:
     --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)
@@ -826,12 +913,20 @@ coordinate, wrong credentials, no value set, ...) print kblockdbserver's own
 error message to stderr and exit non-zero -- nothing is swallowed or
 retried silently.
 
+`query` takes the entire query text as one shell-quoted argument (see the
+"Query language" section above for the grammar) and posts it to
+`/rest/query`. A `SELECT` prints one line per matching cell, as `(coords)
+key=value (type), ...`, followed by a `<n> row(s)` summary; `SET` and
+`DELETE` print `<n> cell(s) affected`. `SET`/`DELETE` need a non-read-only
+account, same as `set`/`remove`.
+
 ### Layout
 
 - `kblockdbcli/src/main.rs`  -- CLI parsing, the HTTP calls (via
   `reqwest::blocking`, so a one-shot command doesn't need an async
-  runtime), and the `<type> <value>` <-> kblockdbserver's tagged-JSON
-  conversion (`build_value_json`/`describe_value`).
+  runtime), the `<type> <value>` <-> kblockdbserver's tagged-JSON
+  conversion (`build_value_json`/`describe_value`), and `query`'s response
+  rendering (`print_query_response`/`describe_query_row`).
 - `kblockdbcli/src/tests.rs` -- integration tests that spawn a real `kblockdbserver`
   and run the actual compiled `kblockdbcli` binary against it via
   `std::process::Command`, checking real stdout and exit codes.
