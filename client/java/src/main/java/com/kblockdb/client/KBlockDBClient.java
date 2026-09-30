@@ -136,19 +136,37 @@ public final class KBlockDBClient implements Closeable {
 
     /**
      * Reads the value at {@code (coord, key)}, or {@link Optional#empty()}
-     * if nothing is set there.
+     * if nothing is set there. Equivalent to {@link #getWithMeta} with the
+     * meta half discarded -- see that method if you also want when this
+     * value was set and how many times it's been overwritten.
      *
      * @throws BadRequestException if {@code coord} doesn't fit this world
      *                             (wrong axis count, out of bounds, ...)
      * @throws UnauthorizedException if this connection hasn't authenticated
      */
     public Optional<Value> get(int[] coord, String key) throws IOException {
+        return getWithMeta(coord, key).map(ValueWithMeta::value);
+    }
+
+    /**
+     * Reads the value at {@code (coord, key)} together with its
+     * {@link CellMeta}, or {@link Optional#empty()} if nothing is set
+     * there. Both come from the same response the server sends for a
+     * {@code Get} -- there's no separate request for metadata, so this
+     * costs nothing extra over {@link #get} beyond decoding a few more
+     * bytes already in hand.
+     *
+     * @throws BadRequestException if {@code coord} doesn't fit this world
+     *                             (wrong axis count, out of bounds, ...)
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public Optional<ValueWithMeta> getWithMeta(int[] coord, String key) throws IOException {
         Objects.requireNonNull(coord, "coord");
         Objects.requireNonNull(key, "key");
         Wire.writeFrame(out, Wire.encodeGet(coord, key));
         Wire.Response response = Wire.decodeResponse(requireFrame(in));
         if (response instanceof Wire.ValueResp v) {
-            return Optional.of(v.value());
+            return Optional.of(new ValueWithMeta(v.value(), v.meta()));
         }
         if (response instanceof Wire.NotFound) {
             return Optional.empty();

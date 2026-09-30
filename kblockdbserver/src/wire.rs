@@ -55,7 +55,7 @@
 //!
 //! 0x00 HelloOk:      [u8 axes][u32 LE world_dim][u8 read_only (0/1)]
 //! 0x01 Ok:           (Set/Remove succeeded)
-//! 0x02 Value:        <value>
+//! 0x02 Value:        <value> <meta>
 //! 0x03 NotFound:     (Get found nothing)
 //! 0x04 BadRequest:   <message>
 //! 0x05 Unauthorized: <message>
@@ -63,7 +63,9 @@
 //! 0x07 Internal:     <message>
 //! ```
 //!
-//! `<message>` is `[u16 LE len][len bytes utf8]`.
+//! `<message>` is `[u16 LE len][len bytes utf8]`. `<meta>` is
+//! `[u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]` --
+//! see [`kblockdblib::CellMeta`], which this mirrors field-for-field.
 //!
 //! One request, one response, strictly in order -- this minimal version
 //! doesn't pipeline multiple in-flight requests on one connection (a
@@ -113,7 +115,12 @@ pub enum Response {
         read_only: bool,
     },
     Ok,
-    Value(Value),
+    Value {
+        value: Value,
+        created_at_ms: u64,
+        modified_at_ms: u64,
+        version: u64,
+    },
     NotFound,
     BadRequest(String),
     Unauthorized(String),
@@ -210,9 +217,15 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             buf.push(u8::from(*read_only));
         }
         Response::Ok => buf.push(0x01),
-        Response::Value(v) => {
+        Response::Value {
+            value,
+            created_at_ms,
+            modified_at_ms,
+            version,
+        } => {
             buf.push(0x02);
-            put_value(&mut buf, v);
+            put_value(&mut buf, value);
+            put_meta(&mut buf, *created_at_ms, *modified_at_ms, *version);
         }
         Response::NotFound => buf.push(0x03),
         Response::BadRequest(m) => {
@@ -258,6 +271,13 @@ fn put_short_string(buf: &mut Vec<u8>, s: &str) {
 fn put_message(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u16).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+}
+
+/// `<meta>`: `[u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]`.
+fn put_meta(buf: &mut Vec<u8>, created_at_ms: u64, modified_at_ms: u64, version: u64) {
+    buf.extend_from_slice(&created_at_ms.to_le_bytes());
+    buf.extend_from_slice(&modified_at_ms.to_le_bytes());
+    buf.extend_from_slice(&version.to_le_bytes());
 }
 
 fn put_value(buf: &mut Vec<u8>, value: &Value) {
@@ -324,6 +344,10 @@ impl<'a> Reader<'a> {
         Ok(i64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
 
+    fn u64(&mut self) -> Result<u64, DecodeError> {
+        Ok(u64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
+    }
+
     fn string(&mut self, len: usize) -> Result<String, DecodeError> {
         String::from_utf8(self.bytes(len)?.to_vec()).map_err(|_| DecodeError::InvalidUtf8)
     }
@@ -358,6 +382,11 @@ impl<'a> Reader<'a> {
             t if t == Value::TAG_I64 => Ok(Value::I64(self.i64()?)),
             other => Err(DecodeError::UnknownValueTag(other)),
         }
+    }
+
+    /// `<meta>`: `[u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]`.
+    fn meta(&mut self) -> Result<(u64, u64, u64), DecodeError> {
+        Ok((self.u64()?, self.u64()?, self.u64()?))
     }
 }
 
@@ -397,7 +426,16 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
             read_only: r.u8()? != 0,
         }),
         0x01 => Ok(Response::Ok),
-        0x02 => Ok(Response::Value(r.value()?)),
+        0x02 => {
+            let value = r.value()?;
+            let (created_at_ms, modified_at_ms, version) = r.meta()?;
+            Ok(Response::Value {
+                value,
+                created_at_ms,
+                modified_at_ms,
+                version,
+            })
+        }
         0x03 => Ok(Response::NotFound),
         0x04 => Ok(Response::BadRequest(r.message()?)),
         0x05 => Ok(Response::Unauthorized(r.message()?)),
@@ -544,7 +582,12 @@ mod tests {
     #[test]
     fn value_response_round_trips_every_type() {
         for value in [Value::Str("air".into()), Value::F64(1.5), Value::I64(0)] {
-            roundtrip_response(Response::Value(value));
+            roundtrip_response(Response::Value {
+                value,
+                created_at_ms: 1000,
+                modified_at_ms: 2000,
+                version: 3,
+            });
         }
     }
 

@@ -137,8 +137,16 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             if let Err(response) = require_authenticated(account) {
                 return response;
             }
-            match state.with_world(move |w| w.get(&coord, &key)).await {
-                Ok(Some(value)) => Response::Value(value),
+            match state
+                .with_world(move |w| w.get_with_meta(&coord, &key))
+                .await
+            {
+                Ok(Some((value, meta))) => Response::Value {
+                    value,
+                    created_at_ms: meta.created_at_ms,
+                    modified_at_ms: meta.modified_at_ms,
+                    version: meta.version,
+                },
                 Ok(None) => Response::NotFound,
                 Err(e) => response_from_error(e),
             }
@@ -248,6 +256,17 @@ mod tests {
         .await
     }
 
+    /// Unwraps a `Response::Value`'s value, ignoring its meta -- for tests
+    /// that only care about the value itself (see
+    /// `a_get_response_reports_created_modified_and_version` for one that
+    /// checks the meta fields).
+    fn expect_value(response: Response) -> Value {
+        match response {
+            Response::Value { value, .. } => value,
+            other => panic!("expected Response::Value, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn hello_with_correct_credentials_returns_the_worlds_shape() {
         let server = spawn_test_server(3, 10_000).await;
@@ -331,7 +350,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(get, Response::Value(Value::Str("stone".to_string())));
+        assert_eq!(expect_value(get), Value::Str("stone".to_string()));
 
         let remove = roundtrip(
             &mut stream,
@@ -352,6 +371,75 @@ mod tests {
         )
         .await;
         assert_eq!(get_after_remove, Response::NotFound);
+    }
+
+    #[tokio::test]
+    async fn a_get_response_reports_created_modified_and_version() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+        let coord = vec![1, 2, 3];
+
+        roundtrip(
+            &mut stream,
+            &Request::Set {
+                coord: coord.clone(),
+                key: "material".to_string(),
+                value: Value::Str("stone".to_string()),
+            },
+        )
+        .await;
+        let first = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: coord.clone(),
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        let Response::Value {
+            value,
+            created_at_ms,
+            modified_at_ms,
+            version,
+        } = first
+        else {
+            panic!("expected Response::Value, got {first:?}");
+        };
+        assert_eq!(value, Value::Str("stone".to_string()));
+        assert_eq!(version, 0);
+        assert_eq!(created_at_ms, modified_at_ms);
+        assert!(created_at_ms > 0);
+
+        roundtrip(
+            &mut stream,
+            &Request::Set {
+                coord: coord.clone(),
+                key: "material".to_string(),
+                value: Value::Str("air".to_string()),
+            },
+        )
+        .await;
+        let second = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord,
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        let Response::Value {
+            created_at_ms: created_at_ms_2,
+            modified_at_ms: modified_at_ms_2,
+            version: version_2,
+            ..
+        } = second
+        else {
+            panic!("expected Response::Value, got {second:?}");
+        };
+        assert_eq!(created_at_ms_2, created_at_ms);
+        assert!(modified_at_ms_2 >= modified_at_ms);
+        assert_eq!(version_2, 1);
     }
 
     #[tokio::test]
@@ -382,7 +470,7 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(get, Response::Value(Value::I64(1)));
+        assert_eq!(expect_value(get), Value::I64(1));
 
         let set = roundtrip(
             &mut stream,

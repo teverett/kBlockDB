@@ -18,6 +18,7 @@ mod semaphore;
 pub mod value;
 pub mod world;
 
+pub use chunk::CellMeta;
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::{Value, ValueType};

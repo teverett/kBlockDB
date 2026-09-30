@@ -122,9 +122,27 @@ enum ColumnData {
     Str(Vec<String>),
 }
 
+/// Every set cell/key pair's bookkeeping, alongside its value: when it was
+/// first set, when it was last changed, and how many times it's been set
+/// since (0 for the initial `set`, incremented on every one after that).
+/// Cleared along with the value on `remove` -- a cell set again later after
+/// being removed starts a brand new history, not a continuation of the old
+/// one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CellMeta {
+    pub created_at_ms: u64,
+    pub modified_at_ms: u64,
+    pub version: u64,
+}
+
 struct Column {
     presence: Bitset,
     data: ColumnData,
+    /// Parallel to `data` -- `meta[rank]` describes the same cell as
+    /// whatever's at `data`'s index `rank` (see `Bitset::rank`), so every
+    /// insert/overwrite/remove on `data` makes the identical change to
+    /// `meta` at the same index.
+    meta: Vec<CellMeta>,
 }
 
 /// A `chunk_cells(axes, chunk_dim)`-cell block of cells, stored columnarly:
@@ -165,6 +183,14 @@ impl Chunk {
         })
     }
 
+    pub fn get_meta(&self, local_idx: usize, key_id: u32) -> Option<CellMeta> {
+        let col = self.columns.get(&key_id)?;
+        if !col.presence.get(local_idx) {
+            return None;
+        }
+        Some(col.meta[col.presence.rank(local_idx)])
+    }
+
     /// `value`'s type must match whatever `key_id` already holds elsewhere
     /// in this chunk (if anything) -- callers (`World::set`/`set_region`)
     /// are expected to have already checked that against `Schema`, which
@@ -174,7 +200,12 @@ impl Chunk {
     /// check, not a normal, reachable-from-user-input outcome -- unlike
     /// `Schema::intern`'s type check, which returns a graceful
     /// `InvalidInput` error for exactly this situation.
-    pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value) {
+    ///
+    /// `now_ms` is milliseconds since the Unix epoch, supplied by the
+    /// caller (`World`) rather than read here, so this stays a pure
+    /// function of its arguments -- deterministic and easy to test without
+    /// depending on wall-clock time.
+    pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value, now_ms: u64) {
         let presence_bytes = self.presence_bytes;
         let col = self.columns.entry(key_id).or_insert_with(|| Column {
             presence: Bitset::new(presence_bytes),
@@ -183,6 +214,7 @@ impl Chunk {
                 Value::I64(_) => ColumnData::I64(Vec::new()),
                 Value::Str(_) => ColumnData::Str(Vec::new()),
             },
+            meta: Vec::new(),
         });
 
         let already_present = col.presence.get(local_idx);
@@ -198,6 +230,9 @@ impl Chunk {
                      caller should have checked this against Schema first"
                 ),
             }
+            let meta = &mut col.meta[rank];
+            meta.modified_at_ms = now_ms;
+            meta.version += 1;
         } else {
             col.presence.set(local_idx, true);
             match (&mut col.data, value) {
@@ -209,6 +244,14 @@ impl Chunk {
                      caller should have checked this against Schema first"
                 ),
             }
+            col.meta.insert(
+                rank,
+                CellMeta {
+                    created_at_ms: now_ms,
+                    modified_at_ms: now_ms,
+                    version: 0,
+                },
+            );
         }
     }
 
@@ -228,6 +271,7 @@ impl Chunk {
                         v.remove(rank);
                     }
                 }
+                col.meta.remove(rank);
             }
         }
     }
@@ -246,12 +290,15 @@ impl Chunk {
     //     [u32 key_id]
     //     [u8  type_tag]              (0=Str, 1=F64, 2=I64)
     //     [4096 bytes presence bitmap]
-    //     values, one per set bit in the bitmap, in cell-index order:
-    //       F64/I64: 8 bytes little-endian
-    //       Str:     [u32 len][len bytes, utf-8]
+    //     entries, one per set bit in the bitmap, in cell-index order:
+    //       [u64 created_at_ms][u64 modified_at_ms][u64 version]  (CellMeta)
+    //       then the value itself:
+    //         F64/I64: 8 bytes little-endian
+    //         Str:     [u32 len][len bytes, utf-8]
     //
-    // There is no per-cell overhead beyond 1 bit in the presence map: a cell
-    // that doesn't use a key costs nothing but that bit.
+    // There is no per-cell overhead beyond 1 bit in the presence map plus
+    // CellMeta's 24 bytes: a cell that doesn't use a key costs nothing but
+    // that bit.
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
         w.write_all(&(self.columns.len() as u32).to_le_bytes())?;
@@ -266,21 +313,24 @@ impl Chunk {
                 ColumnData::F64(v) => {
                     w.write_all(&[Value::TAG_F64])?;
                     w.write_all(&col.presence.bits)?;
-                    for x in v {
+                    for (x, m) in v.iter().zip(&col.meta) {
+                        write_meta(w, m)?;
                         w.write_all(&x.to_le_bytes())?;
                     }
                 }
                 ColumnData::I64(v) => {
                     w.write_all(&[Value::TAG_I64])?;
                     w.write_all(&col.presence.bits)?;
-                    for x in v {
+                    for (x, m) in v.iter().zip(&col.meta) {
+                        write_meta(w, m)?;
                         w.write_all(&x.to_le_bytes())?;
                     }
                 }
                 ColumnData::Str(v) => {
                     w.write_all(&[Value::TAG_STR])?;
                     w.write_all(&col.presence.bits)?;
-                    for s in v {
+                    for (s, m) in v.iter().zip(&col.meta) {
+                        write_meta(w, m)?;
                         let bytes = s.as_bytes();
                         w.write_all(&(bytes.len() as u32).to_le_bytes())?;
                         w.write_all(bytes)?;
@@ -311,10 +361,12 @@ impl Chunk {
             let presence = Bitset::from_bits(bits);
             let count = presence.count();
 
+            let mut meta = Vec::with_capacity(count);
             let data = match tag[0] {
                 t if t == Value::TAG_F64 => {
                     let mut v = Vec::with_capacity(count);
                     for _ in 0..count {
+                        meta.push(read_meta(r)?);
                         v.push(f64::from_le_bytes(read_arr8(r)?));
                     }
                     ColumnData::F64(v)
@@ -322,6 +374,7 @@ impl Chunk {
                 t if t == Value::TAG_I64 => {
                     let mut v = Vec::with_capacity(count);
                     for _ in 0..count {
+                        meta.push(read_meta(r)?);
                         v.push(i64::from_le_bytes(read_arr8(r)?));
                     }
                     ColumnData::I64(v)
@@ -329,6 +382,7 @@ impl Chunk {
                 t if t == Value::TAG_STR => {
                     let mut v = Vec::with_capacity(count);
                     for _ in 0..count {
+                        meta.push(read_meta(r)?);
                         let len = read_u32(r)? as usize;
                         let mut buf = vec![0u8; len];
                         r.read_exact(&mut buf)?;
@@ -347,7 +401,14 @@ impl Chunk {
                 }
             };
 
-            columns.insert(key_id, Column { presence, data });
+            columns.insert(
+                key_id,
+                Column {
+                    presence,
+                    data,
+                    meta,
+                },
+            );
         }
 
         Ok(Chunk {
@@ -362,6 +423,7 @@ impl Chunk {
         let mut n = 4;
         for col in self.columns.values() {
             n += 4 + 1 + self.presence_bytes;
+            n += col.meta.len() * 24; // CellMeta: 3 u64 fields
             n += match &col.data {
                 ColumnData::F64(v) => v.len() * 8,
                 ColumnData::I64(v) => v.len() * 8,
@@ -370,6 +432,21 @@ impl Chunk {
         }
         n
     }
+}
+
+fn write_meta<W: Write>(w: &mut W, m: &CellMeta) -> io::Result<()> {
+    w.write_all(&m.created_at_ms.to_le_bytes())?;
+    w.write_all(&m.modified_at_ms.to_le_bytes())?;
+    w.write_all(&m.version.to_le_bytes())?;
+    Ok(())
+}
+
+fn read_meta<R: Read>(r: &mut R) -> io::Result<CellMeta> {
+    Ok(CellMeta {
+        created_at_ms: u64::from_le_bytes(read_arr8(r)?),
+        modified_at_ms: u64::from_le_bytes(read_arr8(r)?),
+        version: u64::from_le_bytes(read_arr8(r)?),
+    })
 }
 
 fn read_u32<R: Read>(r: &mut R) -> io::Result<u32> {
@@ -401,10 +478,10 @@ mod tests {
         let mut c = Chunk::new(CELLS);
         assert!(c.is_empty());
 
-        c.set(0, 10, Value::Str("stone".into()));
-        c.set(5, 10, Value::Str("air".into()));
-        c.set(0, 11, Value::F64(3.5));
-        c.set(31, 12, Value::I64(-7));
+        c.set(0, 10, Value::Str("stone".into()), 1000);
+        c.set(5, 10, Value::Str("air".into()), 1000);
+        c.set(0, 11, Value::F64(3.5), 1000);
+        c.set(31, 12, Value::I64(-7), 1000);
 
         assert!(!c.is_empty());
         assert_eq!(c.get(0, 10), Some(Value::Str("stone".into())));
@@ -428,8 +505,8 @@ mod tests {
     #[test]
     fn overwrite_and_remove() {
         let mut c = Chunk::new(CELLS);
-        c.set(100, 1, Value::I64(1));
-        c.set(100, 1, Value::I64(2)); // overwrite same cell/key
+        c.set(100, 1, Value::I64(1), 1000);
+        c.set(100, 1, Value::I64(2), 2000); // overwrite same cell/key
         assert_eq!(c.get(100, 1), Some(Value::I64(2)));
 
         c.remove(100, 1);
@@ -438,11 +515,122 @@ mod tests {
     }
 
     #[test]
+    fn a_fresh_set_starts_at_version_0_with_matching_created_and_modified() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        assert_eq!(
+            c.get_meta(0, 1),
+            Some(CellMeta {
+                created_at_ms: 1000,
+                modified_at_ms: 1000,
+                version: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn overwriting_increments_version_and_modified_but_not_created() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        c.set(0, 1, Value::I64(2), 2000);
+        c.set(0, 1, Value::I64(3), 3000);
+        assert_eq!(
+            c.get_meta(0, 1),
+            Some(CellMeta {
+                created_at_ms: 1000,
+                modified_at_ms: 3000,
+                version: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn setting_a_different_cell_in_the_same_column_does_not_affect_anothers_meta() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        c.set(5, 1, Value::I64(2), 2000);
+        c.set(0, 1, Value::I64(9), 3000); // overwrite cell 0 again
+
+        assert_eq!(
+            c.get_meta(0, 1),
+            Some(CellMeta {
+                created_at_ms: 1000,
+                modified_at_ms: 3000,
+                version: 1,
+            })
+        );
+        assert_eq!(
+            c.get_meta(5, 1),
+            Some(CellMeta {
+                created_at_ms: 2000,
+                modified_at_ms: 2000,
+                version: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn get_meta_of_an_unset_cell_or_unknown_key_is_none() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        assert_eq!(c.get_meta(1, 1), None); // same column, untouched cell
+        assert_eq!(c.get_meta(0, 999), None); // column never created
+    }
+
+    #[test]
+    fn removing_then_setting_again_starts_a_fresh_history() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        c.set(0, 1, Value::I64(2), 2000);
+        c.remove(0, 1);
+        c.set(0, 1, Value::I64(3), 5000);
+
+        assert_eq!(
+            c.get_meta(0, 1),
+            Some(CellMeta {
+                created_at_ms: 5000,
+                modified_at_ms: 5000,
+                version: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn meta_round_trips_through_write_to_and_read_from() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::Str("stone".into()), 1000);
+        c.set(0, 1, Value::Str("air".into()), 2000); // overwrite -> version 1
+        c.set(5, 2, Value::I64(0), 3000); // distinct key/column, distinct type
+
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), c.byte_len());
+
+        let c2 = Chunk::read_from(&mut &buf[..], CELLS).unwrap();
+        assert_eq!(
+            c2.get_meta(0, 1),
+            Some(CellMeta {
+                created_at_ms: 1000,
+                modified_at_ms: 2000,
+                version: 1,
+            })
+        );
+        assert_eq!(
+            c2.get_meta(5, 2),
+            Some(CellMeta {
+                created_at_ms: 3000,
+                modified_at_ms: 3000,
+                version: 0,
+            })
+        );
+    }
+
+    #[test]
     fn different_axis_counts_get_different_sized_chunks() {
         // 2 axes: 32^2 = 1024 cells/chunk, a much smaller presence bitmap
         // than the 3-axis default.
         let mut c = Chunk::new(chunk_cells(2, 32));
-        c.set(0, 0, Value::I64(1));
+        c.set(0, 0, Value::I64(1), 1000);
         let mut buf = Vec::new();
         c.write_to(&mut buf).unwrap();
         assert_eq!(buf.len(), c.byte_len());
@@ -461,7 +649,7 @@ mod tests {
 
         let mut c = Chunk::new(cells);
         for idx in 0..cells {
-            c.set(idx, 0, Value::I64(idx as i64));
+            c.set(idx, 0, Value::I64(idx as i64), 1000);
         }
         for idx in 0..cells {
             assert_eq!(c.get(idx, 0), Some(Value::I64(idx as i64)));
@@ -491,7 +679,7 @@ mod tests {
         let mut c = Chunk::new(CELLS);
         let indices: Vec<usize> = (0..CELLS).step_by(137).collect();
         for (i, &idx) in indices.iter().enumerate() {
-            c.set(idx, 42, Value::I64(i as i64));
+            c.set(idx, 42, Value::I64(i as i64), 1000);
         }
         for (i, &idx) in indices.iter().enumerate() {
             assert_eq!(
@@ -510,7 +698,7 @@ mod tests {
         let mut c = Chunk::new(CELLS);
         let boundary_indices = [0usize, 511, 512, 513, 1023, 1024, 1535, 1536];
         for (i, &idx) in boundary_indices.iter().enumerate() {
-            c.set(idx, 7, Value::I64(i as i64));
+            c.set(idx, 7, Value::I64(i as i64), 1000);
         }
         for (i, &idx) in boundary_indices.iter().enumerate() {
             assert_eq!(
@@ -528,8 +716,8 @@ mod tests {
         // in block 0 correctly updates block_counts so a lookup in a much
         // later block still resolves to the right value.
         let mut c = Chunk::new(CELLS);
-        c.set(10, 1, Value::I64(100)); // block 0
-        c.set(2000, 1, Value::I64(200)); // block 3 (2000 / 512 = 3)
+        c.set(10, 1, Value::I64(100), 1000); // block 0
+        c.set(2000, 1, Value::I64(200), 2000); // block 3 (2000 / 512 = 3)
         assert_eq!(c.get(2000, 1), Some(Value::I64(200)));
 
         c.remove(10, 1);
@@ -550,7 +738,7 @@ mod tests {
         let mut c = Chunk::new(CELLS);
         let indices: Vec<usize> = (0..CELLS).step_by(97).collect();
         for &idx in &indices {
-            c.set(idx, 3, Value::I64(0));
+            c.set(idx, 3, Value::I64(0), 1000);
         }
         assert!(!c.is_empty());
         for &idx in &indices {
@@ -567,7 +755,7 @@ mod tests {
         // block_counts get built.
         let mut c = Chunk::new(CELLS);
         for idx in (0..CELLS).step_by(211) {
-            c.set(idx, 5, Value::I64(idx as i64));
+            c.set(idx, 5, Value::I64(idx as i64), 1000);
         }
 
         let mut buf = Vec::new();

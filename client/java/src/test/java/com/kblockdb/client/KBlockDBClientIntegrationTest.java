@@ -18,6 +18,7 @@ import java.util.concurrent.TimeUnit;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 
 /**
@@ -121,6 +122,44 @@ class KBlockDBClientIntegrationTest {
             assertEquals(Optional.of(new Value.Str("air")), client.get(new int[] {5, 5, 5}, "str-key"));
             assertEquals(Optional.of(new Value.I64(-42)), client.get(new int[] {5, 5, 6}, "i64-key"));
             assertEquals(Optional.of(new Value.F64(2.5)), client.get(new int[] {5, 5, 7}, "f64-key"));
+        }
+    }
+
+    @Test
+    void getWithMetaOfAFreshSetReportsVersionZero() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            int[] coord = {2, 2, 2};
+            client.set(coord, "material", new Value.Str("stone"));
+
+            ValueWithMeta result = client.getWithMeta(coord, "material").orElseThrow();
+            assertEquals(new Value.Str("stone"), result.value());
+            assertEquals(0, result.meta().version());
+            assertEquals(result.meta().createdAtMs(), result.meta().modifiedAtMs());
+            assertTrue(result.meta().createdAtMs() > 0);
+        }
+    }
+
+    @Test
+    void getWithMetaReportsAnIncrementingVersionAndStableCreatedAt() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            int[] coord = {3, 3, 3};
+            client.set(coord, "material", new Value.Str("stone"));
+            ValueWithMeta first = client.getWithMeta(coord, "material").orElseThrow();
+
+            client.set(coord, "material", new Value.Str("air"));
+            ValueWithMeta second = client.getWithMeta(coord, "material").orElseThrow();
+
+            assertEquals(new Value.Str("air"), second.value());
+            assertEquals(1, second.meta().version());
+            assertEquals(first.meta().createdAtMs(), second.meta().createdAtMs());
+            assertTrue(second.meta().modifiedAtMs() >= first.meta().modifiedAtMs());
+        }
+    }
+
+    @Test
+    void getWithMetaOfANeverSetCellIsEmpty() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            assertEquals(Optional.empty(), client.getWithMeta(new int[] {9, 9, 9}, "never-set"));
         }
     }
 

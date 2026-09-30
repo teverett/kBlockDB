@@ -130,6 +130,18 @@ async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, Api
 #[derive(Serialize, ToSchema)]
 pub struct CellResponse {
     value: ValueJson,
+    /// Milliseconds since the Unix epoch when this key was first set at
+    /// this cell (see `kblockdblib::CellMeta`).
+    created_at_ms: u64,
+    /// Milliseconds since the Unix epoch when this key was last set at
+    /// this cell -- equal to `created_at_ms` if it's never been
+    /// overwritten.
+    modified_at_ms: u64,
+    /// How many times this key has been overwritten at this cell since it
+    /// was first set: 0 for a value that's never been overwritten, 1 after
+    /// one overwrite, and so on. Resets to 0 if the value is removed and
+    /// later set again.
+    version: u64,
 }
 
 #[utoipa::path(
@@ -155,11 +167,14 @@ async fn get_cell(
     let coord = parse_coords(&coords)?;
     let lookup_key = key.clone();
     let found = state
-        .with_world(move |w| w.get(&coord, &lookup_key))
+        .with_world(move |w| w.get_with_meta(&coord, &lookup_key))
         .await?;
     match found {
-        Some(v) => Ok(Json(CellResponse {
+        Some((v, meta)) => Ok(Json(CellResponse {
             value: ValueJson::from(v),
+            created_at_ms: meta.created_at_ms,
+            modified_at_ms: meta.modified_at_ms,
+            version: meta.version,
         })),
         None => Err(ApiError::NotFound(format!(
             "no value set for key '{key}' at ({coords})"

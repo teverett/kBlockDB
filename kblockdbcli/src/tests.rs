@@ -193,7 +193,15 @@ fn set_then_get_then_remove_round_trips_through_a_real_server() {
 
     let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
     assert!(get.status.success(), "get failed: {}", stderr(&get));
-    assert_eq!(stdout(&get), "str stone");
+    let get_out = stdout(&get);
+    assert!(
+        get_out.starts_with("str stone (created="),
+        "unexpected get output: {get_out}"
+    );
+    assert!(
+        get_out.contains("version=0"),
+        "unexpected get output: {get_out}"
+    );
 
     let remove = run_kblockdbcli(&kblockdbcli_bin, &server, &["remove", "1,2,3", "material"]);
     assert!(
@@ -209,6 +217,36 @@ fn set_then_get_then_remove_round_trips_through_a_real_server() {
         stderr(&get_after_remove).contains("404"),
         "expected a 404 in stderr, got: {}",
         stderr(&get_after_remove)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn get_reports_an_incrementing_version_after_repeated_sets() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("version-increment") else {
+        return;
+    };
+
+    for value in ["stone", "air", "dirt"] {
+        let set = run_kblockdbcli(
+            &kblockdbcli_bin,
+            &server,
+            &["set", "1,2,3", "material", "str", value],
+        );
+        assert!(set.status.success(), "set failed: {}", stderr(&set));
+    }
+
+    let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
+    assert!(get.status.success(), "get failed: {}", stderr(&get));
+    let get_out = stdout(&get);
+    assert!(
+        get_out.starts_with("str dirt (created="),
+        "unexpected get output: {get_out}"
+    );
+    assert!(
+        get_out.contains("version=2"), // 3 sets total: version 0, 1, 2
+        "unexpected get output: {get_out}"
     );
 
     let _ = std::fs::remove_dir_all(&dir);
@@ -235,7 +273,11 @@ fn set_then_get_round_trip_numeric_types() {
 
         let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "5,5,5", &key]);
         assert!(get.status.success(), "get failed: {}", stderr(&get));
-        assert_eq!(stdout(&get), format!("{value_type} {value}"));
+        let get_out = stdout(&get);
+        assert!(
+            get_out.starts_with(&format!("{value_type} {value} (created=")),
+            "unexpected get output: {get_out}"
+        );
     }
 
     let _ = std::fs::remove_dir_all(&dir);

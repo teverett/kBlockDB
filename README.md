@@ -55,6 +55,15 @@ kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdb
   this chunk" touches one contiguous array, not a trillion separate hashmap
   lookups.
 
+- **Every set cell/key pair carries its own metadata.** Alongside the value
+  itself, each entry in a column tracks `created_at_ms` (when it was first
+  set), `modified_at_ms` (when it was last set), and `version` (how many
+  times it's been overwritten since, starting at `0`) -- see
+  `kblockdblib::CellMeta`, `World::get_meta`/`get_with_meta`. Persisted
+  alongside the value on disk, not derived; removing a value and setting it
+  again later starts a fresh `0`/`created_at_ms`, not a continuation of the
+  old history.
+
 - **Global key interning, type fixed on first use.** Key strings
   ("temperature", "material", ...) are interned once into small integer ids
   in `schema.txt` at the world root (append-only, so ids never change), and
@@ -505,6 +514,15 @@ missing/invalid credentials; `403` for a `read_only` account attempting a
 write; `404` for a `GET` that found nothing; `500` for anything on the
 server's side (disk I/O, ...).
 
+A single-cell `GET` reports three extra fields alongside the value itself
+(see `kblockdblib::CellMeta`): `created_at_ms`/`modified_at_ms`
+(milliseconds since the Unix epoch) and `version`, a count of how many
+times this key has been overwritten at this cell (`0` for a value that's
+never been overwritten, incremented on every later `set`). Removing a
+value and setting it again later starts a fresh `0`/`created_at_ms` --
+it's a new history, not a continuation of the old one. Region reads don't
+currently report per-cell metadata, only the single-cell endpoint does.
+
 ```sh
 # set a cell
 curl -u admin:change-me -X PUT localhost:8080/cells/1,2,3/material \
@@ -512,7 +530,8 @@ curl -u admin:change-me -X PUT localhost:8080/cells/1,2,3/material \
 
 # read it back
 curl -u admin:change-me localhost:8080/cells/1,2,3/material
-# {"value":{"type":"str","value":"stone"}}
+# {"value":{"type":"str","value":"stone"},"created_at_ms":1735689600000,
+#  "modified_at_ms":1735689600000,"version":0}
 
 # fill an 8x8x8 region with distinct per-cell values (512 of them, omitted here)
 curl -u admin:change-me -X PUT localhost:8080/regions/0,0,0/8,8,8/material \
@@ -557,17 +576,22 @@ API.
 Every message, either direction, is a length-prefixed frame
 (`[u32 LE payload_len][payload_len bytes]`) -- see
 `kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
-of every request (`Hello`/`Get`/`Set`/`Remove`) and response kind.
-Framing only depends on that length prefix, never on understanding the
-payload, so a malformed request (an unknown opcode, a bad coordinate,
-...) becomes an error response, not a closed connection.
+of every request (`Hello`/`Get`/`Set`/`Remove`) and response kind. A
+successful `Get`'s `Value` response carries the cell's metadata alongside
+its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
+fields the REST API's single-cell `GET` reports (see "Cells and regions"
+above) -- read from the same server-side snapshot, so the two can never
+disagree. Framing only depends on the length prefix, never on
+understanding the payload, so a malformed request (an unknown opcode, a
+bad coordinate, ...) becomes an error response, not a closed connection.
 
-`kblockdbperf/src/binary_client.rs` is the one client for this protocol in
-the workspace so far (used to drive the `binary_*` scenarios below --
-see "`kblockdbperf`: the performance test suite"); `kblockdbcli` still
-speaks REST only. It uses `kblockdbserver`'s published `wire` module
-directly (`encode_request`/`decode_response`, ...) rather than
-reimplementing the format.
+Two clients speak this protocol so far: `kblockdbperf/src/binary_client.rs`
+(drives the `binary_*` scenarios below -- see "`kblockdbperf`: the
+performance test suite"), which uses `kblockdbserver`'s published `wire`
+module directly rather than reimplementing the format; and the standalone
+Java client at `client/java` (`KBlockDBClient`, packaged as a plain jar via
+Maven), which reimplements the format in Java (`Wire.java`) since a JVM
+client can't depend on a Rust crate. `kblockdbcli` still speaks REST only.
 
 ### Layout
 
@@ -715,7 +739,7 @@ Basic Auth every other client of kblockdbserver's REST API needs.
 cargo build --release
 ./target/release/kblockdbcli --password change-me set 1,2,3 material str stone
 ./target/release/kblockdbcli --password change-me get 1,2,3 material
-# str stone
+# str stone (created=1735689600000 modified=1735689600000 version=0)
 ./target/release/kblockdbcli --password change-me remove 1,2,3 material
 ```
 
@@ -724,7 +748,8 @@ USAGE:
     kblockdbcli [OPTIONS] <COMMAND> [ARGS]
 
 COMMANDS:
-    get <coords> <key>                  Print a cell's value, as `<type> <value>`
+    get <coords> <key>                  Print a cell's value and metadata, as
+                                         `<type> <value> (created=<ms> modified=<ms> version=<n>)`
     set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)
     remove <coords> <key>               Clear a cell's value
 

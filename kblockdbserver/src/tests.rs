@@ -248,7 +248,38 @@ async fn set_then_get_a_cell_roundtrips() {
 
     let (status, body) = send(app, get("/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"value": {"type": "str", "value": "stone"}}));
+    assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
+    // A fresh set: version 0, created_at/modified_at equal, both real
+    // (nonzero) timestamps -- see get_cell_reports_incrementing_version_
+    // and_stable_created_at for the overwrite case.
+    assert_eq!(body["version"], 0);
+    assert!(body["created_at_ms"].as_u64().unwrap() > 0);
+    assert_eq!(body["created_at_ms"], body["modified_at_ms"]);
+}
+
+#[tokio::test]
+async fn get_cell_reports_incrementing_version_and_stable_created_at() {
+    let (app, _dir) = test_app();
+
+    for value in ["stone", "air", "dirt"] {
+        let (status, _) = send(
+            app.clone(),
+            put(
+                "/cells/1,2,3/material",
+                json!({"type": "str", "value": value}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+
+    let (status, body) = send(app, get("/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], json!({"type": "str", "value": "dirt"}));
+    assert_eq!(body["version"], 2); // 3 sets total: version 0, 1, 2
+    let created = body["created_at_ms"].as_u64().unwrap();
+    let modified = body["modified_at_ms"].as_u64().unwrap();
+    assert!(modified >= created);
 }
 
 #[tokio::test]
@@ -279,7 +310,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
     // this really was handled as an ordinary rejected request.
     let (status, body) = send(app, get("/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"value": {"type": "str", "value": "stone"}}));
+    assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
 
 #[tokio::test]
@@ -498,7 +529,7 @@ async fn a_read_only_user_can_get_a_cell() {
     );
     let (status, body) = send(app, req).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"value": {"type": "str", "value": "stone"}}));
+    assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
 
 #[tokio::test]
@@ -548,7 +579,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
     // accepted and ignored.
     let (status, body) = send(app, get("/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body, json!({"value": {"type": "str", "value": "stone"}}));
+    assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
 
 #[tokio::test]

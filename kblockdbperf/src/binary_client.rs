@@ -110,7 +110,7 @@ impl BinaryClient {
         let t0 = Instant::now();
         let ok = matches!(
             self.roundtrip(&req).await,
-            Some(Response::Value(_)) | Some(Response::NotFound)
+            Some(Response::Value { .. }) | Some(Response::NotFound)
         );
         Timed {
             elapsed: t0.elapsed(),

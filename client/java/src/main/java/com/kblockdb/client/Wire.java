@@ -221,7 +221,7 @@ final class Wire {
     record Ok() implements Response {
     }
 
-    record ValueResp(Value value) implements Response {
+    record ValueResp(Value value, CellMeta meta) implements Response {
     }
 
     record NotFound() implements Response {
@@ -248,7 +248,7 @@ final class Wire {
             case 0x01:
                 return new Ok();
             case 0x02:
-                return new ValueResp(r.value());
+                return new ValueResp(r.value(), r.meta());
             case 0x03:
                 return new NotFound();
             case 0x04:
@@ -311,6 +311,16 @@ final class Wire {
             return Double.longBitsToDouble(i64());
         }
 
+        /**
+         * Same 8-byte little-endian layout as {@link #i64()} -- Java has
+         * no unsigned 64-bit type, and the bit pattern kBlockDB's
+         * {@code u64} fields (timestamps, {@code version}) use fits
+         * comfortably, and always positively, in a {@code long}.
+         */
+        long u64() throws ProtocolException {
+            return i64();
+        }
+
         byte[] bytes(int n) throws ProtocolException {
             if (pos + n > buf.length) {
                 throw truncated();
@@ -341,6 +351,11 @@ final class Wire {
                 default:
                     throw new ProtocolException("unknown value type tag 0x" + Integer.toHexString(tag));
             }
+        }
+
+        /** {@code <meta>}: {@code [u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]}. */
+        CellMeta meta() throws ProtocolException {
+            return new CellMeta(u64(), u64(), u64());
         }
 
         private ProtocolException truncated() {

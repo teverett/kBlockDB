@@ -1,4 +1,4 @@
-use crate::chunk::{self, Chunk};
+use crate::chunk::{self, CellMeta, Chunk};
 use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
 use crate::params::WorldParams;
@@ -11,6 +11,7 @@ use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default number of spatial axes for a *new* world, i.e. what `main`'s demo
 /// calls `World::create` with. This is only a default: a world's real axis
@@ -77,6 +78,20 @@ const _: () = assert!(
 );
 
 type ChunkKey = Coord;
+
+/// Milliseconds since the Unix epoch, for stamping `CellMeta` on every
+/// `set` -- the clock is read here, once per `set`/`set_region` call, and
+/// passed down to `Chunk::set` as a plain argument rather than read there,
+/// so `Chunk`'s own logic stays a deterministic, easily testable function
+/// of its arguments (see `chunk.rs`'s tests). Falls back to 0 if the system
+/// clock is set before the epoch -- absurd, but not a reason to panic a
+/// storage engine.
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
 
 /// An axis-aligned box of cells: `origin` plus `extent`, i.e. the set of
 /// coordinates `c` with `origin[a] <= c[a] < origin[a] + extent[a]` on
@@ -671,6 +686,35 @@ impl World {
         self.with_chunk_read(&ckey, |chunk| chunk.get(local_idx, key_id))
     }
 
+    /// This cell/key pair's bookkeeping -- when it was first set, when it
+    /// was last changed, and how many times it's been set since (see
+    /// `CellMeta`'s doc comment) -- or `None` under exactly the same
+    /// conditions `get` would return `None`.
+    pub fn get_meta(&self, coord: &[u32], key: &str) -> io::Result<Option<CellMeta>> {
+        let (ckey, local_idx) = self.split(coord)?;
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return Ok(None);
+        };
+        self.with_chunk_read(&ckey, |chunk| chunk.get_meta(local_idx, key_id))
+    }
+
+    /// `get` and `get_meta` together, guaranteed consistent with each other
+    /// -- both are read from the same chunk snapshot under one lock hold,
+    /// so (unlike calling `get` and `get_meta` separately) a concurrent
+    /// write to this exact cell/key can never land between them and pair
+    /// one call's value with a *different* call's meta.
+    pub fn get_with_meta(&self, coord: &[u32], key: &str) -> io::Result<Option<(Value, CellMeta)>> {
+        let (ckey, local_idx) = self.split(coord)?;
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return Ok(None);
+        };
+        self.with_chunk_read(&ckey, |chunk| {
+            chunk
+                .get(local_idx, key_id)
+                .zip(chunk.get_meta(local_idx, key_id))
+        })
+    }
+
     pub fn set(&self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
         // Validate the coordinate before interning `key`: a failed `set`
         // shouldn't have the side effect of permanently registering a new
@@ -680,7 +724,8 @@ impl World {
         // -- see `Schema`'s doc comment), so a type mismatch fails here,
         // before touching any chunk, as a normal `InvalidInput` error.
         let key_id = self.schema().intern(key, value.value_type())?;
-        self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value))
+        let now_ms = now_ms();
+        self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value, now_ms))
     }
 
     pub fn remove(&self, coord: &[u32], key: &str) -> io::Result<()> {
@@ -806,10 +851,11 @@ impl World {
             ));
         }
         let key_id = self.schema().intern(key, value_type)?;
+        let now_ms = now_ms();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             self.with_chunk_write(&ckey, |chunk| {
                 for (i, local_idx) in cells {
-                    chunk.set(local_idx, key_id, values[i].clone());
+                    chunk.set(local_idx, key_id, values[i].clone(), now_ms);
                 }
             })?;
         }
@@ -1183,6 +1229,141 @@ mod tests {
             w.get(&c, "material").unwrap(),
             Some(Value::Str("air".into()))
         );
+    }
+
+    #[test]
+    fn get_meta_of_a_never_set_cell_is_none() {
+        let dir = TempDir::new("meta-never-set");
+        let w = create(&dir);
+        assert_eq!(w.get_meta(&coord3(0, 0, 0), "material").unwrap(), None);
+    }
+
+    #[test]
+    fn a_fresh_set_starts_at_version_0() {
+        let dir = TempDir::new("meta-fresh-set");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+
+        let meta = w.get_meta(&c, "material").unwrap().unwrap();
+        assert_eq!(meta.version, 0);
+        assert_eq!(meta.created_at_ms, meta.modified_at_ms);
+        assert!(meta.created_at_ms > 0);
+    }
+
+    #[test]
+    fn overwriting_increments_version_and_modified_but_not_created() {
+        let dir = TempDir::new("meta-overwrite");
+        let w = create(&dir);
+        let c = coord3(4, 5, 6);
+
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        let first = w.get_meta(&c, "material").unwrap().unwrap();
+
+        w.set(&c, "material", Value::Str("air".into())).unwrap();
+        let second = w.get_meta(&c, "material").unwrap().unwrap();
+        w.set(&c, "material", Value::Str("dirt".into())).unwrap();
+        let third = w.get_meta(&c, "material").unwrap().unwrap();
+
+        assert_eq!(second.created_at_ms, first.created_at_ms);
+        assert_eq!(third.created_at_ms, first.created_at_ms);
+        assert!(second.modified_at_ms >= first.modified_at_ms);
+        assert!(third.modified_at_ms >= second.modified_at_ms);
+        assert_eq!(first.version, 0);
+        assert_eq!(second.version, 1);
+        assert_eq!(third.version, 2);
+    }
+
+    #[test]
+    fn removing_then_setting_again_resets_version_to_0() {
+        let dir = TempDir::new("meta-remove-reset");
+        let w = create(&dir);
+        let c = coord3(2, 2, 2);
+
+        w.set(&c, "material", Value::I64(1)).unwrap();
+        w.set(&c, "material", Value::I64(2)).unwrap();
+        assert_eq!(w.get_meta(&c, "material").unwrap().unwrap().version, 1);
+
+        w.remove(&c, "material").unwrap();
+        assert_eq!(w.get_meta(&c, "material").unwrap(), None);
+
+        w.set(&c, "material", Value::I64(3)).unwrap();
+        let meta = w.get_meta(&c, "material").unwrap().unwrap();
+        assert_eq!(meta.version, 0);
+        assert_eq!(meta.created_at_ms, meta.modified_at_ms);
+    }
+
+    #[test]
+    fn get_with_meta_of_a_never_set_cell_is_none() {
+        let dir = TempDir::new("meta-with-value-never-set");
+        let w = create(&dir);
+        assert_eq!(w.get_with_meta(&coord3(0, 0, 0), "material").unwrap(), None);
+    }
+
+    #[test]
+    fn get_with_meta_matches_get_and_get_meta_separately() {
+        let dir = TempDir::new("meta-with-value-matches");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.set(&c, "material", Value::Str("air".into())).unwrap();
+
+        let value = w.get(&c, "material").unwrap().unwrap();
+        let meta = w.get_meta(&c, "material").unwrap().unwrap();
+        let (v2, m2) = w.get_with_meta(&c, "material").unwrap().unwrap();
+
+        assert_eq!(v2, value);
+        assert_eq!(m2, meta);
+    }
+
+    #[test]
+    fn a_different_cells_meta_is_independent() {
+        let dir = TempDir::new("meta-independent");
+        let w = create(&dir);
+        let a = coord3(0, 0, 0);
+        let b = coord3(1, 1, 1);
+
+        w.set(&a, "material", Value::I64(1)).unwrap();
+        w.set(&a, "material", Value::I64(2)).unwrap();
+        w.set(&b, "material", Value::I64(9)).unwrap();
+
+        assert_eq!(w.get_meta(&a, "material").unwrap().unwrap().version, 1);
+        assert_eq!(w.get_meta(&b, "material").unwrap().unwrap().version, 0);
+    }
+
+    #[test]
+    fn meta_persists_across_flush_and_reopen() {
+        let dir = TempDir::new("meta-persist");
+        let c = coord3(3, 3, 3);
+        let before = {
+            let w = create(&dir);
+            w.set(&c, "material", Value::Str("stone".into())).unwrap();
+            w.set(&c, "material", Value::Str("air".into())).unwrap();
+            w.flush().unwrap();
+            w.get_meta(&c, "material").unwrap().unwrap()
+        };
+
+        let w = World::open(&dir).unwrap();
+        let after = w.get_meta(&c, "material").unwrap().unwrap();
+        assert_eq!(after, before);
+        assert_eq!(after.version, 1);
+    }
+
+    #[test]
+    fn set_region_stamps_meta_for_every_cell_at_version_0() {
+        let dir = TempDir::new("meta-set-region");
+        let w = create(&dir);
+        let region = Region::new(vec![0, 0, 0], vec![2, 2, 2]);
+        let values: Vec<Value> = (0..region.volume() as i64).map(Value::I64).collect();
+
+        w.set_region(&region, "material", &values).unwrap();
+
+        for coord in RegionIter::new(&region) {
+            let meta = w.get_meta(&coord, "material").unwrap().unwrap();
+            assert_eq!(meta.version, 0);
+            assert_eq!(meta.created_at_ms, meta.modified_at_ms);
+        }
     }
 
     #[test]

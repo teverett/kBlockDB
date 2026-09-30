@@ -194,16 +194,27 @@ class WireTest {
 
     @Test
     void decodesValueResponseForEveryValueType() throws IOException {
-        assertEquals(new Wire.ValueResp(new Value.Str("air")), decodeValueResponse(new Value.Str("air")));
-        assertEquals(new Wire.ValueResp(new Value.F64(1.5)), decodeValueResponse(new Value.F64(1.5)));
-        assertEquals(new Wire.ValueResp(new Value.I64(0)), decodeValueResponse(new Value.I64(0)));
+        CellMeta meta = new CellMeta(1000, 2000, 3);
+        assertEquals(new Wire.ValueResp(new Value.Str("air"), meta), decodeValueResponse(new Value.Str("air"), meta));
+        assertEquals(new Wire.ValueResp(new Value.F64(1.5), meta), decodeValueResponse(new Value.F64(1.5), meta));
+        assertEquals(new Wire.ValueResp(new Value.I64(0), meta), decodeValueResponse(new Value.I64(0), meta));
     }
 
-    private static Wire.Response decodeValueResponse(Value value) throws IOException {
+    private static Wire.Response decodeValueResponse(Value value, CellMeta meta) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x02);
         Wire.writeValue(buf, value);
+        writeU64(buf, meta.createdAtMs());
+        writeU64(buf, meta.modifiedAtMs());
+        writeU64(buf, meta.version());
         return Wire.decodeResponse(buf.toByteArray());
+    }
+
+    /** Test-only: production code (see {@link Wire}) never encodes a {@code <meta>} -- only decodes one. */
+    private static void writeU64(ByteArrayOutputStream buf, long v) {
+        for (int i = 0; i < 8; i++) {
+            buf.write((int) ((v >>> (8 * i)) & 0xFF));
+        }
     }
 
     @Test

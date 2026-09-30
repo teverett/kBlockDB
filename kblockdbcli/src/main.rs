@@ -152,7 +152,8 @@ fn print_help() {
         "kblockdbcli -- a command-line client for kblockdbserver's REST API\n\n\
          USAGE:\n    kblockdbcli [OPTIONS] <COMMAND> [ARGS]\n\n\
          COMMANDS:\n    \
-         get <coords> <key>                  Print a cell's value, as `<type> <value>`\n    \
+         get <coords> <key>                  Print a cell's value and metadata, as\n                                              \
+         `<type> <value> (created=<ms> modified=<ms> version=<n>)`\n    \
          set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)\n    \
          remove <coords> <key>               Clear a cell's value\n\n\
          OPTIONS:\n    \
@@ -193,7 +194,8 @@ fn run_get(
         return Err(server_error_message(status, &body));
     }
     let (value_type, rendered) = describe_value(&body["value"])?;
-    println!("{value_type} {rendered}");
+    let meta = describe_meta(&body)?;
+    println!("{value_type} {rendered} {meta}");
     Ok(())
 }
 
@@ -275,6 +277,25 @@ fn describe_value(value: &Json) -> Result<(String, String), String> {
     Ok((value_type, rendered))
 }
 
+/// Renders a `get` response's `created_at_ms`/`modified_at_ms`/`version`
+/// fields (see kblockdbserver's `CellResponse`) as one
+/// `(created=... modified=... version=...)` suffix for `get` to print
+/// alongside the value.
+fn describe_meta(body: &Json) -> Result<String, String> {
+    let created_at_ms = body["created_at_ms"]
+        .as_u64()
+        .ok_or("response is missing 'created_at_ms'")?;
+    let modified_at_ms = body["modified_at_ms"]
+        .as_u64()
+        .ok_or("response is missing 'modified_at_ms'")?;
+    let version = body["version"]
+        .as_u64()
+        .ok_or("response is missing 'version'")?;
+    Ok(format!(
+        "(created={created_at_ms} modified={modified_at_ms} version={version})"
+    ))
+}
+
 fn server_error_message(status: reqwest::StatusCode, body: &Json) -> String {
     let detail = body
         .get("error")
@@ -328,6 +349,27 @@ mod unit_tests {
     #[test]
     fn describe_value_rejects_a_value_with_no_type() {
         assert!(describe_value(&json!({"value": "stone"})).is_err());
+    }
+
+    #[test]
+    fn describe_meta_renders_all_three_fields() {
+        let body = json!({
+            "value": {"type": "str", "value": "stone"},
+            "created_at_ms": 1000,
+            "modified_at_ms": 2000,
+            "version": 1,
+        });
+        assert_eq!(
+            describe_meta(&body).unwrap(),
+            "(created=1000 modified=2000 version=1)"
+        );
+    }
+
+    #[test]
+    fn describe_meta_rejects_a_response_missing_any_field() {
+        assert!(describe_meta(&json!({"modified_at_ms": 1, "version": 0})).is_err());
+        assert!(describe_meta(&json!({"created_at_ms": 1, "version": 0})).is_err());
+        assert!(describe_meta(&json!({"created_at_ms": 1, "modified_at_ms": 1})).is_err());
     }
 
     #[test]
