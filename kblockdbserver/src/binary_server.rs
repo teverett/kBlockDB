@@ -58,6 +58,7 @@ pub async fn serve(listener: TcpListener, state: AppState) {
                 continue;
             }
         };
+        let _ = stream.set_nodelay(true);
         let state = state.clone();
         tokio::spawn(async move {
             handle_connection(stream, state).await;

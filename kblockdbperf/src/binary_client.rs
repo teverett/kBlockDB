@@ -51,6 +51,7 @@ impl BinaryClient {
         password: &str,
     ) -> Option<(BinaryClient, HealthInfo)> {
         let mut stream = TcpStream::connect(addr).await.ok()?;
+        stream.set_nodelay(true).ok()?;
         let hello = Request::Hello {
             username: username.to_string(),
             password: password.to_string(),
