@@ -10,6 +10,7 @@ axes = 4
 world_dim = 10000
 max_concurrent_disk_ops = 32
 admin_password = "changeme"
+max_cached_chunks = 10000
 
 [[users]]
 username = "user"

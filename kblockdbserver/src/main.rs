@@ -25,6 +25,7 @@ struct Args {
     world_dim: Option<u32>,
     addr: Option<String>,
     max_concurrent_disk_ops: Option<usize>,
+    max_cached_chunks: Option<usize>,
 }
 
 fn parse_args() -> Args {
@@ -34,6 +35,7 @@ fn parse_args() -> Args {
     let mut world_dim = None;
     let mut addr = None;
     let mut max_concurrent_disk_ops = None;
+    let mut max_cached_chunks = None;
 
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -71,6 +73,16 @@ fn parse_args() -> Args {
                         }),
                 )
             }
+            "--max-cached-chunks" => {
+                max_cached_chunks = Some(
+                    expect_value(&mut args, "--max-cached-chunks")
+                        .parse()
+                        .unwrap_or_else(|_| {
+                            eprintln!("--max-cached-chunks must be a non-negative integer");
+                            std::process::exit(1);
+                        }),
+                )
+            }
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -90,6 +102,7 @@ fn parse_args() -> Args {
         world_dim,
         addr,
         max_concurrent_disk_ops,
+        max_cached_chunks,
     }
 }
 
@@ -107,8 +120,9 @@ fn print_help() {
          OPTIONS:\n    \
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
          holds admin_password and, optionally, [[users]], plus optional\n                          \
-         addr/data_dir/axes/world_dim/max_concurrent_disk_ops (each\n                          \
-         overridden by the matching CLI flag below, if given). Example:\n                          \
+         addr/data_dir/axes/world_dim/max_concurrent_disk_ops/\n                          \
+         max_cached_chunks (each overridden by the matching CLI flag\n                          \
+         below, if given). Example:\n                          \
          \n                          \
          addr = \"127.0.0.1:8080\"\n                          \
          data_dir = \"./data\"\n                          \
@@ -126,6 +140,11 @@ fn print_help() {
          (default: {}; see kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS --\n                          \
          the right number depends on your filesystem/storage;\n                          \
          measure it with kblockdbperf's concurrency_scan)\n    \
+         --max-cached-chunks <n>\n                          \
+         Cap on distinct chunks kept in the write-through cache at\n                          \
+         once, LRU-evicted beyond that (default: {}; see\n                          \
+         kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
+         cache's benefit without disabling the server)\n    \
          -h, --help           Print this help\n\n\
          --axes/--world-dim only matter the first time a world is created at\n\
          --data-dir; reopening an existing one reads its real shape from its\n\
@@ -136,7 +155,8 @@ fn print_help() {
          credentials don't end up in shell history or `ps` output.",
         kblockdblib::AXES,
         kblockdblib::WORLD_DIM,
-        kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS
+        kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS,
+        kblockdblib::DEFAULT_MAX_CACHED_CHUNKS
     );
 }
 
@@ -168,6 +188,7 @@ async fn main() {
     let max_concurrent_disk_ops = args
         .max_concurrent_disk_ops
         .or(config.max_concurrent_disk_ops);
+    let max_cached_chunks = args.max_cached_chunks.or(config.max_cached_chunks);
 
     let mut world = kblockdblib::World::create(&data_dir, axes, world_dim).unwrap_or_else(|e| {
         eprintln!("failed to open world at {data_dir}: {e}");
@@ -176,13 +197,17 @@ async fn main() {
     if let Some(n) = max_concurrent_disk_ops {
         world = world.with_max_concurrent_disk_ops(n);
     }
+    if let Some(n) = max_cached_chunks {
+        world = world.with_max_cached_chunks(n);
+    }
     let credentials = config.credentials();
     println!(
-        "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, max_concurrent_disk_ops={}), \
-         {} account(s) configured",
+        "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, max_concurrent_disk_ops={}, \
+         max_cached_chunks={}), {} account(s) configured",
         world.axes(),
         world.world_dim(),
         world.max_concurrent_disk_ops(),
+        world.max_cached_chunks(),
         credentials.len()
     );
 

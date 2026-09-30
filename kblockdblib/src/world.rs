@@ -1,5 +1,5 @@
 use crate::chunk::{self, Chunk, CHUNK_DIM};
-use crate::chunk_locks::ChunkLocks;
+use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
 use crate::params::WorldParams;
 use crate::schema::Schema;
@@ -10,26 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
-
-/// Whether a `World::with_chunk` call means to only read a chunk or to
-/// (possibly) write it -- see that method.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Access {
-    Read,
-    Write,
-}
-
-/// Whatever `with_chunk` got back from locking a chunk's `RwLock` for
-/// `access` -- kept alive (as `_guard`) for the rest of the call so the
-/// lock is held for its whole read-apply-[write] sequence, then dropped
-/// (releasing it) when `with_chunk` returns. Neither variant's guard is
-/// ever read -- only held, for its `Drop` -- hence `allow(dead_code)`.
-#[allow(dead_code)]
-enum ChunkGuard<'a> {
-    Read(RwLockReadGuard<'a, ()>),
-    Write(RwLockWriteGuard<'a, ()>),
-}
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Default number of spatial axes for a *new* world, i.e. what `main`'s demo
 /// calls `World::create` with. This is only a default: a world's real axis
@@ -61,6 +42,21 @@ pub const WORLD_DIM: u32 = 10_000;
 /// measure it for yours (e.g. with `kblockdbperf`'s `concurrency_scan`) rather
 /// than trusting this default.
 pub const DEFAULT_MAX_CONCURRENT_DISK_OPS: usize = 32;
+
+/// Default cap on how many distinct chunks the write-through cache (see
+/// `World`'s "Concurrency" doc comment and `crate::chunk_cache`) keeps in
+/// memory at once. Once a `World` has touched this many distinct chunks,
+/// touching a new one evicts the least-recently-used one to make room.
+/// Override with `World::with_max_cached_chunks`.
+///
+/// 100,000 is a reasonable starting point -- an empty (never-written)
+/// chunk costs next to nothing (see `Chunk::new`), so this comfortably
+/// covers a working set of a few hundred thousand touched chunks without
+/// growing unbounded for the life of the process -- not a measured optimum
+/// for any particular deployment; the right number depends on how large
+/// your actual hot working set is and how much memory you can spare for
+/// it.
+pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 100_000;
 
 const _: () = assert!(AXES >= 1, "AXES must be at least 1");
 
@@ -179,29 +175,37 @@ impl Iterator for RegionIter {
 /// processes pointed at the same directory at once (see `kblockdbserver/
 /// src/state.rs`, which holds its one `World` behind a plain `Arc`, shared
 /// by every request-handling thread). Within that one `World`, every
-/// operation locks (via `crate::chunk_locks::ChunkLocks`, a plain
+/// operation locks (via `crate::chunk_cache::ChunkCache`, a plain
 /// in-memory per-chunk `RwLock`, not an OS-level file lock) exactly the
-/// chunk(s) it touches -- shared for a read, exclusive for a write --
-/// reads that chunk's *current* on-disk contents fresh, applies the
-/// change, and writes it straight back before releasing the lock, all
-/// before returning. There is no in-process cache of chunk contents to go
-/// stale or to lose an update on eviction: every `set`/`remove` is durable
-/// the moment its call returns, and every `get` sees whatever the last
-/// writer actually wrote, never a stale or partially-written copy. The
-/// schema (`schema.rs`) gets the same treatment: it's held behind `World`'s
-/// own `Mutex<Schema>`, so two threads racing to intern two *different*
-/// new keys can't collide on the same id. What this does *not* give you is
-/// cross-call atomicity: a `get` immediately followed by a `set` from the
-/// same caller is two separate locked operations, not one transaction, so
-/// another thread's write can land in between them -- same as most simple
-/// key/value stores without an explicit read-modify-write or transaction
-/// API.
+/// chunk(s) it touches -- shared for a read, exclusive for a write.
+///
+/// **Chunks are cached, not just locked.** Since this process is always
+/// the sole writer, a chunk's in-memory contents -- once read off disk --
+/// can never fall behind what's on disk, so `with_chunk_read`/
+/// `with_chunk_write` load a chunk from disk (or synthesize an empty one,
+/// if it's never been written) only the *first* time this `World` touches
+/// it (or the first time again, after it's been evicted -- see below);
+/// every access in between reads the cached copy straight out of memory,
+/// no disk I/O at all. Writes are still *write-through*, not write-behind:
+/// `with_chunk_write` still writes the chunk straight back to disk before
+/// releasing its lock and returning, so `set`/`remove` stay exactly as
+/// durable as before -- caching only removes redundant *reads*, never
+/// defers a write. The cache itself is bounded (`DEFAULT_MAX_CACHED_CHUNKS`/
+/// `World::with_max_cached_chunks`, an LRU eviction policy once full -- see
+/// `crate::chunk_cache`), so memory doesn't grow forever for a workload
+/// that keeps touching new chunks. The schema (`schema.rs`) gets the same
+/// treatment: it's held behind `World`'s own `Mutex<Schema>`, so two
+/// threads racing to intern two *different* new keys can't collide on the
+/// same id. What this does *not* give you is cross-call atomicity: a `get`
+/// immediately followed by a `set` from the same caller is two separate
+/// locked operations, not one transaction, so another thread's write can
+/// land in between them -- same as most simple key/value stores without
+/// an explicit read-modify-write or transaction API.
 ///
 /// **All of this is also why every method takes `&self`, not `&mut
-/// self`.** `World` holds no cache and no other state that a second
-/// concurrent call could corrupt -- its only interior state is `schema`
-/// (behind its own `Mutex`), a lazily-populated table of per-chunk locks,
-/// and a couple of atomic counters -- so the one process can hold its one
+/// self`.** `World`'s only interior state is `schema` (behind its own
+/// `Mutex`), a lazily-populated cache of per-chunk locks and contents, and
+/// a couple of atomic counters -- so the one process can hold its one
 /// `World` behind an `Arc` (no outer `Mutex<World>` needed) and let
 /// concurrent requests actually run concurrently, limited only by the same
 /// per-chunk locks that keep two threads from corrupting the same chunk.
@@ -212,7 +216,7 @@ impl Iterator for RegionIter {
 ///
 /// **Opening more than one `World` (in this process or another) against
 /// the same `root` at the same time is not supported and will corrupt
-/// data.** Each `World` keeps its own private chunk-lock table and its own
+/// data.** Each `World` keeps its own private chunk cache and its own
 /// private `Schema` cache, so two independent `World`s have no way to
 /// coordinate a write to the same chunk file -- exactly the failure mode
 /// the old, OS-level-file-lock-based design existed to prevent when
@@ -246,22 +250,31 @@ pub struct World {
     world_dim: u32,
     chunk_cells: usize,
     schema: Mutex<Schema>,
-    /// Number of chunk files this `World` has read since it was opened.
-    /// Counts operations, not distinct chunks -- touching the same chunk
-    /// twice counts twice, since nothing is cached between calls (see
-    /// `with_chunk`). Read via `chunks_read_from_disk()`.
+    /// Number of chunk files this `World` has actually opened and read
+    /// from disk since it was opened -- not every `get`/`set`/`remove`
+    /// call: this is 0 for a chunk that's never been written (there's no
+    /// file to read) and at most 1 per chunk ever touched, no matter how
+    /// many times it's queried after the first -- see `chunk_cache`. Read
+    /// via `chunks_read_from_disk()`.
     chunks_read_from_disk: AtomicU64,
-    /// Number of chunk files this `World` has (over)written since it was
-    /// opened. Same counting caveat as `chunks_read_from_disk`: a cell
-    /// `set` four times in the same chunk, even in a row, is four writes.
-    /// Read via `chunks_written_to_disk()`.
+    /// Number of chunk files this `World` has (over)written to disk since
+    /// it was opened. Unlike `chunks_read_from_disk`, this *does* count
+    /// every write, not just the first: caching removes redundant reads,
+    /// not writes (writes are still write-through -- see `World`'s
+    /// "Concurrency" doc comment), so a cell `set` four times in the same
+    /// chunk, even in a row, is still four writes. Read via
+    /// `chunks_written_to_disk()`.
     chunks_written_to_disk: AtomicU64,
-    /// Caps how many `with_chunk` calls run concurrently -- see
-    /// `DEFAULT_MAX_CONCURRENT_DISK_OPS`.
+    /// Caps how many actual disk operations (a cache-miss read, or any
+    /// write) run concurrently -- see `DEFAULT_MAX_CONCURRENT_DISK_OPS`. A
+    /// cache-hit read doesn't touch this at all: there's no disk operation
+    /// to cap.
     disk_io: Semaphore,
-    /// One in-memory `RwLock` per chunk actually touched so far -- see
-    /// `with_chunk` and `crate::chunk_locks`.
-    chunk_locks: ChunkLocks<ChunkKey>,
+    /// Chunks this `World` has touched, cached in memory up to
+    /// `DEFAULT_MAX_CACHED_CHUNKS`/`with_max_cached_chunks`'s cap (an LRU
+    /// eviction policy beyond that) -- see `with_chunk_read`/
+    /// `with_chunk_write` and `crate::chunk_cache`.
+    chunk_cache: ChunkCache<ChunkKey, Chunk>,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -343,7 +356,7 @@ impl World {
             chunks_read_from_disk: AtomicU64::new(0),
             chunks_written_to_disk: AtomicU64::new(0),
             disk_io: Semaphore::new(DEFAULT_MAX_CONCURRENT_DISK_OPS),
-            chunk_locks: ChunkLocks::new(),
+            chunk_cache: ChunkCache::new(DEFAULT_MAX_CACHED_CHUNKS),
         })
     }
 
@@ -365,6 +378,28 @@ impl World {
     /// ```
     pub fn with_max_concurrent_disk_ops(mut self, n: usize) -> Self {
         self.disk_io = Semaphore::new(n.max(1));
+        self
+    }
+
+    /// Overrides the cap on how many distinct chunks the write-through
+    /// cache keeps in memory at once -- see `DEFAULT_MAX_CACHED_CHUNKS` for
+    /// why this exists and how to pick a value. Unlike
+    /// `with_max_concurrent_disk_ops`, `0` is a legitimate (if
+    /// self-defeating) value here: it doesn't deadlock anything, it just
+    /// means every chunk is evicted about as soon as it's cached, so
+    /// caching stops helping -- there's no correctness reason to floor it.
+    ///
+    /// Chainable right after `create`/`open`, same as
+    /// `with_max_concurrent_disk_ops`:
+    /// ```no_run
+    /// # fn main() -> std::io::Result<()> {
+    /// let world = kblockdblib::World::create("./data", 3, 10_000)?
+    ///     .with_max_cached_chunks(1_000_000);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_max_cached_chunks(mut self, n: usize) -> Self {
+        self.chunk_cache = ChunkCache::new(n);
         self
     }
 
@@ -394,6 +429,13 @@ impl World {
     /// `DEFAULT_MAX_CONCURRENT_DISK_OPS`/`with_max_concurrent_disk_ops`.
     pub fn max_concurrent_disk_ops(&self) -> usize {
         self.disk_io.capacity()
+    }
+
+    /// The current cap on how many distinct chunks the write-through cache
+    /// keeps in memory at once -- see
+    /// `DEFAULT_MAX_CACHED_CHUNKS`/`with_max_cached_chunks`.
+    pub fn max_cached_chunks(&self) -> usize {
+        self.chunk_cache.max_entries()
     }
 
     pub fn axes(&self) -> usize {
@@ -465,20 +507,49 @@ impl World {
         Ok((ckey, local_idx))
     }
 
-    /// Runs `f` against chunk `ckey`'s *current* on-disk contents, having
-    /// first acquired `access` on that chunk's in-memory lock -- shared
-    /// for `Access::Read`, exclusive for `Access::Write` (see
-    /// `crate::chunk_locks`). `f` gets a `Chunk` freshly read from disk (or
-    /// a fresh empty one, if the chunk has never been written), and for
-    /// `Access::Write` that chunk is written straight back (or its file
-    /// deleted, if `f` left it empty) before the lock is released. This is
-    /// the one place `World` touches a chunk file, and it's the whole of
-    /// `World`'s concurrency story -- see the "Concurrency" section of
-    /// `World`'s own doc comment.
-    fn with_chunk<T>(
+    /// Runs `f` against chunk `ckey`'s cached contents, read-only. If this
+    /// `World` has already touched `ckey`, this is a plain in-memory
+    /// shared read -- no disk I/O, no exclusive lock, so any number of
+    /// concurrent `with_chunk_read` calls (on this chunk or any other) run
+    /// fully in parallel. Otherwise (the first touch), this loads the
+    /// chunk from disk once (see `load_chunk`) and caches it before
+    /// running `f` -- see the "Concurrency" section of `World`'s own doc
+    /// comment.
+    fn with_chunk_read<T>(&self, ckey: &ChunkKey, f: impl FnOnce(&Chunk) -> T) -> io::Result<T> {
+        let slot = self.chunk_cache.slot(ckey);
+
+        // Fast path: already cached.
+        {
+            let guard = slot.read().unwrap_or_else(PoisonError::into_inner);
+            if let Some(chunk) = guard.as_ref() {
+                return Ok(f(chunk));
+            }
+        }
+
+        // Slow path: never touched by this `World` before. Locks the slot
+        // exclusively for the load so two readers racing the very first
+        // touch don't both hit disk -- checked again after acquiring the
+        // lock in case another thread's load already won that race while
+        // this one was waiting for it.
+        let mut guard = slot.write().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(self.load_chunk(ckey)?);
+        }
+        Ok(f(guard.as_ref().unwrap()))
+    }
+
+    /// Runs `f` against chunk `ckey`'s cached contents, mutably -- loading
+    /// it first (same as `with_chunk_read`) if this is the first touch --
+    /// and writes the result straight back to disk (or deletes the
+    /// chunk's file, if `f` left it empty) before releasing the chunk's
+    /// lock and returning. Always exclusive, and always write-*through*:
+    /// caching means a repeated `get` skips disk entirely once a chunk is
+    /// loaded, but a `set`/`remove` still hits disk on *every* call, so
+    /// it's durable the instant this returns -- see the "Concurrency"
+    /// section of `World`'s own doc comment.
+    fn with_chunk_write<T>(
         &self,
         ckey: &ChunkKey,
-        access: Access,
         f: impl FnOnce(&mut Chunk) -> T,
     ) -> io::Result<T> {
         // Held for the rest of this function -- see `disk_io`'s field doc
@@ -489,52 +560,61 @@ impl World {
         // not just the chunk file I/O.
         let _permit = self.disk_io.acquire();
 
-        // Kept alive for the rest of this function so `_guard` (below) can
-        // borrow through it -- see `ChunkLocks::get`.
-        let chunk_lock = self.chunk_locks.get(ckey);
-        let _guard = match access {
-            Access::Read => {
-                ChunkGuard::Read(chunk_lock.read().unwrap_or_else(PoisonError::into_inner))
-            }
-            Access::Write => {
-                ChunkGuard::Write(chunk_lock.write().unwrap_or_else(PoisonError::into_inner))
-            }
-        };
+        let slot = self.chunk_cache.slot(ckey);
+        let mut guard = slot.write().unwrap_or_else(PoisonError::into_inner);
+        if guard.is_none() {
+            *guard = Some(self.load_chunk_unmetered(ckey)?);
+        }
+        let chunk = guard.as_mut().unwrap();
+
+        let result = f(chunk);
 
         let chunk_path = self.chunk_path(ckey);
-        let mut chunk = if chunk_path.exists() {
-            let f = File::open(&chunk_path)?;
-            let mut r = BufReader::new(f);
-            self.chunks_read_from_disk.fetch_add(1, Ordering::Relaxed);
-            Chunk::read_from(&mut r, self.chunk_cells)?
+        if chunk.is_empty() {
+            // Nothing left in this chunk (e.g. every cell was removed) --
+            // don't leave a pointless empty file around.
+            let _ = fs::remove_file(&chunk_path);
         } else {
-            Chunk::new(self.chunk_cells)
-        };
-
-        let result = f(&mut chunk);
-
-        if access == Access::Write {
-            if chunk.is_empty() {
-                // Nothing left in this chunk (e.g. every cell was removed)
-                // -- don't leave a pointless empty file around.
-                let _ = fs::remove_file(&chunk_path);
-            } else {
-                fs::create_dir_all(chunk_path.parent().unwrap())?;
-                let file = File::create(&chunk_path)?;
-                let mut w = BufWriter::new(file);
-                chunk.write_to(&mut w)?;
-                self.chunks_written_to_disk.fetch_add(1, Ordering::Relaxed);
-            }
+            fs::create_dir_all(chunk_path.parent().unwrap())?;
+            let file = File::create(&chunk_path)?;
+            let mut w = BufWriter::new(file);
+            chunk.write_to(&mut w)?;
+            self.chunks_written_to_disk.fetch_add(1, Ordering::Relaxed);
         }
 
         Ok(result)
     }
 
+    /// Reads chunk `ckey` fresh off disk, or synthesizes an empty one if
+    /// it's never been written -- the one place a cache slot is first
+    /// populated. Gated by `disk_io`, same as the write path in
+    /// `with_chunk_write`.
+    fn load_chunk(&self, ckey: &ChunkKey) -> io::Result<Chunk> {
+        let _permit = self.disk_io.acquire();
+        self.load_chunk_unmetered(ckey)
+    }
+
+    /// Core of `load_chunk`, minus the `disk_io` permit -- for
+    /// `with_chunk_write`, which already holds one for its whole
+    /// load-apply-write sequence and would deadlock acquiring a second.
+    fn load_chunk_unmetered(&self, ckey: &ChunkKey) -> io::Result<Chunk> {
+        let chunk_path = self.chunk_path(ckey);
+        if chunk_path.exists() {
+            let f = File::open(&chunk_path)?;
+            let mut r = BufReader::new(f);
+            self.chunks_read_from_disk.fetch_add(1, Ordering::Relaxed);
+            Chunk::read_from(&mut r, self.chunk_cells)
+        } else {
+            Ok(Chunk::new(self.chunk_cells))
+        }
+    }
+
     /// Every write this crate has ever made is already durable the moment
-    /// its call returns (see `with_chunk`) -- there's no dirty/cached
-    /// state left to flush. Kept as a no-op, rather than removed, so code
-    /// written against the version of this API that *did* batch writes
-    /// (this crate's own demo included) doesn't need to change.
+    /// its call returns (see `with_chunk_write`) -- there's no dirty
+    /// (unwritten) state to flush, only *cached-and-already-written*
+    /// state. Kept as a no-op, rather than removed, so code written
+    /// against the version of this API that *did* batch writes (this
+    /// crate's own demo included) doesn't need to change.
     pub fn flush(&self) -> io::Result<()> {
         Ok(())
     }
@@ -549,7 +629,7 @@ impl World {
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(None); // this key has never been written anywhere in the world
         };
-        self.with_chunk(&ckey, Access::Read, |chunk| chunk.get(local_idx, key_id))
+        self.with_chunk_read(&ckey, |chunk| chunk.get(local_idx, key_id))
     }
 
     pub fn set(&self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
@@ -561,9 +641,7 @@ impl World {
         // -- see `Schema`'s doc comment), so a type mismatch fails here,
         // before touching any chunk, as a normal `InvalidInput` error.
         let key_id = self.schema().intern(key, value.value_type())?;
-        self.with_chunk(&ckey, Access::Write, |chunk| {
-            chunk.set(local_idx, key_id, value)
-        })
+        self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value))
     }
 
     pub fn remove(&self, coord: &[u32], key: &str) -> io::Result<()> {
@@ -581,9 +659,7 @@ impl World {
             ));
             return Ok(());
         };
-        self.with_chunk(&ckey, Access::Write, |chunk| {
-            chunk.remove(local_idx, key_id)
-        })?;
+        self.with_chunk_write(&ckey, |chunk| chunk.remove(local_idx, key_id))?;
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
         Ok(())
     }
@@ -640,7 +716,7 @@ impl World {
             return Ok(out); // never interned anywhere: every cell is None
         };
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            let values = self.with_chunk(&ckey, Access::Read, |chunk| {
+            let values = self.with_chunk_read(&ckey, |chunk| {
                 cells
                     .iter()
                     .map(|&(i, local_idx)| (i, chunk.get(local_idx, key_id)))
@@ -692,7 +768,7 @@ impl World {
         }
         let key_id = self.schema().intern(key, value_type)?;
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            self.with_chunk(&ckey, Access::Write, |chunk| {
+            self.with_chunk_write(&ckey, |chunk| {
                 for (i, local_idx) in cells {
                     chunk.set(local_idx, key_id, values[i].clone());
                 }
@@ -721,7 +797,7 @@ impl World {
             return Ok(());
         };
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            self.with_chunk(&ckey, Access::Write, |chunk| {
+            self.with_chunk_write(&ckey, |chunk| {
                 for (_, local_idx) in cells {
                     chunk.remove(local_idx, key_id);
                 }
@@ -1666,6 +1742,155 @@ mod tests {
                 Some(Value::I64(i as i64))
             );
         }
+    }
+
+    // --- Write-through chunk cache ---
+
+    #[test]
+    fn repeated_gets_on_the_same_chunk_only_read_from_disk_once() {
+        let dir = TempDir::new("cache-repeated-get");
+        let w = create(&dir);
+        let c = coord3(1, 1, 1);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        assert_eq!(
+            w.chunks_read_from_disk(),
+            0,
+            "set() populates the cache directly, it shouldn't need to read the chunk back"
+        );
+
+        for _ in 0..5 {
+            assert_eq!(
+                w.get(&c, "material").unwrap(),
+                Some(Value::Str("stone".into()))
+            );
+        }
+        assert_eq!(
+            w.chunks_read_from_disk(),
+            0,
+            "every get() after the set() above should hit the in-memory cache, not disk"
+        );
+    }
+
+    #[test]
+    fn a_fresh_world_handle_reads_a_pre_existing_chunk_from_disk_exactly_once() {
+        let dir = TempDir::new("cache-cold-start");
+        let c = coord3(2, 2, 2);
+        {
+            let w = create(&dir);
+            w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        }
+
+        // A brand new `World` handle -- its cache starts empty, so the
+        // first touch of this chunk must go to disk once, and every touch
+        // after that must not.
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.chunks_read_from_disk(), 0);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(w.chunks_read_from_disk(), 1);
+        for _ in 0..5 {
+            w.get(&c, "material").unwrap();
+        }
+        assert_eq!(
+            w.chunks_read_from_disk(),
+            1,
+            "only the first get() on a freshly opened World should read this chunk from disk"
+        );
+    }
+
+    #[test]
+    fn repeated_sets_on_the_same_chunk_still_write_to_disk_every_time() {
+        // The cache is write-through, not write-behind: caching removes
+        // redundant reads, never defers or coalesces a write, so
+        // durability is unchanged -- see World's "Concurrency" doc
+        // comment.
+        let dir = TempDir::new("cache-write-through");
+        let w = create(&dir);
+        let c = coord3(3, 3, 3);
+
+        for i in 0..5 {
+            w.set(&c, "n", Value::I64(i)).unwrap();
+        }
+        assert_eq!(w.chunks_written_to_disk(), 5);
+
+        // And each write really did land on disk immediately, not just in
+        // the cache: a completely independent handle over the same
+        // directory sees the last value without this `w` doing anything
+        // else.
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(reopened.get(&c, "n").unwrap(), Some(Value::I64(4)));
+    }
+
+    #[test]
+    fn repeated_gets_on_a_never_written_chunk_stay_correct_and_touch_no_file() {
+        // A chunk that's never been written has no file to read at all --
+        // `chunks_read_from_disk` (which only counts an actual file read)
+        // must stay 0 here regardless of how many times it's queried,
+        // unlike the pre-existing-chunk case above.
+        let dir = TempDir::new("cache-never-written");
+        let w = create(&dir);
+        let c = coord3(9_999, 0, 0); // a chunk nothing has ever touched
+
+        for _ in 0..5 {
+            assert_eq!(w.get(&c, "material").unwrap(), None);
+        }
+        assert_eq!(
+            w.chunks_read_from_disk(),
+            0,
+            "there was never a file to read for this chunk"
+        );
+    }
+
+    #[test]
+    fn default_max_cached_chunks_is_the_documented_constant() {
+        let dir = TempDir::new("cache-cap-default");
+        let w = create(&dir);
+        assert_eq!(w.max_cached_chunks(), DEFAULT_MAX_CACHED_CHUNKS);
+    }
+
+    #[test]
+    fn with_max_cached_chunks_overrides_the_default() {
+        let dir = TempDir::new("cache-cap-override");
+        let w = World::create(&dir, AXES, WORLD_DIM)
+            .unwrap()
+            .with_max_cached_chunks(3);
+        assert_eq!(w.max_cached_chunks(), 3);
+    }
+
+    #[test]
+    fn evicting_a_chunk_from_the_cache_makes_a_later_touch_re_read_it_from_disk() {
+        // A tiny cache (cap 2) forces eviction almost immediately: touching
+        // a 3rd, 4th, and 5th distinct chunk each evict the
+        // least-recently-touched one so far. Re-touching an evicted chunk
+        // must still read the right data back -- correctness, not just
+        // that *a* read happens -- and `chunks_read_from_disk` proves it
+        // really did go back to disk rather than getting a lucky
+        // in-memory hit.
+        let dir = TempDir::new("cache-eviction-reread");
+        let w = World::create(&dir, AXES, WORLD_DIM)
+            .unwrap()
+            .with_max_cached_chunks(2);
+
+        // Each of these is CHUNK_DIM apart on axis 0, so each lands in a
+        // distinct chunk.
+        let chunk_coord = |n: u32| coord3(n * CHUNK_DIM, 0, 0);
+
+        w.set(&chunk_coord(0), "material", Value::I64(0)).unwrap(); // cache: {0}
+        w.set(&chunk_coord(1), "material", Value::I64(1)).unwrap(); // cache: {0, 1} -- full
+                                                                    // Touching a 3rd distinct chunk evicts the least-recently-touched
+                                                                    // one so far (chunk 0) to make room.
+        w.set(&chunk_coord(2), "material", Value::I64(2)).unwrap(); // cache: {1, 2}
+        assert_eq!(w.chunks_read_from_disk(), 0); // every set() above populated its own cache slot directly
+
+        // Re-reading evicted chunk 0 must go back to disk, and still
+        // return the value that was durably written to it earlier.
+        assert_eq!(
+            w.get(&chunk_coord(0), "material").unwrap(),
+            Some(Value::I64(0))
+        );
+        assert_eq!(w.chunks_read_from_disk(), 1);
     }
 
     #[test]

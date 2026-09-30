@@ -35,6 +35,8 @@ pub struct Config {
     pub world_dim: Option<u32>,
     #[serde(default)]
     pub max_concurrent_disk_ops: Option<usize>,
+    #[serde(default)]
+    pub max_cached_chunks: Option<usize>,
     pub admin_password: String,
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -128,6 +130,7 @@ mod tests {
             axes = 4
             world_dim = 500
             max_concurrent_disk_ops = 16
+            max_cached_chunks = 5000
             admin_password = "secret"
 
             [[users]]
@@ -145,6 +148,7 @@ mod tests {
         assert_eq!(config.axes, Some(4));
         assert_eq!(config.world_dim, Some(500));
         assert_eq!(config.max_concurrent_disk_ops, Some(16));
+        assert_eq!(config.max_cached_chunks, Some(5000));
         assert_eq!(config.users.len(), 2);
     }
 

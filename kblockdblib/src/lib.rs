@@ -9,7 +9,7 @@
 //! specific (e.g. `kblockdblib::chunk::CHUNK_DIM`).
 
 pub mod chunk;
-mod chunk_locks;
+mod chunk_cache;
 pub mod coord;
 pub mod logger;
 pub mod params;
@@ -21,4 +21,7 @@ pub mod world;
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use value::{Value, ValueType};
-pub use world::{Region, Stats, World, AXES, DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM};
+pub use world::{
+    Region, Stats, World, AXES, DEFAULT_MAX_CACHED_CHUNKS, DEFAULT_MAX_CONCURRENT_DISK_OPS,
+    WORLD_DIM,
+};
