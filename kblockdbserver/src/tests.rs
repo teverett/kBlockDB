@@ -750,7 +750,7 @@ async fn rows_lists_a_set_cell_with_its_metadata() {
 #[tokio::test]
 async fn rows_are_sorted_ascending_by_coordinate() {
     let (app, _dir) = test_app();
-    for coords in ["50,0,0", "1,2,3", "0,0,0"] {
+    for coords in ["40,0,0", "1,2,3", "-10,0,0", "0,0,0"] {
         send(
             app.clone(),
             put(
@@ -771,7 +771,12 @@ async fn rows_are_sorted_ascending_by_coordinate() {
         .collect();
     assert_eq!(
         coords,
-        vec![json!([0, 0, 0]), json!([1, 2, 3]), json!([50, 0, 0]),]
+        vec![
+            json!([-10, 0, 0]),
+            json!([0, 0, 0]),
+            json!([1, 2, 3]),
+            json!([40, 0, 0]),
+        ]
     );
 }
 
@@ -969,7 +974,7 @@ async fn select_where_filters_by_value() {
 #[tokio::test]
 async fn select_where_filters_by_axis_coordinate() {
     let (app, _dir) = test_app();
-    for coords in ["1,1,1", "50,50,50"] {
+    for coords in ["1,1,1", "40,40,40"] {
         send(
             app.clone(),
             put(
@@ -982,13 +987,13 @@ async fn select_where_filters_by_axis_coordinate() {
 
     let (_, body) = send(app, post("/rest/query", query("SELECT * WHERE x0 >= 10"))).await;
     assert_eq!(body["total_rows"], 1);
-    assert_eq!(body["rows"][0]["coord"], json!([50, 50, 50]));
+    assert_eq!(body["rows"][0]["coord"], json!([40, 40, 40]));
 }
 
 #[tokio::test]
 async fn select_from_range_scopes_to_the_box() {
     let (app, _dir) = test_app();
-    for coords in ["1,1,1", "50,50,50"] {
+    for coords in ["1,1,1", "40,40,40"] {
         send(
             app.clone(),
             put(
@@ -1028,7 +1033,7 @@ async fn a_range_with_the_wrong_axis_count_is_400() {
 }
 
 #[tokio::test]
-async fn set_writes_the_given_keys_to_every_matching_cell() {
+async fn update_writes_the_given_keys_to_every_matching_cell() {
     let (app, _dir) = test_app();
     for coords in ["1,1,1", "2,2,2"] {
         send(
@@ -1045,7 +1050,7 @@ async fn set_writes_the_given_keys_to_every_matching_cell() {
         app.clone(),
         post(
             "/rest/query",
-            query("SET (material='stone', hardness=7) WHERE k = 1"),
+            query("UPDATE (material='stone', hardness=7) WHERE k = 1"),
         ),
     )
     .await;
@@ -1057,15 +1062,135 @@ async fn set_writes_the_given_keys_to_every_matching_cell() {
 }
 
 #[tokio::test]
+async fn update_never_creates_a_cell_that_does_not_already_exist() {
+    // Regression: UPDATE is the old SET behavior -- it must only ever
+    // touch cells World::list_cells already reports, never bring a new
+    // one into existence the way SET (upsert) now can.
+    let (app, _dir) = test_app();
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/query",
+            query("UPDATE (material='stone') IN (0,0,0) TO (10,10,10)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 0);
+
+    let (status, _) = send(app, get("/rest/cells/1,1,1/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn a_read_only_account_cannot_set() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/query", query("SET (k = 1)")),
+        post("/rest/query", query("SET (k = 1) IN (0,0,0) TO (1,1,1)")),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
     let (status, _) = send(app, req).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn a_read_only_account_cannot_update() {
+    let (app, _dir) = test_app();
+    let req = with_auth(
+        post("/rest/query", query("UPDATE (k = 1)")),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn set_without_a_range_is_400() {
+    // SET is an upsert -- unlike UPDATE, it requires IN <range> (see
+    // query.rs's doc comment), so omitting it is a parse error, not a
+    // request that silently does nothing.
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, post("/rest/query", query("SET (k = 1)"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn set_upserts_every_cell_in_range_when_there_is_no_where_clause() {
+    let (app, _dir) = test_app();
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/query",
+            query("SET (material='stone') IN (0,0,0) TO (2,2,1)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 4); // 2x2x1 box
+
+    for coords in ["0,0,0", "1,0,0", "0,1,0", "1,1,0"] {
+        let (_, cell) = send(app.clone(), get(&format!("/rest/cells/{coords}/material"))).await;
+        assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
+    }
+}
+
+#[tokio::test]
+async fn set_with_an_axis_where_clause_only_upserts_matching_coordinates() {
+    let (app, _dir) = test_app();
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/query",
+            query("SET (material='stone') WHERE x0 >= 1 IN (0,0,0) TO (2,1,1)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 1);
+
+    let (status, _) = send(app.clone(), get("/rest/cells/0,0,0/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (_, cell) = send(app, get("/rest/cells/1,0,0/material")).await;
+    assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
+}
+
+#[tokio::test]
+async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
+    // A key-based WHERE can never match a cell that doesn't exist yet (same
+    // "missing key never matches" rule eval uses everywhere else), so this
+    // behaves like UPDATE even though it's SET -- see query.rs's doc
+    // comment on why that's the intended, not a surprising, outcome.
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/0,0,0/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/query",
+            query("SET (hardness=7) WHERE material = 'stone' IN (0,0,0) TO (2,2,2)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 1);
+
+    let (_, cell) = send(app.clone(), get("/rest/cells/0,0,0/hardness")).await;
+    assert_eq!(cell["value"], json!({"type": "i64", "value": 7}));
+    // Never-populated neighbor cells in the range must not have been
+    // created just because they were in bounds.
+    let (status, _) = send(app, get("/rest/cells/1,1,1/hardness")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]

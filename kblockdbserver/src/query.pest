@@ -19,6 +19,7 @@ WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 // code explicitly skips `Rule::kw_*` pairs to account for that.
 kw_select = @{ ^"SELECT" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_set    = @{ ^"SET"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_update = @{ ^"UPDATE" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_delete = @{ ^"DELETE" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_from   = @{ ^"FROM"   ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_where  = @{ ^"WHERE"  ~ !(ASCII_ALPHANUMERIC | "_") }
@@ -28,10 +29,17 @@ kw_and    = @{ ^"AND"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_or     = @{ ^"OR"     ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not    = @{ ^"NOT"    ~ !(ASCII_ALPHANUMERIC | "_") }
 
-statement = { SOI ~ (select_stmt | set_stmt | delete_stmt) ~ EOI }
+statement = { SOI ~ (select_stmt | set_stmt | update_stmt | delete_stmt) ~ EOI }
 
 select_stmt = { kw_select ~ columns ~ (kw_from ~ range)? ~ (kw_where ~ expr)? }
-set_stmt    = { kw_set ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
+// SET is an upsert over `IN <range>` -- unlike UPDATE, it can create cells
+// that don't exist yet, so a range is mandatory: "upsert everywhere" isn't
+// a meaningful request. See query.rs's doc comment.
+set_stmt    = { kw_set ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ kw_in ~ range }
+// UPDATE only ever touches cells that already exist (it's built on
+// World::list_cells, same as SELECT/DELETE) -- its range is optional, same
+// as DELETE's.
+update_stmt = { kw_update ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
 delete_stmt = { kw_delete ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
 
 columns     = { "*" | column_list }
@@ -41,9 +49,11 @@ assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment      = { ident ~ "=" ~ literal }
 
 // An axis-aligned box: `from` inclusive, `to` exclusive on every axis (same
-// convention as kblockdblib::Region -- see query.rs's `Range`).
+// convention as kblockdblib::Region -- see query.rs's `Range`). Each
+// component is a signed `int` (see below), not just digits, since a range
+// can sit anywhere in a world's now zero-centered coordinate space.
 range = { point ~ kw_to ~ point }
-point = { "(" ~ uint ~ ("," ~ uint)* ~ ")" }
+point = { "(" ~ int ~ ("," ~ int)* ~ ")" }
 
 expr      = { or_expr }
 or_expr   = { and_expr ~ (kw_or ~ and_expr)* }
@@ -63,6 +73,5 @@ literal = { string | float | int }
 string  = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
 float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 int     = @{ "-"? ~ ASCII_DIGIT+ }
-uint    = @{ ASCII_DIGIT+ }
 
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

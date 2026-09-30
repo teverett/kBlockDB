@@ -80,7 +80,7 @@ struct KeyEntry {
 
 #[derive(Serialize)]
 struct RowEntry {
-    coord: Vec<u32>,
+    coord: Vec<i32>,
     key_count: usize,
     /// The earliest `created_at_ms` among this cell's keys -- when this
     /// cell was first touched at all.
@@ -151,7 +151,7 @@ fn cell_matches(cell: &CellEntry, search: &str) -> bool {
     let coord_str = cell
         .coord
         .iter()
-        .map(u32::to_string)
+        .map(i32::to_string)
         .collect::<Vec<_>>()
         .join(",");
     if coord_str.contains(search) {
@@ -198,7 +198,7 @@ mod tests {
     use super::*;
     use kblockdblib::CellMeta;
 
-    fn cell(coord: &[u32], values: Vec<(&str, Value)>) -> CellEntry {
+    fn cell(coord: &[i32], values: Vec<(&str, Value)>) -> CellEntry {
         CellEntry {
             coord: coord.into(),
             values: values
@@ -223,6 +223,14 @@ mod tests {
         let c = cell(&[1, 2, 3], vec![("k", Value::I64(1))]);
         assert!(cell_matches(&c, "1,2,3"));
         assert!(cell_matches(&c, "2,3"));
+        assert!(!cell_matches(&c, "9,9,9"));
+    }
+
+    #[test]
+    fn cell_matches_by_negative_coordinate_substring() {
+        let c = cell(&[-1, 2, -3], vec![("k", Value::I64(1))]);
+        assert!(cell_matches(&c, "-1,2,-3"));
+        assert!(cell_matches(&c, "-3"));
         assert!(!cell_matches(&c, "9,9,9"));
     }
 

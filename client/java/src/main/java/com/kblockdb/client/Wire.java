@@ -138,7 +138,16 @@ final class Wire {
         out.write(bytes);
     }
 
-    /** {@code <coord>}: {@code [u8 axes][axes * u32 LE]}. */
+    /**
+     * {@code <coord>}: {@code [u8 axes][axes * i32 LE]} -- signed, since
+     * kBlockDB's coordinate space is zero-centered (see
+     * {@code kblockdblib::World}'s doc comment on its axis bounds).
+     * {@link #writeU32} is reused here rather than duplicated: Java widens
+     * {@code int} to {@code long} by sign-extension, but {@code writeU32}
+     * only ever reads the bottom 32 bits back out, so it already emits the
+     * correct little-endian two's-complement bytes for a negative {@code
+     * c} with no change needed.
+     */
     private static void writeCoord(OutputStream out, int[] coord) throws IOException {
         if (coord.length > 0xFF) {
             throw new IllegalArgumentException(
@@ -146,9 +155,6 @@ final class Wire {
         }
         out.write(coord.length);
         for (int c : coord) {
-            if (c < 0) {
-                throw new IllegalArgumentException("coordinate component " + c + " is negative");
-            }
             writeU32(out, c);
         }
     }

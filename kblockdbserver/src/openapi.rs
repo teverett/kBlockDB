@@ -54,7 +54,7 @@ use utoipa::{Modify, OpenApi};
         (name = "stats", description = "On-disk statistics for the world's data"),
         (name = "cells", description = "Single-cell reads and writes"),
         (name = "regions", description = "Axis-aligned box-of-cells reads and writes"),
-        (name = "query", description = "The SELECT/SET/DELETE query language -- see the README"),
+        (name = "query", description = "The SELECT/SET/UPDATE/DELETE query language -- see the README"),
     ),
     modifiers(&SecurityAddon),
 )]

@@ -223,6 +223,41 @@ fn set_then_get_then_remove_round_trips_through_a_real_server() {
 }
 
 #[test]
+fn negative_coordinates_round_trip_through_a_real_server() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("negative-coords") else {
+        return;
+    };
+
+    let set = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["set", "-1,-2,-3", "material", "str", "stone"],
+    );
+    assert!(set.status.success(), "set failed: {}", stderr(&set));
+
+    let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "-1,-2,-3", "material"]);
+    assert!(get.status.success(), "get failed: {}", stderr(&get));
+    assert!(
+        stdout(&get).starts_with("str stone (created="),
+        "unexpected get output: {}",
+        stdout(&get)
+    );
+
+    let remove = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["remove", "-1,-2,-3", "material"],
+    );
+    assert!(
+        remove.status.success(),
+        "remove failed: {}",
+        stderr(&remove)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn get_reports_an_incrementing_version_after_repeated_sets() {
     let Some((server, dir, kblockdbcli_bin)) = test_fixture("version-increment") else {
         return;
@@ -392,6 +427,53 @@ fn query_select_set_delete_round_trip_through_a_real_server() {
         "expected a 404 in stderr, got: {}",
         stderr(&get_after_delete)
     );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn set_upserts_a_cell_that_did_not_exist_before() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("query-set-upsert") else {
+        return;
+    };
+
+    // No `set` beforehand -- SET is an upsert, so it must create this cell
+    // on its own, unlike UPDATE.
+    let set_query = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["query", "SET (material='stone') IN (1,2,3) TO (2,3,4)"],
+    );
+    assert!(
+        set_query.status.success(),
+        "set query failed: {}",
+        stderr(&set_query)
+    );
+    assert_eq!(stdout(&set_query), "1 cell(s) affected");
+
+    let get = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
+    assert!(get.status.success(), "get failed: {}", stderr(&get));
+    assert!(stdout(&get).starts_with("str stone (created="));
+
+    // UPDATE, by contrast, must never create a cell.
+    let update_query = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &[
+            "query",
+            "UPDATE (material='stone') IN (9,9,9) TO (10,10,10)",
+        ],
+    );
+    assert!(
+        update_query.status.success(),
+        "update query failed: {}",
+        stderr(&update_query)
+    );
+    assert_eq!(stdout(&update_query), "0 cell(s) affected");
+
+    let get_never_created =
+        run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "9,9,9", "material"]);
+    assert!(!get_never_created.status.success());
 
     let _ = std::fs::remove_dir_all(&dir);
 }

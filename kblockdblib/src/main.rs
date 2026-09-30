@@ -35,6 +35,15 @@ fn pow_axes_display(base: u32, axes: usize) -> String {
     }
 }
 
+/// Shifts a `0..world_dim` scatter value into this world's valid,
+/// zero-centered coordinate range (half of `world_dim` lands negative, the
+/// rest at or above zero -- see `World`'s doc comment on its coordinate
+/// bounds), so this demo's scatter still spreads across the whole world
+/// now that `0..world_dim` on its own is no longer a valid range.
+fn to_world_coord(raw: u32, world_dim: u32) -> i32 {
+    (raw as i64 - (world_dim / 2) as i64) as i32
+}
+
 fn run() -> io::Result<()> {
     let root = std::env::args()
         .nth(1)
@@ -87,7 +96,7 @@ fn run() -> io::Result<()> {
     let n = 5_000u32;
     for i in 0..n {
         let coord: Coord = (0..axes)
-            .map(|a| i.wrapping_mul(axis_multiplier(a)) % world_dim)
+            .map(|a| to_world_coord(i.wrapping_mul(axis_multiplier(a)) % world_dim, world_dim))
             .collect();
 
         w.set(
@@ -135,7 +144,9 @@ fn run() -> io::Result<()> {
     w.flush()?;
 
     // The i=1 case of the scatter loop above.
-    let sample: Coord = (0..axes).map(|a| axis_multiplier(a) % world_dim).collect();
+    let sample: Coord = (0..axes)
+        .map(|a| to_world_coord(axis_multiplier(a) % world_dim, world_dim))
+        .collect();
 
     // Demonstrate removal: this cell had a "temperature" key set in the loop
     // above; clear it so the sample read below shows it as <not set>.
@@ -169,8 +180,8 @@ fn run() -> io::Result<()> {
     // set_region takes one value per cell (not a single fill value), so a
     // vein can vary cell-to-cell in one call: every 4th cell is "ore", the
     // rest are "stone".
-    let r = w.chunk_dim() - 3;
-    let d = 8;
+    let r = (w.chunk_dim() - 3) as i32;
+    let d = 8i32;
     let region = world::Region::new(vec![r; axes], vec![d; axes]);
     let vein_values: Vec<Value> = (0..region.volume())
         .map(|i| {

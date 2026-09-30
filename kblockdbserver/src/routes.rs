@@ -34,7 +34,7 @@
 //! doesn't use `require_auth`: that middleware's `read_only` check is
 //! purely a function of HTTP method (`GET` = read, anything else = write),
 //! but one `POST /rest/query` can be *either* depending on the query text
-//! itself (`SELECT` vs `SET`/`DELETE` -- see `query.rs`'s
+//! itself (`SELECT` vs `SET`/`UPDATE`/`DELETE` -- see `query.rs`'s
 //! `Statement::is_write`). `run_query` authenticates the same way
 //! `require_auth` does (`auth::account_from_headers`) and only then checks
 //! `read_only` against the parsed statement, not the HTTP method.
@@ -54,6 +54,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -184,7 +185,7 @@ pub struct CellResponse {
     path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
-        ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
+        ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to read"),
     ),
     responses(
@@ -222,7 +223,7 @@ async fn get_cell(
     path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
-        ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
+        ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to write"),
     ),
     request_body = ValueJson,
@@ -252,7 +253,7 @@ async fn set_cell(
     path = "/rest/cells/{coords}/{key}",
     tag = "cells",
     params(
-        ("coords" = String, Path, description = "Comma-separated coordinate, one u32 per axis (e.g. `1,2,3`)"),
+        ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to clear"),
     ),
     responses(
@@ -285,8 +286,8 @@ pub struct RegionValuesResponse {
     path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
-        ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),
-        ("extent" = String, Path, description = "Comma-separated region extent, one u32 per axis"),
+        ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
+        ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to read"),
     ),
     responses(
@@ -325,8 +326,8 @@ pub struct SetRegionBody {
     path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
-        ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),
-        ("extent" = String, Path, description = "Comma-separated region extent, one u32 per axis"),
+        ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
+        ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to write"),
     ),
     request_body = SetRegionBody,
@@ -358,8 +359,8 @@ async fn set_region(
     path = "/rest/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
-        ("origin" = String, Path, description = "Comma-separated region origin, one u32 per axis"),
-        ("extent" = String, Path, description = "Comma-separated region extent, one u32 per axis"),
+        ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
+        ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to clear"),
     ),
     responses(
@@ -387,7 +388,7 @@ async fn remove_region(
 pub struct QueryRequest {
     /// e.g. `SELECT material, density WHERE x0 >= 10 AND x0 < 20` -- see
     /// the README's "Query language" section for the full grammar and
-    /// more examples (`SET`/`DELETE`, ranges, `AND`/`OR`/`NOT`).
+    /// more examples (`SET`/`UPDATE`/`DELETE`, ranges, `AND`/`OR`/`NOT`).
     query: String,
 }
 
@@ -399,11 +400,11 @@ pub struct QueryKeyValue {
 
 #[derive(Serialize, ToSchema)]
 pub struct QueryRow {
-    coord: Vec<u32>,
+    coord: Vec<i32>,
     values: Vec<QueryKeyValue>,
 }
 
-/// `SELECT` populates `total_rows`/`rows`; `SET`/`DELETE` populate
+/// `SELECT` populates `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE` populate
 /// `affected_cells` instead -- one statement, one endpoint, but a
 /// different result shape depending on which kind was sent (fields the
 /// statement kind doesn't produce are omitted, not null).
@@ -441,10 +442,10 @@ impl QueryResponse {
     tag = "query",
     request_body = QueryRequest,
     responses(
-        (status = 200, description = "SELECT: the matching rows. SET/DELETE: how many cells were affected", body = QueryResponse),
+        (status = 200, description = "SELECT: the matching rows. SET/UPDATE/DELETE: how many cells were affected", body = QueryResponse),
         (status = 400, description = "Malformed query, or a range whose axis count doesn't match the world's", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
-        (status = 403, description = "A read-only account attempted a SET or DELETE", body = ErrorBody),
+        (status = 403, description = "A read-only account attempted a SET, UPDATE, or DELETE", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
@@ -495,6 +496,11 @@ async fn execute_query(
             assignments,
             where_clause,
             range,
+        } => execute_set(state, assignments, where_clause, range).await,
+        query::Statement::Update {
+            assignments,
+            where_clause,
+            range,
         } => {
             let cells = state.with_world(kblockdblib::World::list_cells).await?;
             // Snapshotted here, then mutated in a second `with_world` call
@@ -503,7 +509,7 @@ async fn execute_query(
             // mutate race), same honest caveat as any bulk operation built
             // on a point-in-time `list_cells` scan rather than a
             // world-wide lock.
-            let matching: Vec<Vec<u32>> = cells
+            let matching: Vec<Vec<i32>> = cells
                 .iter()
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
                 .map(|c| c.coord.to_vec())
@@ -526,7 +532,7 @@ async fn execute_query(
             range,
         } => {
             let cells = state.with_world(kblockdblib::World::list_cells).await?;
-            let matching: Vec<(Vec<u32>, Vec<String>)> = cells
+            let matching: Vec<(Vec<i32>, Vec<String>)> = cells
                 .iter()
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
                 .map(|c| {
@@ -552,16 +558,107 @@ async fn execute_query(
     }
 }
 
+/// `SET`'s upsert: every coordinate in `range` (mandatory -- see
+/// `query.rs`'s doc comment) satisfying `where_clause` gets `assignments`
+/// written, whether or not a cell already existed there.
+///
+/// Two paths, chosen for cost, not just convenience:
+/// - **No `WHERE`**: every coordinate in `range` matches unconditionally,
+///   so this is exactly `World::set_region` once per assignment -- the
+///   same primitive the `/rest/regions` endpoints use, and just as
+///   efficient (no per-coordinate work in this handler at all).
+/// - **With a `WHERE`**: which coordinates match can depend on a cell's
+///   *existing* values, so each candidate coordinate needs to be checked
+///   individually against either its existing `CellEntry` (if any) or a
+///   synthetic empty one (if not -- under the same "a missing key never
+///   matches" rule `query::eval` already applies everywhere else, so a
+///   key-based `WHERE` naturally excludes not-yet-existing cells from
+///   being created; only an axis-based or `WHERE`-less `SET` can actually
+///   upsert).
+///
+/// Either way, not atomic with respect to a concurrent writer touching the
+/// same range in between the read (existing cells, `WHERE` path only) and
+/// the write -- same honest caveat as `UPDATE`/`DELETE`'s own
+/// snapshot-then-mutate approach.
+async fn execute_set(
+    state: &AppState,
+    assignments: Vec<(String, query::Literal)>,
+    where_clause: Option<query::Expr>,
+    range: query::Range,
+) -> Result<QueryResponse, ApiError> {
+    let region = range_to_region(&range);
+
+    let Some(expr) = where_clause else {
+        let volume = region.volume() as usize;
+        let values: Vec<(String, kblockdblib::Value)> = assignments
+            .into_iter()
+            .map(|(key, literal)| (key, literal.to_value()))
+            .collect();
+        state
+            .with_world(move |w| {
+                for (key, value) in &values {
+                    w.set_region(&region, key, &vec![value.clone(); volume])?;
+                }
+                Ok(())
+            })
+            .await?;
+        return Ok(QueryResponse::affected(volume));
+    };
+
+    let cells = state.with_world(kblockdblib::World::list_cells).await?;
+    let existing: HashMap<Vec<i32>, &kblockdblib::CellEntry> =
+        cells.iter().map(|c| (c.coord.to_vec(), c)).collect();
+
+    let targets: Vec<Vec<i32>> = region
+        .iter()
+        .map(|c| c.to_vec())
+        .filter(|coord| match existing.get(coord) {
+            Some(cell) => query::eval(&expr, cell),
+            None => {
+                let synthetic = kblockdblib::CellEntry {
+                    coord: coord.as_slice().into(),
+                    values: Vec::new(),
+                };
+                query::eval(&expr, &synthetic)
+            }
+        })
+        .collect();
+
+    let affected = targets.len();
+    state
+        .with_world(move |w| {
+            for coord in &targets {
+                for (key, literal) in &assignments {
+                    w.set(coord, key, literal.to_value())?;
+                }
+            }
+            Ok(())
+        })
+        .await?;
+    Ok(QueryResponse::affected(affected))
+}
+
+fn range_to_region(range: &query::Range) -> kblockdblib::Region {
+    let extent: Vec<i32> = range
+        .to
+        .iter()
+        .zip(&range.from)
+        .map(|(&to, &from)| to - from)
+        .collect();
+    kblockdblib::Region::new(range.from.clone(), extent)
+}
+
 /// A query's optional `FROM`/`IN` range must name exactly as many axes as
 /// the target world has -- `query.rs` itself can't check this (it has no
 /// `World` to check against), so `execute_query` does, before running
 /// anything, the same "reject up front, don't touch any data" policy
 /// `check_region` (used by the region endpoints above) follows.
 fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError> {
-    let range = match stmt {
+    let range: Option<&query::Range> = match stmt {
         query::Statement::Select { range, .. }
-        | query::Statement::Set { range, .. }
-        | query::Statement::Delete { range, .. } => range,
+        | query::Statement::Update { range, .. }
+        | query::Statement::Delete { range, .. } => range.as_ref(),
+        query::Statement::Set { range, .. } => Some(range),
     };
     match range {
         Some(r) if r.from.len() != axes => Err(ApiError::BadRequest(format!(

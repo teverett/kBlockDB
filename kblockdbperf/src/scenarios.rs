@@ -34,14 +34,20 @@ fn axis_multiplier(axis: usize) -> u64 {
         .unwrap_or_else(|| 1_000_003u64.wrapping_mul(axis as u64 + 1) | 1)
 }
 
-/// Spreads `seed` into an `axes`-long coordinate within `[0, world_dim)`.
-/// `salt` decorrelates different scenarios'/reps' coordinate sets from
-/// each other so they don't all hammer the exact same cells by accident.
-fn spread_coord(axes: usize, world_dim: u32, seed: u64, salt: u64) -> Vec<u32> {
+/// Spreads `seed` into an `axes`-long coordinate within this world's
+/// zero-centered `[-world_dim/2, world_dim/2)` range (see
+/// `kblockdblib::World`'s doc comment on its axis bounds). `salt`
+/// decorrelates different scenarios'/reps' coordinate sets from each other
+/// so they don't all hammer the exact same cells by accident.
+fn spread_coord(axes: usize, world_dim: u32, seed: u64, salt: u64) -> Vec<i32> {
     let seed = seed.wrapping_add(salt.wrapping_mul(0x9E37_79B9_7F4A_7C15));
-    let world_dim = world_dim.max(1) as u64;
+    let modulus = world_dim.max(1) as u64;
+    let half = (world_dim / 2) as i64;
     (0..axes)
-        .map(|a| (seed.wrapping_mul(axis_multiplier(a)) % world_dim) as u32)
+        .map(|a| {
+            let raw = seed.wrapping_mul(axis_multiplier(a)) % modulus;
+            (raw as i64 - half) as i32
+        })
         .collect()
 }
 
@@ -242,11 +248,11 @@ pub async fn region_sweep(
     reps: usize,
 ) -> Vec<ScenarioResult> {
     let mut results = Vec::new();
-    let origin = vec![0u32; axes];
+    let origin = vec![0i32; axes];
 
     for &edge in edges {
-        let extent = vec![edge; axes];
-        let volume = extent.iter().map(|&e| u64::from(e)).product::<u64>() as usize;
+        let extent = vec![edge as i32; axes];
+        let volume = (0..axes).map(|_| u64::from(edge)).product::<u64>() as usize;
         let values: Vec<i64> = (0..volume as i64).collect();
 
         let mut set_samples = Vec::with_capacity(reps);
@@ -335,7 +341,7 @@ pub async fn contended_cell(
     levels: &[usize],
     ops_per_client: usize,
 ) -> Vec<ScenarioResult> {
-    let coord: Vec<u32> = vec![1; axes];
+    let coord: Vec<i32> = vec![1; axes];
     let mut results = Vec::new();
     for &level in levels {
         let client = client.clone();
@@ -376,7 +382,7 @@ mod tests {
             for seed in 0..50u64 {
                 let c = spread_coord(axes, 1000, seed, 7);
                 assert_eq!(c.len(), axes);
-                assert!(c.iter().all(|&x| x < 1000));
+                assert!(c.iter().all(|&x| (-500..500).contains(&x)));
             }
         }
     }

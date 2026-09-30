@@ -40,10 +40,11 @@
 //! 0x03 Remove: <coord> <key>
 //! ```
 //!
-//! `<coord>` is `[u8 axes][axes * u32 LE]`; `<key>` is `[u16 LE key_len][key
-//! bytes]`; `<value>` is `[u8 type_tag]` (see [`kblockdblib::Value`]'s
-//! `TAG_*` constants) followed by `[8 bytes LE]` for F64/I64 or `[u32 LE
-//! len][len bytes]` for Str.
+//! `<coord>` is `[u8 axes][axes * i32 LE]` (signed -- kBlockDB's coordinate
+//! space is zero-centered, see `kblockdblib::World`'s doc comment on its
+//! axis bounds); `<key>` is `[u16 LE key_len][key bytes]`; `<value>` is
+//! `[u8 type_tag]` (see [`kblockdblib::Value`]'s `TAG_*` constants) followed
+//! by `[8 bytes LE]` for F64/I64 or `[u32 LE len][len bytes]` for Str.
 //!
 //! **Responses** (server -> client), as `payload`. Every status has one
 //! fixed shape regardless of which request it's answering -- the client
@@ -93,16 +94,16 @@ pub enum Request {
         password: String,
     },
     Get {
-        coord: Vec<u32>,
+        coord: Vec<i32>,
         key: String,
     },
     Set {
-        coord: Vec<u32>,
+        coord: Vec<i32>,
         key: String,
         value: Value,
     },
     Remove {
-        coord: Vec<u32>,
+        coord: Vec<i32>,
         key: String,
     },
 }
@@ -249,7 +250,7 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
 }
 
 #[allow(dead_code)] // client-side only, see encode_request above
-fn put_coord(buf: &mut Vec<u8>, coord: &[u32]) {
+fn put_coord(buf: &mut Vec<u8>, coord: &[i32]) {
     buf.push(coord.len() as u8);
     for &c in coord {
         buf.extend_from_slice(&c.to_le_bytes());
@@ -336,6 +337,10 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
     }
 
+    fn i32(&mut self) -> Result<i32, DecodeError> {
+        Ok(i32::from_le_bytes(self.bytes(4)?.try_into().unwrap()))
+    }
+
     fn f64(&mut self) -> Result<f64, DecodeError> {
         Ok(f64::from_le_bytes(self.bytes(8)?.try_into().unwrap()))
     }
@@ -367,9 +372,9 @@ impl<'a> Reader<'a> {
         self.key() // identical shape -- u16 len prefix, utf8 bytes
     }
 
-    fn coord(&mut self) -> Result<Vec<u32>, DecodeError> {
+    fn coord(&mut self) -> Result<Vec<i32>, DecodeError> {
         let axes = self.u8()? as usize;
-        (0..axes).map(|_| self.u32()).collect()
+        (0..axes).map(|_| self.i32()).collect()
     }
 
     fn value(&mut self) -> Result<Value, DecodeError> {
@@ -560,6 +565,19 @@ mod tests {
     }
 
     #[test]
+    fn negative_coordinates_round_trip() {
+        roundtrip_request(Request::Get {
+            coord: vec![-1, -2, -3],
+            key: "material".into(),
+        });
+        roundtrip_request(Request::Set {
+            coord: vec![i32::MIN, i32::MAX, 0],
+            key: "k".into(),
+            value: Value::I64(1),
+        });
+    }
+
+    #[test]
     fn hello_ok_response_round_trips() {
         roundtrip_response(Response::HelloOk {
             axes: 3,
@@ -619,7 +637,7 @@ mod tests {
     fn decode_rejects_a_truncated_frame() {
         // A Get opcode promising a coordinate, but with nothing after it.
         assert_eq!(decode_request(&[0x01]), Err(DecodeError::UnexpectedEof));
-        // Cut off partway through a u32 coordinate component.
+        // Cut off partway through an i32 coordinate component.
         assert_eq!(
             decode_request(&[0x01, 0x01, 0x00, 0x00]),
             Err(DecodeError::UnexpectedEof)

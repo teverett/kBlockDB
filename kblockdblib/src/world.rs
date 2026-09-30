@@ -123,12 +123,29 @@ impl Region {
         }
     }
 
+    /// A negative extent component (meaningless as a size) contributes 0
+    /// rather than panicking or wrapping -- same "don't validate in a plain
+    /// data holder" stance as `Region::new`'s doc comment; `World::check_region`
+    /// is what actually rejects a negative extent as an error.
     pub fn volume(&self) -> u64 {
-        self.extent.iter().map(|&d| u64::from(d)).product()
+        self.extent.iter().map(|&d| d.max(0) as u64).product()
     }
 
     fn axes(&self) -> usize {
         self.origin.len()
+    }
+
+    /// Every coordinate inside this region, axis 0 fastest and the last
+    /// axis slowest -- same order `get_region`'s result and `set_region`'s
+    /// expected `values` use (see `RegionIter`). An empty (any zero-or-
+    /// negative-extent axis) region yields nothing. Exposed so callers that
+    /// need to enumerate a region's coordinates one at a time (rather than
+    /// go through `get_region`/`set_region`/`remove_region`) -- e.g.
+    /// `kblockdbserver`'s query language, upserting a `WHERE`-filtered
+    /// subset of a range -- don't have to reimplement this odometer logic
+    /// themselves.
+    pub fn iter(&self) -> impl Iterator<Item = Coord> {
+        RegionIter::new(self)
     }
 }
 
@@ -509,8 +526,30 @@ impl World {
         self.chunk_dim
     }
 
+    /// This world's valid coordinate range per axis, `[low, high)` --
+    /// `world_dim` cells wide, centered on zero (half below, half at or
+    /// above it; an odd `world_dim` puts the extra cell on the positive
+    /// side). Computed in `i64` so this can't overflow `i32` even at
+    /// extreme `world_dim` values, even though every coordinate that
+    /// actually falls in this range fits in `i32`.
+    fn axis_bounds(&self) -> (i64, i64) {
+        let low = -((self.world_dim / 2) as i64);
+        (low, low + self.world_dim as i64)
+    }
+
+    /// Distinct chunk-key values a full axis spans, i.e. `chunks_per_axis()
+    /// ^ axes` chunk files at most (most are never written -- see `World`'s
+    /// "Layout on disk" doc comment). Since `axis_bounds()`'s low edge isn't
+    /// generally a multiple of `chunk_dim`, this is the exact inclusive
+    /// span of chunk-key buckets the valid range touches, not just
+    /// `world_dim.div_ceil(chunk_dim)` -- the two agree only when the low
+    /// edge happens to land on a chunk boundary (e.g. `world_dim` even and
+    /// a lower edge of exactly 0, as when `world_dim` was always the whole
+    /// range starting at zero).
     pub fn chunks_per_axis(&self) -> u32 {
-        self.world_dim.div_ceil(self.chunk_dim)
+        let (lo, hi) = self.axis_bounds();
+        let chunk_dim = self.chunk_dim as i64;
+        ((hi - 1).div_euclid(chunk_dim) - lo.div_euclid(chunk_dim) + 1) as u32
     }
 
     pub fn schema_len(&self) -> usize {
@@ -535,7 +574,7 @@ impl World {
     /// one key set), each with the full set of keys/values/metadata set
     /// there, sorted ascending by coordinate (axis 0 most significant --
     /// plain lexicographic order over the coordinate's components, same as
-    /// comparing two `Vec<u32>`s).
+    /// comparing two `Vec<i32>`s).
     ///
     /// A live filesystem walk plus a full decode of every chunk file --
     /// like `stats()`, but heavier, since this reads and decodes whole
@@ -592,7 +631,7 @@ impl World {
         p.join(format!("{}.chunk", ckey[self.axes - 1]))
     }
 
-    fn split(&self, coord: &[u32]) -> io::Result<(ChunkKey, usize)> {
+    fn split(&self, coord: &[i32]) -> io::Result<(ChunkKey, usize)> {
         if coord.len() != self.axes {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -603,21 +642,27 @@ impl World {
                 ),
             ));
         }
-        if let Some(&bad) = coord.iter().find(|&&c| c >= self.world_dim) {
+        let (lo, hi) = self.axis_bounds();
+        if let Some(&bad) = coord.iter().find(|&&c| (c as i64) < lo || (c as i64) >= hi) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                format!(
-                    "coordinate {coord:?} is out of range: {bad} >= world_dim {}",
-                    self.world_dim
-                ),
+                format!("coordinate {coord:?} is out of range: {bad} is not in [{lo}, {hi})"),
             ));
         }
+        // Floor (Euclidean) division/remainder, not Rust's default
+        // truncate-toward-zero `/`/`%` -- with a negative `c`, truncation
+        // would put e.g. -1 and chunk_dim-1's negation in inconsistent
+        // chunks and could yield a negative `local_idx`. `div_euclid`/
+        // `rem_euclid` keep chunk boundaries evenly spaced across zero and
+        // guarantee `local_idx`'s per-axis component always lands in
+        // `0..chunk_dim`.
+        let chunk_dim = self.chunk_dim as i32;
         let mut ckey: ChunkKey = Coord::zeros(self.axes);
         let mut local_idx = 0usize;
         let mut mult = 1usize;
         for (a, c) in coord.iter().enumerate() {
-            ckey[a] = c / self.chunk_dim;
-            local_idx += (c % self.chunk_dim) as usize * mult;
+            ckey[a] = c.div_euclid(chunk_dim);
+            local_idx += c.rem_euclid(chunk_dim) as usize * mult;
             mult *= self.chunk_dim as usize;
         }
         Ok((ckey, local_idx))
@@ -632,7 +677,7 @@ impl World {
         let chunk_dim = self.chunk_dim as usize;
         let mut coord = Coord::zeros(self.axes);
         for a in 0..self.axes {
-            coord[a] = ckey[a] * self.chunk_dim + (local_idx % chunk_dim) as u32;
+            coord[a] = ckey[a] * self.chunk_dim as i32 + (local_idx % chunk_dim) as i32;
             local_idx /= chunk_dim;
         }
         coord
@@ -750,7 +795,7 @@ impl World {
         Ok(())
     }
 
-    pub fn get(&self, coord: &[u32], key: &str) -> io::Result<Option<Value>> {
+    pub fn get(&self, coord: &[i32], key: &str) -> io::Result<Option<Value>> {
         // Validate the coordinate *before* consulting the schema: a
         // malformed/out-of-range coordinate must always be rejected the
         // same way, regardless of whether `key` happens to be known yet --
@@ -767,7 +812,7 @@ impl World {
     /// was last changed, and how many times it's been set since (see
     /// `CellMeta`'s doc comment) -- or `None` under exactly the same
     /// conditions `get` would return `None`.
-    pub fn get_meta(&self, coord: &[u32], key: &str) -> io::Result<Option<CellMeta>> {
+    pub fn get_meta(&self, coord: &[i32], key: &str) -> io::Result<Option<CellMeta>> {
         let (ckey, local_idx) = self.split(coord)?;
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(None);
@@ -780,7 +825,7 @@ impl World {
     /// so (unlike calling `get` and `get_meta` separately) a concurrent
     /// write to this exact cell/key can never land between them and pair
     /// one call's value with a *different* call's meta.
-    pub fn get_with_meta(&self, coord: &[u32], key: &str) -> io::Result<Option<(Value, CellMeta)>> {
+    pub fn get_with_meta(&self, coord: &[i32], key: &str) -> io::Result<Option<(Value, CellMeta)>> {
         let (ckey, local_idx) = self.split(coord)?;
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(None);
@@ -792,7 +837,7 @@ impl World {
         })
     }
 
-    pub fn set(&self, coord: &[u32], key: &str, value: Value) -> io::Result<()> {
+    pub fn set(&self, coord: &[i32], key: &str, value: Value) -> io::Result<()> {
         // Validate the coordinate before interning `key`: a failed `set`
         // shouldn't have the side effect of permanently registering a new
         // key that was never actually written anywhere.
@@ -805,7 +850,7 @@ impl World {
         self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value, now_ms))
     }
 
-    pub fn remove(&self, coord: &[u32], key: &str) -> io::Result<()> {
+    pub fn remove(&self, coord: &[i32], key: &str) -> io::Result<()> {
         // See `get`: validate the coordinate before the key-existence
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
@@ -827,8 +872,11 @@ impl World {
 
     /// Checks that `region`'s origin and extent both have this world's axis
     /// count -- *not* just that they match each other, since `Region::new`
-    /// itself doesn't enforce that (see its doc comment) -- and that it
-    /// fits inside the world without overflowing `u32` along the way.
+    /// itself doesn't enforce that (see its doc comment) -- that `extent`
+    /// has no negative component (meaningless as a size), and that it fits
+    /// inside the world's `axis_bounds()`. Widening to `i64` for the fit
+    /// check means this can't overflow `i32` along the way, unlike a plain
+    /// `origin + extent` in `i32`.
     fn check_region(&self, region: &Region) -> io::Result<()> {
         if region.origin.len() != self.axes || region.extent.len() != self.axes {
             return Err(io::Error::new(
@@ -842,8 +890,17 @@ impl World {
                 ),
             ));
         }
-        let in_range =
-            |lo: u32, len: u32| lo.checked_add(len).is_some_and(|hi| hi <= self.world_dim);
+        if let Some(&bad) = region.extent.iter().find(|&&len| len < 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("region {region:?} has a negative extent component ({bad})"),
+            ));
+        }
+        let (lo_bound, hi_bound) = self.axis_bounds();
+        let in_range = |lo: i32, len: i32| {
+            let lo = lo as i64;
+            lo >= lo_bound && lo + len as i64 <= hi_bound
+        };
         let fits = region
             .origin
             .iter()
@@ -855,7 +912,7 @@ impl World {
             Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!(
-                    "region {region:?} doesn't fit in a {}^{} world",
+                    "region {region:?} doesn't fit in a {}^{} world with range [{lo_bound}, {hi_bound})",
                     self.world_dim, self.axes
                 ),
             ))
@@ -1045,13 +1102,15 @@ fn accumulate_chunk_stats(dir: &Path, stats: &mut Stats) -> io::Result<()> {
 /// `prefix` holds the directory segments seen so far, pushed before
 /// recursing into a numeric subdirectory and popped after, so it's back to
 /// its caller's value once this returns. A directory or file name that
-/// doesn't parse as a `u32` (unexpected, but not this function's place to
+/// doesn't parse as an `i32` (a chunk key can be negative now -- see
+/// `World::split` -- so a leading `-` is expected, not unusual; anything
+/// else failing to parse is unexpected, but not this function's place to
 /// fail over) is silently skipped, same tolerance-for-surprises philosophy
 /// as `accumulate_chunk_stats`.
 fn collect_chunk_keys(
     dir: &Path,
     axes: usize,
-    prefix: &mut Vec<u32>,
+    prefix: &mut Vec<i32>,
     out: &mut Vec<Coord>,
 ) -> io::Result<()> {
     let entries = match fs::read_dir(dir) {
@@ -1071,7 +1130,7 @@ fn collect_chunk_keys(
             let Some(n) = path
                 .file_name()
                 .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u32>().ok())
+                .and_then(|s| s.parse::<i32>().ok())
             else {
                 continue;
             };
@@ -1086,7 +1145,7 @@ fn collect_chunk_keys(
         let Some(n) = path
             .file_stem()
             .and_then(|s| s.to_str())
-            .and_then(|s| s.parse::<u32>().ok())
+            .and_then(|s| s.parse::<i32>().ok())
         else {
             continue;
         };
@@ -1150,7 +1209,7 @@ mod tests {
         World::create(dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM).unwrap()
     }
 
-    fn coord3(x: u32, y: u32, z: u32) -> Coord {
+    fn coord3(x: i32, y: i32, z: i32) -> Coord {
         Coord::from([x, y, z])
     }
 
@@ -1236,8 +1295,11 @@ mod tests {
         let dir = TempDir::new("create-small-chunk-dim");
         let w = World::create(&dir, 3, 100, 4).unwrap();
         assert_eq!(w.chunk_dim(), 4);
-        // 100 cells per axis, 4 cells/chunk -> 25 chunks per axis exactly.
-        assert_eq!(w.chunks_per_axis(), 25);
+        // 100 cells per axis, centered on zero, is the range [-50, 50) --
+        // not a multiple of chunk_dim=4, so it spans 26 chunk-key buckets
+        // (-13..=12), not the 25 a naive 100/4 would suggest -- see
+        // `chunks_per_axis`'s doc comment.
+        assert_eq!(w.chunks_per_axis(), 26);
 
         w.set(&[0, 0, 0], "material", Value::Str("stone".into()))
             .unwrap();
@@ -1298,7 +1360,7 @@ mod tests {
         let w = create(&dir);
 
         assert_eq!(
-            w.get(&coord3(WORLD_DIM, 0, 0), "never-set")
+            w.get(&coord3(WORLD_DIM as i32, 0, 0), "never-set")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
@@ -1317,7 +1379,7 @@ mod tests {
         let w = create(&dir);
 
         assert_eq!(
-            w.remove(&coord3(WORLD_DIM, 0, 0), "never-set")
+            w.remove(&coord3(WORLD_DIM as i32, 0, 0), "never-set")
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidInput
@@ -1333,9 +1395,79 @@ mod tests {
         let dir = TempDir::new("set-no-intern-on-bad-coord");
         let w = create(&dir);
 
-        let err = w.set(&coord3(WORLD_DIM, 0, 0), "material", Value::I64(1));
+        let err = w.set(&coord3(WORLD_DIM as i32, 0, 0), "material", Value::I64(1));
         assert_eq!(err.unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert_eq!(w.schema_len(), 0, "key must not be interned on failure");
+    }
+
+    #[test]
+    fn negative_coordinates_round_trip_through_get_and_set() {
+        let dir = TempDir::new("negative-coords");
+        let w = create(&dir);
+        let c = coord3(-1, -2, -3);
+
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        // A different (positive) cell is untouched.
+        assert_eq!(w.get(&coord3(1, 2, 3), "material").unwrap(), None);
+    }
+
+    #[test]
+    fn coordinates_below_the_lower_bound_are_rejected() {
+        let dir = TempDir::new("negative-coords-oob");
+        let w = create(&dir); // WORLD_DIM=10_000 -> valid range is [-5000, 5000)
+
+        assert_eq!(
+            w.get(&coord3(-5_001, 0, 0), "material").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+        // Just inside the lower edge is fine.
+        assert_eq!(w.get(&coord3(-5_000, 0, 0), "material").unwrap(), None);
+    }
+
+    #[test]
+    fn chunk_splitting_is_consistent_across_the_zero_boundary() {
+        // Regression: Rust's `/`/`%` truncate toward zero for signed
+        // integers, which would put -1 and -32 in inconsistent chunks (or
+        // give a negative local index) -- World::split must use
+        // div_euclid/rem_euclid instead, so chunk boundaries stay evenly
+        // spaced across zero the same as everywhere else.
+        let dir = TempDir::new("chunk-split-zero");
+        let w = create(&dir); // DEFAULT_CHUNK_DIM = 32
+
+        // -32 and -1 land in the chunk just below zero; 0 and 31 land in
+        // the chunk at/above zero -- -1 and 0, one cell apart, are in
+        // different chunks.
+        w.set(&coord3(-1, 0, 0), "k", Value::I64(-1)).unwrap();
+        w.set(&coord3(0, 0, 0), "k", Value::I64(0)).unwrap();
+        w.set(&coord3(-32, 0, 0), "k", Value::I64(-32)).unwrap();
+        w.set(&coord3(31, 0, 0), "k", Value::I64(31)).unwrap();
+
+        assert_eq!(w.get(&coord3(-1, 0, 0), "k").unwrap(), Some(Value::I64(-1)));
+        assert_eq!(w.get(&coord3(0, 0, 0), "k").unwrap(), Some(Value::I64(0)));
+        assert_eq!(
+            w.get(&coord3(-32, 0, 0), "k").unwrap(),
+            Some(Value::I64(-32))
+        );
+        assert_eq!(w.get(&coord3(31, 0, 0), "k").unwrap(), Some(Value::I64(31)));
+
+        // list_cells sorts ascending by coordinate -- negative components
+        // must sort before non-negative ones, not after (which a naive
+        // unsigned-style comparison would get wrong).
+        let cells = w.list_cells().unwrap();
+        let coords: Vec<Coord> = cells.into_iter().map(|c| c.coord).collect();
+        assert_eq!(
+            coords,
+            vec![
+                coord3(-32, 0, 0),
+                coord3(-1, 0, 0),
+                coord3(0, 0, 0),
+                coord3(31, 0, 0),
+            ]
+        );
     }
 
     #[test]
@@ -1517,7 +1649,11 @@ mod tests {
         // entirely) -- the type conflict must still be caught, since it's
         // recorded in the schema, not per-chunk.
         let err = w
-            .set(&coord3(9_000, 9_000, 9_000), "temperature", Value::I64(20))
+            .set(
+                &coord3(-4_000, -4_000, -4_000),
+                "temperature",
+                Value::I64(20),
+            )
             .unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("temperature"));
@@ -1525,7 +1661,8 @@ mod tests {
         // The failed set didn't write anything, and the original value is
         // untouched.
         assert_eq!(
-            w.get(&coord3(9_000, 9_000, 9_000), "temperature").unwrap(),
+            w.get(&coord3(-4_000, -4_000, -4_000), "temperature")
+                .unwrap(),
             None
         );
         assert_eq!(
@@ -1555,7 +1692,7 @@ mod tests {
 
         // DEFAULT_CHUNK_DIM cells apart on axis 0 guarantees these land in
         // different chunks.
-        let far = coord3(DEFAULT_CHUNK_DIM, 0, 0);
+        let far = coord3(DEFAULT_CHUNK_DIM as i32, 0, 0);
         w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
             .unwrap();
         w.set(&far, "material", Value::Str("air".into())).unwrap();
@@ -1808,6 +1945,27 @@ mod tests {
     }
 
     #[test]
+    fn region_iter_yields_every_coordinate_axis0_fastest() {
+        let region = Region::new(coord3(10, 20, 30), coord3(2, 2, 1));
+        let coords: Vec<Coord> = region.iter().collect();
+        assert_eq!(
+            coords,
+            vec![
+                coord3(10, 20, 30),
+                coord3(11, 20, 30),
+                coord3(10, 21, 30),
+                coord3(11, 21, 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn region_iter_of_a_zero_extent_axis_is_empty() {
+        let region = Region::new(coord3(0, 0, 0), coord3(5, 0, 5));
+        assert_eq!(region.iter().count(), 0);
+    }
+
+    #[test]
     fn get_region_orders_results_axis0_fastest() {
         let dir = TempDir::new("region-order");
         let w = create(&dir);
@@ -1835,8 +1993,8 @@ mod tests {
         // Starts 5 cells before a chunk boundary and ends 5 cells past the
         // next one, on every axis: covers the tail of one chunk, all of a
         // second, and the head of a third, on each axis.
-        let x0 = DEFAULT_CHUNK_DIM - 5;
-        let d = DEFAULT_CHUNK_DIM + 10;
+        let x0 = (DEFAULT_CHUNK_DIM - 5) as i32;
+        let d = (DEFAULT_CHUNK_DIM + 10) as i32;
         let region = Region::new(vec![x0; 3], vec![d; 3]);
 
         w.set_region(
@@ -1866,7 +2024,7 @@ mod tests {
         let dir = TempDir::new("region-remove");
         let w = create(&dir);
 
-        let x0 = DEFAULT_CHUNK_DIM - 2;
+        let x0 = (DEFAULT_CHUNK_DIM - 2) as i32;
         let region = Region::new(coord3(x0, 0, 0), coord3(5, 5, 5));
         w.set_region(
             &region,
@@ -1927,14 +2085,14 @@ mod tests {
         let dir = TempDir::new("region-oob");
         let w = create(&dir);
 
-        let region = Region::new(coord3(WORLD_DIM - 1, 0, 0), coord3(2, 1, 1));
+        let region = Region::new(coord3(WORLD_DIM as i32 - 1, 0, 0), coord3(2, 1, 1));
         assert_eq!(
             w.get_region(&region, "material").unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
 
-        // Overflowing u32 entirely must not panic or wrap around.
-        let region = Region::new(coord3(u32::MAX - 1, 0, 0), coord3(5, 1, 1));
+        // Overflowing i32 entirely must not panic or wrap around.
+        let region = Region::new(coord3(i32::MAX - 1, 0, 0), coord3(5, 1, 1));
         assert_eq!(
             w.set_region(
                 &region,
@@ -1943,6 +2101,47 @@ mod tests {
             )
             .unwrap_err()
             .kind(),
+            io::ErrorKind::InvalidInput
+        );
+
+        // Same, at the opposite (negative) extreme.
+        let region = Region::new(coord3(i32::MIN + 1, 0, 0), coord3(5, 1, 1));
+        assert_eq!(
+            w.get_region(&region, "material").unwrap_err().kind(),
+            io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_region_spanning_zero_round_trips() {
+        let dir = TempDir::new("region-spans-zero");
+        let w = create(&dir);
+
+        let region = Region::new(coord3(-2, -2, -2), coord3(5, 5, 5)); // covers -2..3 on every axis
+        w.set_region(
+            &region,
+            "material",
+            &fill(&region, Value::Str("stone".into())),
+        )
+        .unwrap();
+
+        let got = w.get_region(&region, "material").unwrap();
+        assert_eq!(got.len(), region.volume() as usize);
+        assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
+
+        // Just outside the region on the low and high corners: untouched.
+        assert_eq!(w.get(&coord3(-3, -2, -2), "material").unwrap(), None);
+        assert_eq!(w.get(&coord3(3, -2, -2), "material").unwrap(), None);
+    }
+
+    #[test]
+    fn a_region_with_a_negative_extent_component_is_an_error() {
+        let dir = TempDir::new("region-negative-extent");
+        let w = create(&dir);
+
+        let region = Region::new(coord3(0, 0, 0), coord3(-1, 2, 2));
+        assert_eq!(
+            w.get_region(&region, "material").unwrap_err().kind(),
             io::ErrorKind::InvalidInput
         );
     }
@@ -2235,7 +2434,7 @@ mod tests {
         // unlike the pre-existing-chunk case above.
         let dir = TempDir::new("cache-never-written");
         let w = create(&dir);
-        let c = coord3(9_999, 0, 0); // a chunk nothing has ever touched
+        let c = coord3(4_999, 0, 0); // a chunk nothing has ever touched
 
         for _ in 0..5 {
             assert_eq!(w.get(&c, "material").unwrap(), None);
@@ -2279,7 +2478,7 @@ mod tests {
 
         // Each of these is DEFAULT_CHUNK_DIM apart on axis 0, so each lands in a
         // distinct chunk.
-        let chunk_coord = |n: u32| coord3(n * DEFAULT_CHUNK_DIM, 0, 0);
+        let chunk_coord = |n: i32| coord3(n * DEFAULT_CHUNK_DIM as i32, 0, 0);
 
         w.set(&chunk_coord(0), "material", Value::I64(0)).unwrap(); // cache: {0}
         w.set(&chunk_coord(1), "material", Value::I64(1)).unwrap(); // cache: {0, 1} -- full
@@ -2390,8 +2589,12 @@ mod tests {
                     thread::spawn(move || {
                         for op in 0..ops_per_worker {
                             let seed = worker * ops_per_worker + op;
-                            w.set(&coord3(seed, seed, seed), "bench", Value::I64(seed as i64))
-                                .unwrap();
+                            w.set(
+                                &coord3(seed as i32, seed as i32, seed as i32),
+                                "bench",
+                                Value::I64(seed as i64),
+                            )
+                            .unwrap();
                         }
                     })
                 })

@@ -65,15 +65,15 @@ impl Client {
         })
     }
 
-    fn coords(coord: &[u32]) -> String {
+    fn coords(coord: &[i32]) -> String {
         coord
             .iter()
-            .map(u32::to_string)
+            .map(i32::to_string)
             .collect::<Vec<_>>()
             .join(",")
     }
 
-    pub async fn set_cell(&self, coord: &[u32], key: &str, value: i64) -> Timed {
+    pub async fn set_cell(&self, coord: &[i32], key: &str, value: i64) -> Timed {
         let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let body = json!({"type": "i64", "value": value});
         let t0 = Instant::now();
@@ -91,7 +91,7 @@ impl Client {
         }
     }
 
-    pub async fn get_cell(&self, coord: &[u32], key: &str) -> Timed {
+    pub async fn get_cell(&self, coord: &[i32], key: &str) -> Timed {
         let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let t0 = Instant::now();
         let ok = self
@@ -107,7 +107,7 @@ impl Client {
         }
     }
 
-    pub async fn remove_cell(&self, coord: &[u32], key: &str) -> Timed {
+    pub async fn remove_cell(&self, coord: &[i32], key: &str) -> Timed {
         let url = format!("{}/rest/cells/{}/{key}", self.base_url, Self::coords(coord));
         let t0 = Instant::now();
         let ok = self
@@ -125,8 +125,8 @@ impl Client {
 
     pub async fn set_region(
         &self,
-        origin: &[u32],
-        extent: &[u32],
+        origin: &[i32],
+        extent: &[i32],
         key: &str,
         values: &[i64],
     ) -> Timed {
@@ -154,7 +154,7 @@ impl Client {
         }
     }
 
-    pub async fn get_region(&self, origin: &[u32], extent: &[u32], key: &str) -> Timed {
+    pub async fn get_region(&self, origin: &[i32], extent: &[i32], key: &str) -> Timed {
         let url = format!(
             "{}/rest/regions/{}/{}/{key}",
             self.base_url,

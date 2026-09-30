@@ -374,6 +374,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_negative_coordinate_round_trips_through_a_real_connection() {
+        let server = spawn_test_server(3, 10_000).await; // valid range: [-5000, 5000)
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let coord = vec![-1, -2, -3];
+        let set = roundtrip(
+            &mut stream,
+            &Request::Set {
+                coord: coord.clone(),
+                key: "material".to_string(),
+                value: Value::Str("stone".to_string()),
+            },
+        )
+        .await;
+        assert_eq!(set, Response::Ok);
+
+        let get = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord,
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(expect_value(get), Value::Str("stone".to_string()));
+    }
+
+    #[tokio::test]
     async fn a_get_response_reports_created_modified_and_version() {
         let server = spawn_test_server(3, 10_000).await;
         let mut stream = connect(&server).await;

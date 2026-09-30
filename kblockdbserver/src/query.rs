@@ -1,9 +1,10 @@
 //! kBlockDB's query language: a small SQL-like language over a world's
-//! populated cells, with three statement kinds --
+//! cells, with four statement kinds --
 //!
 //! ```text
 //! SELECT <columns> [FROM <range>] [WHERE <criteria>]
-//! SET (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
+//! SET (<key>=<value>, ...) [WHERE <criteria>] IN <range>
+//! UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
 //! DELETE [WHERE <criteria>] [IN <range>]
 //! ```
 //!
@@ -15,17 +16,34 @@
 //! parentheses; `x<N>` addresses coordinate axis `N`, anything else is a
 //! key name.
 //!
-//! `SELECT` is a read; `SET`/`DELETE` are writes -- see
+//! **`SET` is an upsert, `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all
+//! operate on `kblockdblib::World::list_cells` -- i.e. only cells that
+//! already have at least one key set somewhere -- so `UPDATE` (like the
+//! `SET` this replaced) can only ever change cells that already exist.
+//! `SET` is different: it upserts every coordinate in its (mandatory) `IN
+//! <range>` that satisfies `WHERE`, creating a cell there if it doesn't
+//! already exist. Because a `WHERE` clause comparing against a *key* can
+//! never match a cell that doesn't exist yet (a missing key is always
+//! "doesn't match", same as everywhere else in this language -- see
+//! "Evaluation" below), a key-based `WHERE` makes `SET` behave exactly like
+//! `UPDATE` in practice; the difference only shows up with no `WHERE` at
+//! all, or one that only compares against axis coordinates (`x<N>`), where
+//! `SET` can genuinely bring new cells into existence and `UPDATE` cannot.
+//! `SET` requires `IN <range>` (not optional, unlike `UPDATE`'s) because
+//! "upsert everywhere" has no meaningful bound -- `routes.rs` needs a range
+//! to know which coordinates to even consider creating.
+//!
+//! `SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes -- see
 //! `Statement::is_write`, which `routes.rs`'s query handler uses to reject
-//! a `read_only` account's `SET`/`DELETE` the same way the REST API's
-//! `PUT`/`DELETE` handlers do, just checked explicitly there instead of by
-//! HTTP method (this whole language shares one endpoint and one HTTP
-//! method -- see `routes.rs`'s doc comment on why).
+//! a `read_only` account's writes the same way the REST API's `PUT`/
+//! `DELETE` handlers do, just checked explicitly there instead of by HTTP
+//! method (this whole language shares one endpoint and one HTTP method --
+//! see `routes.rs`'s doc comment on why).
 //!
 //! This module only builds and evaluates the AST against
 //! `kblockdblib::CellEntry` values (in memory, no I/O) -- `routes.rs`
-//! drives the actual `World::list_cells`/`set`/`remove` calls the parsed
-//! statement implies.
+//! drives the actual `World::list_cells`/`get_region`/`set_region`/`set`/
+//! `remove` calls the parsed statement implies.
 
 use kblockdblib::{CellEntry, Value};
 use pest::iterators::Pair;
@@ -52,8 +70,8 @@ pub enum Columns {
 /// place that knows the target `World`) can check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Range {
-    pub from: Vec<u32>,
-    pub to: Vec<u32>,
+    pub from: Vec<i32>,
+    pub to: Vec<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -108,7 +126,19 @@ pub enum Statement {
         range: Option<Range>,
         where_clause: Option<Expr>,
     },
+    /// An upsert: every coordinate in `range` satisfying `where_clause` is
+    /// written, whether or not a cell already existed there. `range` isn't
+    /// optional -- see this module's doc comment on why.
     Set {
+        assignments: Vec<(String, Literal)>,
+        where_clause: Option<Expr>,
+        range: Range,
+    },
+    /// Same shape as the old `SET`: only ever touches cells `World::list_cells`
+    /// already reports (i.e. that already have some key set) -- never
+    /// creates one. See this module's doc comment on how this differs from
+    /// `Set`.
+    Update {
         assignments: Vec<(String, Literal)>,
         where_clause: Option<Expr>,
         range: Option<Range>,
@@ -120,11 +150,14 @@ pub enum Statement {
 }
 
 impl Statement {
-    /// `SET`/`DELETE` are writes; `SELECT` is a read. See this module's
-    /// doc comment on why this -- not HTTP method -- is what gates a
-    /// `read_only` account here.
+    /// `SET`/`UPDATE`/`DELETE` are writes; `SELECT` is a read. See this
+    /// module's doc comment on why this -- not HTTP method -- is what
+    /// gates a `read_only` account here.
     pub fn is_write(&self) -> bool {
-        matches!(self, Statement::Set { .. } | Statement::Delete { .. })
+        matches!(
+            self,
+            Statement::Set { .. } | Statement::Update { .. } | Statement::Delete { .. }
+        )
     }
 }
 
@@ -151,8 +184,11 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
     match inner.as_rule() {
         Rule::select_stmt => build_select(inner),
         Rule::set_stmt => build_set(inner),
+        Rule::update_stmt => build_update(inner),
         Rule::delete_stmt => build_delete(inner),
-        other => unreachable!("statement can only contain select/set/delete_stmt, got {other:?}"),
+        other => {
+            unreachable!("statement can only contain select/set/update/delete_stmt, got {other:?}")
+        }
     }
 }
 
@@ -165,6 +201,7 @@ fn is_keyword(pair: &Pair<Rule>) -> bool {
         pair.as_rule(),
         Rule::kw_select
             | Rule::kw_set
+            | Rule::kw_update
             | Rule::kw_delete
             | Rule::kw_from
             | Rule::kw_where
@@ -214,6 +251,30 @@ fn build_set(pair: Pair<Rule>) -> Result<Statement, ParseError> {
         }
     }
     Ok(Statement::Set {
+        assignments,
+        where_clause,
+        // set_stmt = { ... ~ kw_in ~ range } -- the grammar makes IN <range>
+        // mandatory, so `range` is always populated by the loop above.
+        range: range.expect("set_stmt's grammar requires a range"),
+    })
+}
+
+fn build_update(pair: Pair<Rule>) -> Result<Statement, ParseError> {
+    let mut assignments = Vec::new();
+    let mut range = None;
+    let mut where_clause = None;
+    for p in pair.into_inner() {
+        if is_keyword(&p) {
+            continue;
+        }
+        match p.as_rule() {
+            Rule::assignment_list => assignments = build_assignment_list(p)?,
+            Rule::range => range = Some(build_range(p)?),
+            Rule::expr => where_clause = Some(build_expr(p)),
+            other => unreachable!("unexpected rule in update_stmt: {other:?}"),
+        }
+    }
+    Ok(Statement::Update {
         assignments,
         where_clause,
         range,
@@ -272,13 +333,13 @@ fn build_range(pair: Pair<Rule>) -> Result<Range, ParseError> {
     Ok(Range { from, to })
 }
 
-fn build_point(pair: Pair<Rule>) -> Result<Vec<u32>, ParseError> {
+fn build_point(pair: Pair<Rule>) -> Result<Vec<i32>, ParseError> {
     pair.into_inner()
-        .map(|uint| {
-            uint.as_str().parse().map_err(|_| {
+        .map(|int| {
+            int.as_str().parse().map_err(|_| {
                 ParseError(format!(
-                    "coordinate '{}' doesn't fit in a u32",
-                    uint.as_str()
+                    "coordinate '{}' doesn't fit in an i32",
+                    int.as_str()
                 ))
             })
         })
@@ -425,7 +486,12 @@ pub fn matches(range: Option<&Range>, where_clause: Option<&Expr>, cell: &CellEn
     where_clause.is_none_or(|expr| eval(expr, cell))
 }
 
-fn eval(expr: &Expr, cell: &CellEntry) -> bool {
+/// `eval` alone, without a range check -- `routes.rs`'s `SET` (upsert)
+/// handling needs this directly: it already knows a candidate coordinate
+/// is in range (from `kblockdblib::Region::iter()`), and evaluates
+/// `WHERE` against either that coordinate's existing `CellEntry` or a
+/// synthetic empty one if it doesn't exist yet.
+pub fn eval(expr: &Expr, cell: &CellEntry) -> bool {
     match expr {
         Expr::And(a, b) => eval(a, cell) && eval(b, cell),
         Expr::Or(a, b) => eval(a, cell) || eval(b, cell),
@@ -491,7 +557,7 @@ mod tests {
     use super::*;
     use kblockdblib::CellMeta;
 
-    fn cell(coord: &[u32], values: Vec<(&str, Value)>) -> CellEntry {
+    fn cell(coord: &[i32], values: Vec<(&str, Value)>) -> CellEntry {
         CellEntry {
             coord: coord.into(),
             values: values
@@ -586,28 +652,46 @@ mod tests {
     }
 
     #[test]
+    fn parses_a_range_with_negative_points() {
+        let stmt = parse("SELECT * FROM (-10,-10,-10) TO (10,10,10)").unwrap();
+        let Statement::Select { range, .. } = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(
+            range,
+            Some(Range {
+                from: vec![-10, -10, -10],
+                to: vec![10, 10, 10],
+            })
+        );
+    }
+
+    #[test]
     fn keywords_are_case_insensitive() {
         assert!(parse("select * where x0 = 1").is_ok());
         assert!(parse("Select * Where x0 = 1 and x1 = 2").is_ok());
     }
 
-    // --- Parsing: SET ---
+    // --- Parsing: SET (upsert -- range is mandatory) ---
 
     #[test]
     fn parses_set_with_a_single_assignment() {
-        let stmt = parse("SET (material = 'stone')").unwrap();
+        let stmt = parse("SET (material = 'stone') IN (0,0,0) TO (10,10,10)").unwrap();
         assert_eq!(
             stmt,
             Statement::Set {
                 assignments: vec![("material".to_string(), Literal::Str("stone".to_string()))],
                 where_clause: None,
-                range: None,
+                range: Range {
+                    from: vec![0, 0, 0],
+                    to: vec![10, 10, 10],
+                },
             }
         );
     }
 
     #[test]
-    fn parses_set_with_multiple_assignments_and_clauses() {
+    fn parses_set_with_multiple_assignments_and_a_where_clause() {
         let stmt =
             parse("SET (material='stone', hardness=7) WHERE x0 >= 10 IN (0,0,0) TO (20,20,20)")
                 .unwrap();
@@ -627,13 +711,77 @@ mod tests {
             ]
         );
         assert!(where_clause.is_some());
-        assert!(range.is_some());
+        assert_eq!(
+            range,
+            Range {
+                from: vec![0, 0, 0],
+                to: vec![20, 20, 20],
+            }
+        );
+    }
+
+    #[test]
+    fn set_without_a_range_is_rejected() {
+        // Unlike UPDATE, SET is an upsert -- "upsert everywhere" has no
+        // meaningful bound, so IN <range> is mandatory.
+        assert!(parse("SET (k = 1)").is_err());
+        assert!(parse("SET (k = 1) WHERE x0 >= 10").is_err());
     }
 
     #[test]
     fn set_is_a_write() {
-        let stmt = parse("SET (k = 1)").unwrap();
+        let stmt = parse("SET (k = 1) IN (0,0,0) TO (1,1,1)").unwrap();
         assert!(stmt.is_write());
+    }
+
+    // --- Parsing: UPDATE (range and WHERE both optional, like the old SET) ---
+
+    #[test]
+    fn parses_update_with_a_single_assignment() {
+        let stmt = parse("UPDATE (material = 'stone')").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::Update {
+                assignments: vec![("material".to_string(), Literal::Str("stone".to_string()))],
+                where_clause: None,
+                range: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_update_with_multiple_assignments_and_clauses() {
+        let stmt =
+            parse("UPDATE (material='stone', hardness=7) WHERE x0 >= 10 IN (0,0,0) TO (20,20,20)")
+                .unwrap();
+        let Statement::Update {
+            assignments,
+            where_clause,
+            range,
+        } = stmt
+        else {
+            panic!("expected Update");
+        };
+        assert_eq!(
+            assignments,
+            vec![
+                ("material".to_string(), Literal::Str("stone".to_string())),
+                ("hardness".to_string(), Literal::Int(7)),
+            ]
+        );
+        assert!(where_clause.is_some());
+        assert!(range.is_some());
+    }
+
+    #[test]
+    fn update_is_a_write() {
+        let stmt = parse("UPDATE (k = 1)").unwrap();
+        assert!(stmt.is_write());
+    }
+
+    #[test]
+    fn update_keyword_is_case_insensitive() {
+        assert!(parse("update (k = 1)").is_ok());
     }
 
     // --- Parsing: DELETE ---
@@ -817,6 +965,27 @@ mod tests {
         assert!(eval(&parse_expr("x0 = 10"), &c));
         assert!(eval(&parse_expr("x1 > 15"), &c));
         assert!(!eval(&parse_expr("x2 < 30"), &c));
+    }
+
+    #[test]
+    fn eval_compares_negative_axis_coordinates() {
+        let c = cell(&[-10, -20, 30], vec![]);
+        assert!(eval(&parse_expr("x0 = -10"), &c));
+        assert!(eval(&parse_expr("x1 < -15"), &c));
+        assert!(eval(&parse_expr("x0 > -20 AND x0 < 0"), &c));
+    }
+
+    #[test]
+    fn matches_range_spanning_zero() {
+        let range = Range {
+            from: vec![-5, -5, -5],
+            to: vec![5, 5, 5],
+        };
+        assert!(matches(Some(&range), None, &cell(&[-5, -5, -5], vec![])));
+        assert!(matches(Some(&range), None, &cell(&[0, 0, 0], vec![])));
+        assert!(matches(Some(&range), None, &cell(&[4, 4, 4], vec![])));
+        assert!(!matches(Some(&range), None, &cell(&[-6, 0, 0], vec![])));
+        assert!(!matches(Some(&range), None, &cell(&[5, 0, 0], vec![])));
     }
 
     #[test]

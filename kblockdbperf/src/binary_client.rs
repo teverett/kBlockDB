@@ -88,7 +88,7 @@ impl BinaryClient {
         wire::decode_response(&payload).ok()
     }
 
-    pub async fn set_cell(&mut self, coord: &[u32], key: &str, value: i64) -> Timed {
+    pub async fn set_cell(&mut self, coord: &[i32], key: &str, value: i64) -> Timed {
         let req = Request::Set {
             coord: coord.to_vec(),
             key: key.to_string(),
@@ -102,7 +102,7 @@ impl BinaryClient {
         }
     }
 
-    pub async fn get_cell(&mut self, coord: &[u32], key: &str) -> Timed {
+    pub async fn get_cell(&mut self, coord: &[i32], key: &str) -> Timed {
         let req = Request::Get {
             coord: coord.to_vec(),
             key: key.to_string(),
@@ -118,7 +118,7 @@ impl BinaryClient {
         }
     }
 
-    pub async fn remove_cell(&mut self, coord: &[u32], key: &str) -> Timed {
+    pub async fn remove_cell(&mut self, coord: &[i32], key: &str) -> Timed {
         let req = Request::Remove {
             coord: coord.to_vec(),
             key: key.to_string(),

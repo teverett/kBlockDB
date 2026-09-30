@@ -113,6 +113,19 @@ class KBlockDBClientIntegrationTest {
     }
 
     @Test
+    void negativeCoordinatesRoundTripThroughARealConnection() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            int[] coord = {-1, -2, -3};
+
+            client.set(coord, "material", new Value.Str("stone"));
+            assertEquals(Optional.of(new Value.Str("stone")), client.get(coord, "material"));
+
+            client.remove(coord, "material");
+            assertEquals(Optional.empty(), client.get(coord, "material"));
+        }
+    }
+
+    @Test
     void everyValueTypeRoundTrips() throws IOException {
         try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
             client.set(new int[] {5, 5, 5}, "str-key", new Value.Str("air"));

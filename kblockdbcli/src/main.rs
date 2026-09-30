@@ -1,9 +1,9 @@
 //! `kblockdbcli` -- a command-line client for kblockdbserver's REST API: get, set,
 //! and remove a single cell's value for a key, plus `query` for the
-//! `SELECT`/`SET`/`DELETE` query language over `POST /rest/query`. A thin
-//! wrapper over HTTP Basic Auth and those two endpoints, nothing more (see
-//! kblockdbserver's README section for the fuller API this could grow into
-//! covering, e.g. `/rest/regions`).
+//! `SELECT`/`SET`/`UPDATE`/`DELETE` query language over `POST /rest/query`.
+//! A thin wrapper over HTTP Basic Auth and those two endpoints, nothing
+//! more (see kblockdbserver's README section for the fuller API this could
+//! grow into covering, e.g. `/rest/regions`).
 
 #[cfg(test)]
 mod tests;
@@ -170,25 +170,30 @@ fn print_help() {
          `<type> <value> (created=<ms> modified=<ms> version=<n>)`\n    \
          set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)\n    \
          remove <coords> <key>               Clear a cell's value\n    \
-         query <query-text>                  Run a SELECT/SET/DELETE query (see below)\n\n\
+         query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)\n\n\
          OPTIONS:\n    \
          --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)\n    \
          --user <name>      Username (default: admin)\n    \
          --password <pw>    Password (or set the KBLOCKDBCLI_PASSWORD env var, so it\n                        \
          doesn't end up in shell history)\n    \
          -h, --help         Print this help\n\n\
-         <coords> is a comma-separated coordinate, one u32 per axis (e.g. 1,2,3),\n\
-         matching however many axes the target world was created with.\n\n\
+         <coords> is a comma-separated coordinate, one i32 per axis (e.g. 1,2,3\n\
+         or -1,2,-3 -- a world's valid range is centered on zero, see the\n\
+         server's README), matching however many axes the target world was\n\
+         created with.\n\n\
          EXAMPLES:\n    \
          kblockdbcli --password change-me set 1,2,3 material str stone\n    \
          kblockdbcli --password change-me get 1,2,3 material\n    \
          kblockdbcli --password change-me remove 1,2,3 material\n    \
          kblockdbcli --password change-me query \"SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'\"\n    \
-         kblockdbcli --password change-me query \"SET (material='stone') WHERE x0 < 10\"\n    \
+         kblockdbcli --password change-me query \"SET (material='stone') IN (0,0,0) TO (9,9,9)\"\n    \
+         kblockdbcli --password change-me query \"UPDATE (material='dirt') WHERE material = 'stone'\"\n    \
          kblockdbcli --password change-me query \"DELETE WHERE material = 'air'\"\n\n\
          Wrap the whole query in one shell-quoted argument -- it may contain\n\
-         spaces and single-quoted string literals of its own. SET and DELETE\n\
-         require a non-read-only account."
+         spaces and single-quoted string literals of its own. SET is an\n\
+         upsert and requires IN <range> (it can create cells; UPDATE only\n\
+         ever changes cells that already exist). SET, UPDATE, and DELETE\n\
+         all require a non-read-only account."
     );
 }
 
@@ -273,8 +278,8 @@ fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Re
 }
 
 /// Renders a `/rest/query` response (kblockdbserver's `QueryResponse`), which
-/// is shaped one way for `SELECT` (`rows`) and another for `SET`/`DELETE`
-/// (`affected_cells`).
+/// is shaped one way for `SELECT` (`rows`) and another for
+/// `SET`/`UPDATE`/`DELETE` (`affected_cells`).
 fn print_query_response(body: &Json) -> Result<(), String> {
     if let Some(rows) = body.get("rows").and_then(Json::as_array) {
         for row in rows {

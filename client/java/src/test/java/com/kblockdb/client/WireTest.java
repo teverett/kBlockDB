@@ -150,8 +150,20 @@ class WireTest {
     }
 
     @Test
-    void encodeRejectsANegativeCoordinateComponent() {
-        assertThrows(IllegalArgumentException.class, () -> Wire.encodeGet(new int[] {-1}, "k"));
+    void encodeGetProducesTheDocumentedByteLayoutForANegativeCoordinate() throws IOException {
+        // kBlockDB's coordinate space is zero-centered, so a negative
+        // component is ordinary, not an error -- encoded as its plain i32
+        // little-endian two's-complement bytes, same as any other int.
+        byte[] payload = Wire.encodeGet(new int[] {-1, -2147483648, 3}, "k");
+        byte[] expected = {
+                0x01,
+                0x03,
+                (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, // -1
+                0x00, 0x00, 0x00, (byte) 0x80, // Integer.MIN_VALUE
+                3, 0, 0, 0, // 3
+                1, 0, 'k',
+        };
+        assertArrayEquals(expected, payload);
     }
 
     @Test

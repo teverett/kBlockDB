@@ -12,8 +12,8 @@ A Cargo workspace with four crates:
   exposes `get`/`set`/`remove` for individual cells and for axis-aligned
   regions of cells, over a RESTful HTTP API and (optionally, as a peer to
   it, not a replacement) a minimal binary protocol with less per-call
-  overhead. Also a small SQL-like query language (`SELECT`/`SET`/`DELETE`
-  over `POST /rest/query`) and a read-only web data browser at `/`. Unlike
+  overhead. Also a small SQL-like query language (`SELECT`/`SET`/`UPDATE`/
+  `DELETE` over `POST /rest/query`) and a read-only web data browser at `/`. Unlike
   `kblockdblib`, it takes on the standard modern Rust web stack (axum +
   tokio + serde + pest) -- that dependency-free constraint was specific to
   `kblockdblib`'s storage format, not to everything built on top of it.
@@ -21,10 +21,10 @@ A Cargo workspace with four crates:
   over real HTTP and measures it: single-cell and region throughput/latency,
   concurrency scaling, and lock contention.
 - **`kblockdbcli`** -- a small command-line client for kblockdbserver's REST API:
-  `get`/`set`/`remove` a single cell's value, or run a `SELECT`/`SET`/`DELETE`
-  query, from a shell, authenticating like `curl -u` would. A pure HTTP client,
-  same as `kblockdbperf` -- it treats kblockdbserver as a black box over its
-  REST API, not `kblockdblib` directly.
+  `get`/`set`/`remove` a single cell's value, or run a
+  `SELECT`/`SET`/`UPDATE`/`DELETE` query, from a shell, authenticating like
+  `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
+  kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
 
 Plus a standalone (non-Cargo) Java client at `client/java`: `KBlockDBClient`
 speaks kblockdbserver's binary protocol (see "Binary protocol" below),
@@ -104,6 +104,19 @@ client/java/      the Java client (KBlockDBClient, speaks the binary protocol; M
   world's shape can't silently change out from under data already written
   for it. `world::AXES`/`world::WORLD_DIM`/`world::DEFAULT_CHUNK_DIM` are
   only the defaults `main`'s demo happens to call `create` with.
+
+- **Coordinates are signed and centered on zero.** Each axis component is
+  an `i32`, and a world's valid range per axis is `[-(world_dim/2),
+  world_dim/2)` -- `world_dim` cells wide either way, split evenly around
+  the origin (an odd `world_dim` puts the extra cell on the positive
+  side). `world_dim` itself is unchanged (still the same `u32` persisted to
+  `world.txt`); only where the valid window sits relative to zero is new.
+  Chunk indexing uses floor (Euclidean) division/remainder rather than
+  Rust's default truncate-toward-zero `/`/`%`, so chunk boundaries stay
+  evenly spaced across zero the same as everywhere else, and a chunk's
+  on-disk directory/file name (`kblockdblib::World`'s "Layout on disk" doc
+  comment) is just that chunk key's plain decimal form, negative sign
+  included where it applies (e.g. `<root>/-3/0/2.chunk`).
 
 ### Concurrency
 
@@ -308,11 +321,12 @@ packed value array. That costs two different things:
 - `kblockdblib/src/value.rs`  -- the `Value` enum (Str/F64/I64), its on-disk type
   tags, and `ValueType` (a `Value` without the value itself -- what
   `Schema` records per key).
-- `kblockdblib/src/coord.rs`  -- `Coord`, a small-vec-style `u32` sequence (inline
-  up to 8 axes, heap beyond that) used for coordinates and chunk keys. A
+- `kblockdblib/src/coord.rs`  -- `Coord`, a small-vec-style `i32` sequence (inline
+  up to 8 axes, heap beyond that) used for coordinates and chunk keys.
+  Signed so a coordinate can be negative (see "Coordinate space" below). A
   world's axis count is a runtime value (see `params.rs`), so a coordinate
   can't be a fixed-size array the way a single-world-shape version of this
-  prototype could use -- `Coord` avoids a `Vec<u32>`-per-coordinate heap
+  prototype could use -- `Coord` avoids a `Vec<i32>`-per-coordinate heap
   allocation for the common case (a handful of axes) without adding a
   `smallvec` dependency.
 - `kblockdblib/src/chunk_cache.rs` -- `ChunkCache`, the in-memory,
@@ -482,9 +496,11 @@ credentials; it exposes nothing more sensitive than the world's shape and
 this server's clock.
 
 Every coordinate, and every region origin/extent, is a comma-separated
-list of `u32`s in the URL, one per axis (`1,2,3` for a 3-axis world) --
-there's nothing 3-axis-specific about the API; it works the same way for
-whatever axis count the world was created with.
+list of `i32`s in the URL, one per axis (`1,2,3` for a 3-axis world, or
+`-1,2,-3` -- a negative component needs no special URL encoding, `-` is a
+plain path character) -- there's nothing 3-axis-specific about the API; it
+works the same way for whatever axis count the world was created with. See
+"Coordinate space" above for a world's valid range per axis.
 
 A cell value on the wire is a small tagged JSON object:
 
@@ -571,12 +587,13 @@ curl -u admin:change-me localhost:8080/rest/stats
 ### Query language
 
 `POST /rest/query` runs a small SQL-like query language over the world's
-populated cells, parsed with a [pest](https://pest.rs) grammar
-(`kblockdbserver/src/query.pest`/`query.rs`). Three statement kinds:
+cells, parsed with a [pest](https://pest.rs) grammar
+(`kblockdbserver/src/query.pest`/`query.rs`). Four statement kinds:
 
 ```text
 SELECT <columns> [FROM <range>] [WHERE <criteria>]
-SET (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
+SET (<key>=<value>, ...) [WHERE <criteria>] IN <range>
+UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
 DELETE [WHERE <criteria>] [IN <range>]
 ```
 
@@ -584,24 +601,42 @@ DELETE [WHERE <criteria>] [IN <range>]
 - `<range>` is `(o0,o1,...) TO (e0,e1,...)` -- an axis-aligned box, `o`
   inclusive/`e` exclusive on every axis, same convention as
   `kblockdblib::Region` (origin + extent), just written as two corners.
+  Each component is a signed integer (a world's valid range is centered on
+  zero -- see "Coordinate space" above), e.g. `(-10,-10,-10) TO (10,10,10)`.
   Its axis count must match the world's, or the query is rejected with
   `400` before touching any data.
 - `<criteria>` is a boolean expression: comparisons (`=`, `!=`, `<`, `<=`,
   `>`, `>=`) combined with `AND`/`OR`/`NOT` and parentheses, standard
   precedence (`NOT` binds tightest, then `AND`, then `OR`). A comparison's
   left side is either `x<N>` (coordinate axis `N`, zero-indexed) or a key
-  name; its right side is a string (`'stone'`), integer, or float literal.
-  Keywords are case-insensitive; key/axis names are not. A key literally
-  named e.g. `x0` can't be addressed this way -- a known limitation of a
-  generic axis-count grammar.
+  name; its right side is a string (`'stone'`), integer, or float literal
+  (`x0 >= -10` works the same as any other comparison). Keywords are
+  case-insensitive; key/axis names are not. A key literally named e.g.
+  `x0` can't be addressed this way -- a known limitation of a generic
+  axis-count grammar.
 - A comparison against a key that isn't set at a given cell, or whose
   value's type doesn't match the literal's (a string literal against a
   numeric key, say), simply doesn't match that cell -- never an error, the
   same "total, not partial" philosophy `kblockdblib` itself uses.
 
-`SELECT` is a read; `SET`/`DELETE` are writes. Both are behind the same
-`POST /rest/query`, so this is the one route in the whole REST API where
-`read_only` isn't decided by HTTP method the way it is everywhere
+**`SET` is an upsert; `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all run
+on `kblockdblib::World::list_cells` -- i.e. only cells that already have at
+least one key set somewhere. `UPDATE` can only ever change such a cell,
+never create one, same as this whole language's original `SET` used to
+work. `SET` is different: it upserts every coordinate in its `IN <range>`
+that satisfies `WHERE`, creating a cell there if one doesn't already exist
+-- which is exactly why `IN <range>` isn't optional for `SET` the way it is
+for `UPDATE`/`DELETE`: "upsert everywhere" has no meaningful bound. Because
+a `WHERE` clause comparing against a *key* can never match a cell that
+doesn't exist yet (a missing key is always "doesn't match", per the bullet
+above), a key-based `WHERE` makes `SET` behave exactly like `UPDATE` in
+practice -- the two only diverge with no `WHERE` at all, or one that only
+compares axis coordinates (`x<N>`), where `SET` can genuinely bring new
+cells into existence.
+
+`SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes. All four are behind
+the same `POST /rest/query`, so this is the one route in the whole REST API
+where `read_only` isn't decided by HTTP method the way it is everywhere
 else (see `routes.rs`'s doc comment) -- it's decided by which kind of
 statement was actually sent, checked after parsing, before touching
 anything.
@@ -614,9 +649,18 @@ curl -u admin:change-me -X POST localhost:8080/rest/query \
 #   {"key":"density","value":{"type":"f64","value":2.6}},
 #   {"key":"material","value":{"type":"str","value":"stone"}}]}]}
 
+# upsert: fills every cell in the box with material='stone', creating any
+# that don't already exist.
 curl -u admin:change-me -X POST localhost:8080/rest/query \
   -H 'content-type: application/json' \
-  -d '{"query": "SET (material='"'"'basalt'"'"', hardness=9) WHERE material = '"'"'stone'"'"' IN (0,0,0) TO (20,20,20)"}'
+  -d '{"query": "SET (material='"'"'stone'"'"') IN (0,0,0) TO (20,20,20)"}'
+# {"affected_cells":8000}
+
+# update: only changes cells that already have material='stone' -- never
+# creates one, whether or not IN is given.
+curl -u admin:change-me -X POST localhost:8080/rest/query \
+  -H 'content-type: application/json' \
+  -d '{"query": "UPDATE (material='"'"'basalt'"'"', hardness=9) WHERE material = '"'"'stone'"'"' IN (0,0,0) TO (20,20,20)"}'
 # {"affected_cells":1}
 
 curl -u admin:change-me -X POST localhost:8080/rest/query \
@@ -625,20 +669,26 @@ curl -u admin:change-me -X POST localhost:8080/rest/query \
 # {"affected_cells":1}
 ```
 
-`SELECT`'s response has `total_rows`/`rows`; `SET`/`DELETE`'s has
+`SELECT`'s response has `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE`'s has
 `affected_cells` instead (the fields the statement kind doesn't produce
 are omitted, not null). `DELETE` clears *every* key set at each matching
 cell -- there's no column list to delete only some of them.
 
-All three statement kinds run on `kblockdblib::World::list_cells` under
+`SELECT`/`UPDATE`/`DELETE` run on `kblockdblib::World::list_cells` under
 the hood (the same full-chunk-decode walk the `/` data browser below uses)
--- `SELECT` filters and projects it directly; `SET`/`DELETE` use it to
-find matching coordinates, then apply the write in a second pass. That
-second pass isn't atomic with the first: a concurrent writer touching the
-same cells in between is a real (if narrow) race, same honest trade-off
-`list_cells`'s own doc comment already makes for reads. Fine for the
-occasional bulk edit; not meant for a world with millions of populated
-cells or for `SET`/`DELETE` queries racing each other at high frequency.
+-- `SELECT` filters and projects it directly; `UPDATE`/`DELETE` use it to
+find matching coordinates, then apply the write in a second pass. `SET`
+without a `WHERE` skips `list_cells` entirely and goes straight to
+`World::set_region` (the same primitive `/rest/regions` uses) -- one call
+per assignment, as efficient as the region endpoints; `SET` *with* a
+`WHERE` falls back to a `list_cells`-plus-per-coordinate-`Region::iter`
+scan, since which coordinates match can depend on a cell's existing
+values. None of this is atomic with respect to a concurrent writer
+touching the same range in between the scan and the write -- a real (if
+narrow) race, same honest trade-off `list_cells`'s own doc comment already
+makes for reads. Fine for the occasional bulk edit; not meant for a world
+with millions of populated cells or for these write statements racing each
+other at high frequency.
 
 ### Data browser
 
@@ -865,8 +915,8 @@ well under a minute, and every default is overridable.
 
 A thin wrapper over kblockdbserver's `/rest/cells/{coords}/{key}` and
 `/rest/query` endpoints -- `get`, `set`, and `remove` one cell's value, or run
-a `SELECT`/`SET`/`DELETE` query, from a shell, with the same HTTP Basic Auth
-every other client of kblockdbserver's REST API needs.
+a `SELECT`/`SET`/`UPDATE`/`DELETE` query, from a shell, with the same HTTP
+Basic Auth every other client of kblockdbserver's REST API needs.
 
 ### Build & run
 
@@ -891,7 +941,7 @@ COMMANDS:
                                          `<type> <value> (created=<ms> modified=<ms> version=<n>)`
     set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)
     remove <coords> <key>               Clear a cell's value
-    query <query-text>                  Run a SELECT/SET/DELETE query (see below)
+    query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)
 
 OPTIONS:
     --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)
@@ -901,9 +951,10 @@ OPTIONS:
     -h, --help         Print this help
 ```
 
-`<coords>` is a comma-separated coordinate, one `u32` per axis (`1,2,3` for
-a 3-axis world), matching however many axes the target world was created
-with -- same convention as the REST API itself.
+`<coords>` is a comma-separated coordinate, one `i32` per axis (`1,2,3` for
+a 3-axis world, or `-1,2,-3` -- a world's valid range is centered on zero,
+see "Coordinate space" above), matching however many axes the target world
+was created with -- same convention as the REST API itself.
 
 `get`'s output and `set`'s trailing two arguments share one format
 (`<type> <value>`, e.g. `str stone` or `i64 42`) on purpose, so the two
@@ -916,9 +967,11 @@ retried silently.
 `query` takes the entire query text as one shell-quoted argument (see the
 "Query language" section above for the grammar) and posts it to
 `/rest/query`. A `SELECT` prints one line per matching cell, as `(coords)
-key=value (type), ...`, followed by a `<n> row(s)` summary; `SET` and
-`DELETE` print `<n> cell(s) affected`. `SET`/`DELETE` need a non-read-only
-account, same as `set`/`remove`.
+key=value (type), ...`, followed by a `<n> row(s)` summary; `SET`, `UPDATE`,
+and `DELETE` print `<n> cell(s) affected`. `SET` is an upsert and requires
+`IN <range>` (it can create cells; `UPDATE` only ever changes cells that
+already exist). All three writes need a non-read-only account, same as
+`set`/`remove`.
 
 ### Layout
 
