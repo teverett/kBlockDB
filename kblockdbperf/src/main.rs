@@ -11,10 +11,9 @@ use server::{default_kblockdbserver_bin, ManagedServer};
 use std::path::PathBuf;
 
 struct Args {
-    urls: Vec<String>,
+    url: Option<String>,
     kblockdbserver_bin: Option<PathBuf>,
-    instances: usize,
-    base_port: u16,
+    port: u16,
     concurrency: Vec<usize>,
     ops_per_client: usize,
     cells: usize,
@@ -30,10 +29,9 @@ struct Args {
 impl Default for Args {
     fn default() -> Args {
         Args {
-            urls: Vec::new(),
+            url: None,
             kblockdbserver_bin: None,
-            instances: 2,
-            base_port: 18_080,
+            port: 18_080,
             concurrency: vec![1, 8, 32, 128],
             ops_per_client: 50,
             cells: 500,
@@ -55,7 +53,6 @@ const SCENARIO_NAMES: &[&str] = &[
     "region",
     "concurrency_scan",
     "contended_cell",
-    "multi_instance",
 ];
 
 fn parse_args() -> Args {
@@ -63,13 +60,12 @@ fn parse_args() -> Args {
     let mut it = std::env::args().skip(1);
     while let Some(arg) = it.next() {
         match arg.as_str() {
-            "--url" => args.urls.push(expect_value(&mut it, "--url")),
+            "--url" => args.url = Some(expect_value(&mut it, "--url")),
             "--kblockdbserver-bin" => {
                 args.kblockdbserver_bin =
                     Some(PathBuf::from(expect_value(&mut it, "--kblockdbserver-bin")))
             }
-            "--instances" => args.instances = expect_parsed(&mut it, "--instances"),
-            "--base-port" => args.base_port = expect_parsed(&mut it, "--base-port"),
+            "--port" => args.port = expect_parsed(&mut it, "--port"),
             "--concurrency" => args.concurrency = expect_list(&mut it, "--concurrency"),
             "--ops-per-client" => args.ops_per_client = expect_parsed(&mut it, "--ops-per-client"),
             "--cells" => args.cells = expect_parsed(&mut it, "--cells"),
@@ -138,18 +134,14 @@ fn print_help() {
     println!(
         "kblockdbperf -- a performance test suite that drives a real kblockdbserver over HTTP\n\n\
          USAGE:\n    kblockdbperf [OPTIONS]\n\n\
-         By default, spawns its own kblockdbserver instance(s) against a fresh temp data\n\
-         dir and tears them down when done. Pass --url to target an already-running\n\
-         instance instead (repeat --url for a multi_instance comparison against\n\
-         real, separately-deployed instances).\n\n\
+         By default, spawns its own kblockdbserver instance against a fresh temp data\n\
+         dir and tears it down when done. Pass --url to target an already-running\n\
+         instance instead.\n\n\
          OPTIONS:\n    \
-         --url <url>              Target an existing kblockdbserver instead of spawning one\n                              \
-         (repeatable)\n    \
+         --url <url>              Target an existing kblockdbserver instead of spawning one\n    \
          --kblockdbserver-bin <path>   kblockdbserver binary to spawn (default: next to kblockdbperf's\n                              \
          own binary)\n    \
-         --instances <n>          Instances to spawn, sharing one data dir, for\n                              \
-         multi_instance (default: {})\n    \
-         --base-port <n>          First port used for spawned instances (default: {})\n    \
+         --port <n>               Port for the spawned instance (default: {})\n    \
          --concurrency <list>     Comma-separated concurrency levels (default: {})\n    \
          --ops-per-client <n>     Ops each concurrent client runs per level (default: {})\n    \
          --cells <n>              Cells for sequential single-cell scenarios (default: {})\n    \
@@ -160,14 +152,13 @@ fn print_help() {
          --json                   Print results as JSON instead of a table\n    \
          --keep-data-dir          Don't delete the spawned temp data dir on exit\n    \
          --user <name>            Username for kblockdbserver's REST API (default: admin;\n                              \
-         only meaningful with --url -- spawned instances are always\n                              \
+         only meaningful with --url -- a spawned instance is always\n                              \
          driven as admin)\n    \
          --password <pw>          Password for --user. Required with --url (kblockdbserver\n                              \
-         requires login). When spawning instances, defaults to a random\n                              \
+         requires login). When spawning an instance, defaults to a random\n                              \
          per-run password used for both the spawned config and the client\n    \
          -h, --help               Print this help",
-        default.instances,
-        default.base_port,
+        default.port,
         fmt_list(&default.concurrency),
         default.ops_per_client,
         default.cells,
@@ -203,26 +194,22 @@ impl Drop for TempDataDir {
 async fn main() {
     let args = parse_args();
 
-    // Order matters: `_servers` must drop (killing the processes) before
-    // `_data_dir` drops (deleting their data), so declare it first --
-    // Rust drops locals in reverse declaration order.
+    // Order matters: `_server` must drop (killing the process) before
+    // `_data_dir` drops (deleting its data), so declare it first -- Rust
+    // drops locals in reverse declaration order.
     let _data_dir: Option<TempDataDir>;
-    let _servers: Vec<ManagedServer>;
-    let clients: Vec<Client>;
+    let _server: Option<ManagedServer>;
+    let client: Client;
 
-    if !args.urls.is_empty() {
+    if let Some(url) = args.url.clone() {
         let password = args.password.clone().unwrap_or_else(|| {
             eprintln!("--password is required with --url (kblockdbserver requires login)");
             std::process::exit(1);
         });
         _data_dir = None;
-        _servers = Vec::new();
-        clients = args
-            .urls
-            .iter()
-            .map(|u| Client::new(u.clone(), args.user.clone(), password.clone()))
-            .collect();
-        println!("targeting {} existing instance(s)\n", clients.len());
+        _server = None;
+        client = Client::new(url, args.user.clone(), password);
+        println!("targeting existing instance\n");
     } else {
         let bin = args
             .kblockdbserver_bin
@@ -247,13 +234,12 @@ async fn main() {
             std::process::exit(1);
         });
         println!(
-            "spawning {} kblockdbserver instance(s) sharing {}",
-            args.instances,
+            "spawning kblockdbserver instance against {}",
             data_dir.display()
         );
 
         // Always the `admin` account here, regardless of `--user`: the
-        // config this spawns each instance with only ever creates that one
+        // config this spawns the instance with only ever creates that one
         // account (see `ManagedServer::spawn`), so `--user` only matters
         // against an already-running server (`--url`).
         let admin_password = args
@@ -261,23 +247,17 @@ async fn main() {
             .clone()
             .unwrap_or_else(|| format!("kblockdbperf-{}", rand_suffix()));
 
-        let mut servers = Vec::with_capacity(args.instances);
-        for i in 0..args.instances {
-            let addr = format!("127.0.0.1:{}", args.base_port + i as u16);
-            servers.push(ManagedServer::spawn(&bin, &data_dir, &addr, &admin_password).await);
-        }
-        clients = servers
-            .iter()
-            .map(|s| Client::new(s.url.clone(), "admin", admin_password.clone()))
-            .collect();
-        _servers = servers;
+        let addr = format!("127.0.0.1:{}", args.port);
+        let server = ManagedServer::spawn(&bin, &data_dir, &addr, &admin_password).await;
+        client = Client::new(server.url.clone(), "admin", admin_password);
+        _server = Some(server);
         _data_dir = Some(TempDataDir {
             path: data_dir,
             keep: args.keep_data_dir,
         });
     }
 
-    let primary = &clients[0];
+    let primary = &client;
     let health = primary.health().await.unwrap_or_else(|| {
         eprintln!("failed to query /health on the target server");
         std::process::exit(1);
@@ -325,38 +305,6 @@ async fn main() {
                 .await,
         );
     }
-    if want("multi_instance") {
-        if clients.len() >= 2 {
-            for &level in &args.concurrency {
-                results.push(
-                    scenarios::multi_instance(
-                        &clients[..1],
-                        health.axes,
-                        health.world_dim,
-                        level,
-                        args.ops_per_client,
-                    )
-                    .await,
-                );
-                results.push(
-                    scenarios::multi_instance(
-                        &clients,
-                        health.axes,
-                        health.world_dim,
-                        level,
-                        args.ops_per_client,
-                    )
-                    .await,
-                );
-            }
-        } else {
-            eprintln!(
-                "skipping multi_instance: needs 2+ servers (pass --instances 2 or more, or \
-                 two or more --url)"
-            );
-        }
-    }
-
     println!();
     if args.json {
         report::print_json(&results);

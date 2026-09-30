@@ -277,49 +277,6 @@ pub async fn contended_cell(
     results
 }
 
-/// `set` from `concurrency` concurrent clients spread evenly across
-/// `clients` (round-robin), each on its own disjoint cells. Run once with
-/// one server and once with several servers sharing the same data
-/// directory at the same total concurrency, this is what actually shows
-/// multi-process scaling: a single kblockdbserver process serializes every
-/// request through one `Mutex<World>` regardless of kblockdblib's own per-chunk
-/// locking, so that lock only stops mattering once there's more than one
-/// process to spread load across.
-pub async fn multi_instance(
-    clients: &[Client],
-    axes: usize,
-    world_dim: u32,
-    concurrency: usize,
-    ops_per_client: usize,
-) -> ScenarioResult {
-    let clients: Vec<Client> = clients.to_vec();
-    let n_instances = clients.len();
-    let (samples, errors, elapsed) = aggregate(concurrency, ops_per_client, move |worker, n| {
-        let client = clients[worker % clients.len()].clone();
-        async move {
-            let mut samples = Vec::with_capacity(n);
-            let mut errors = 0;
-            for op in 0..n {
-                let seed = (worker * n + op) as u64;
-                let coord = spread_coord(axes, world_dim, seed, 20);
-                let t = client.set_cell(&coord, "bench", seed as i64).await;
-                errors += usize::from(!t.ok);
-                samples.push(t.elapsed);
-            }
-            (samples, errors)
-        }
-    })
-    .await;
-    ScenarioResult {
-        name: "multi_instance".into(),
-        detail: format!(
-            "instances={n_instances}, concurrency={concurrency}, ops_per_client={ops_per_client}"
-        ),
-        throughput: Throughput::new(concurrency * ops_per_client, elapsed),
-        latency: LatencyStats::from_samples(samples, errors),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

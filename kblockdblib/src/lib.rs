@@ -9,8 +9,8 @@
 //! specific (e.g. `kblockdblib::chunk::CHUNK_DIM`).
 
 pub mod chunk;
+mod chunk_locks;
 pub mod coord;
-mod lock;
 pub mod logger;
 pub mod params;
 pub mod schema;

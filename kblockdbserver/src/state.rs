@@ -17,14 +17,21 @@ pub struct Account {
 }
 
 /// No `Mutex` on `world` on purpose. `World`'s own methods take `&self` and
-/// are safe to call concurrently -- its only interior state is a locked
-/// `Schema` and a couple of atomic counters, and the actual per-chunk
-/// concurrency safety comes from OS-level file locks in `with_chunk` (see
-/// `kblockdblib`'s "Concurrency" doc comment on `World`), the same mechanism that
-/// already makes it safe for *separate processes* to share a world. A
-/// `Mutex<World>` here would serialize every request through one lock
-/// regardless of which chunk it touched, throwing that away -- two
-/// requests to unrelated cells would contend for no reason.
+/// are safe to call concurrently from many threads of *this one process* --
+/// its only interior state is a locked `Schema`, a lazily-populated table
+/// of per-chunk `RwLock`s, and a couple of atomic counters (see
+/// `kblockdblib`'s "Concurrency" doc comment on `World`). A `Mutex<World>`
+/// here would serialize every request through one lock regardless of which
+/// chunk it touched, throwing that away -- two requests to unrelated cells
+/// would contend for no reason.
+///
+/// This server must be the only process with this `World`'s data directory
+/// open -- `World`'s locking is in-process only now, not OS-level, so a
+/// second `kblockdbserver` (or anything else) pointed at the same
+/// `--data-dir` at the same time would race it with no coordination at all
+/// and can corrupt data. Run exactly one `kblockdbserver` per data
+/// directory; scale by giving it more threads (it already uses as many as
+/// the async runtime has, see `with_world`), not by running more of it.
 #[derive(Clone)]
 pub struct AppState {
     pub world: Arc<World>,

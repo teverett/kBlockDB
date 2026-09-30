@@ -1,6 +1,6 @@
-//! Spawns (and, on drop, tears down) one or more real `kblockdbserver`
-//! processes for the benchmarks to drive over HTTP -- this crate measures
-//! what a client actually experiences, not kblockdblib's internals directly.
+//! Spawns (and, on drop, tears down) a real `kblockdbserver` process for
+//! the benchmarks to drive over HTTP -- this crate measures what a client
+//! actually experiences, not kblockdblib's internals directly.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -22,10 +22,10 @@ impl ManagedServer {
     ///
     /// kblockdbserver requires a config file with an `admin_password` (its REST
     /// API needs HTTP Basic Auth on everything but `/health`), so this
-    /// writes a minimal one -- named after `addr` so concurrently spawned
-    /// instances (even ones sharing `data_dir`, as `multi_instance` does)
-    /// never collide on the same path -- and points `--config` at it.
-    /// Callers authenticate as `admin`/`admin_password` (see `Client`).
+    /// writes a minimal one -- named after `addr` so two test runs'
+    /// concurrently spawned instances never collide on the same path --
+    /// and points `--config` at it. Callers authenticate as
+    /// `admin`/`admin_password` (see `Client`).
     pub async fn spawn(
         kblockdbserver_bin: &Path,
         data_dir: &Path,

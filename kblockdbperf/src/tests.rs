@@ -1,4 +1,4 @@
-//! Integration tests: spawn a real `kblockdbserver` (or two) and run a real
+//! Integration tests: spawn a real `kblockdbserver` and run a real
 //! scenario against it, checking the result is sane (no errors, the right
 //! op count) rather than just that the helper functions compute correctly
 //! in isolation (see the `#[cfg(test)]` blocks in `stats.rs`/`client.rs`/
@@ -134,32 +134,6 @@ async fn concurrency_scan_scenario_runs_concurrently_with_no_errors() {
     for r in &results {
         assert_eq!(r.latency.errors, 0);
     }
-
-    let _ = std::fs::remove_dir_all(&dir);
-}
-
-#[tokio::test]
-async fn multi_instance_scenario_runs_against_two_servers_sharing_one_data_dir() {
-    let dir = temp_data_dir("multi-instance");
-    let Some(server_a) = spawn_test_server(&dir).await else {
-        return;
-    };
-    let bin = default_kblockdbserver_bin();
-    let server_b = ManagedServer::spawn(
-        &bin,
-        &dir,
-        &format!("127.0.0.1:{}", next_port()),
-        TEST_ADMIN_PASSWORD,
-    )
-    .await;
-
-    let clients = vec![test_client(&server_a), test_client(&server_b)];
-    let health = clients[0].health().await.unwrap();
-
-    let result = scenarios::multi_instance(&clients, health.axes, health.world_dim, 8, 5).await;
-    assert_eq!(result.throughput.ops, 40);
-    assert_eq!(result.latency.errors, 0);
-    assert!(result.detail.contains("instances=2"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

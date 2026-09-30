@@ -1,16 +1,25 @@
-use crate::lock::FileLock;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, PoisonError};
+
+/// Guards `world.txt`'s check-then-maybe-write sequence
+/// (`create_or_validate`) against concurrent *threads* in this process --
+/// there's no other process to guard against any more, since kBlockDB now
+/// assumes exactly one process ever has a world open at a time (see
+/// `World`'s "Concurrency" doc comment). Global rather than one lock per
+/// directory: `World::create`/`open` are cheap, rare, startup-time calls,
+/// so a single process-wide lock is simpler than a table of per-path locks
+/// for no measurable cost.
+static LOCK: Mutex<()> = Mutex::new(());
 
 /// The two numbers that fix a world's shape for its entire lifetime: how
 /// many axes it has, and how many cells wide each axis is. Persisted as
 /// `world.txt` at the world root (`axes\t<n>\nworld_dim\t<n>\n`), written
 /// once by `World::create` (via `create_or_validate`) and never rewritten,
-/// so reopening a world -- or a second process `create`-ing one in the
-/// same directory with different numbers, possibly at the very same
-/// moment -- can't silently change its shape out from under data already
-/// on disk.
+/// so reopening a world -- or a second thread `create`-ing one in the same
+/// directory with different numbers, possibly at the very same moment --
+/// can't silently change its shape out from under data already on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WorldParams {
     pub axes: usize,
@@ -22,30 +31,17 @@ impl WorldParams {
         world_root.join("world.txt")
     }
 
-    /// A sidecar lock file, deliberately *not* `world.txt` itself:
-    /// `read_locked`/`create_or_validate` need to tell "no world here yet"
-    /// apart from "world.txt exists but is empty/corrupt", and
-    /// `FileLock::exclusive`/`shared` create the path they're given if
-    /// it's missing -- locking `world.txt` directly would blur that
-    /// distinction by conjuring an empty `world.txt` into existence just
-    /// from taking the lock.
-    fn lock_path(world_root: &Path) -> PathBuf {
-        world_root.join("world.txt.lock")
-    }
-
     /// Reads `world.txt` at `world_root`, or `None` if this directory has
-    /// no world yet. Takes a shared lock first, so this can never observe
-    /// a `world.txt` another process's `create_or_validate` is mid-way
-    /// through writing.
+    /// no world yet.
     pub fn read(world_root: &Path) -> io::Result<Option<Self>> {
-        let _lock = FileLock::shared(&Self::lock_path(world_root))?;
-        Self::read_locked(world_root)
+        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        Self::read_inner(world_root)
     }
 
     /// Core of `read`, minus the locking -- callers that already hold
-    /// *some* lock on `lock_path` (shared or exclusive) call this
-    /// directly instead of taking a second, redundant one.
-    fn read_locked(world_root: &Path) -> io::Result<Option<Self>> {
+    /// `LOCK` (i.e. `create_or_validate`) call this directly instead of
+    /// taking a second, reentrant-deadlocking lock.
+    fn read_inner(world_root: &Path) -> io::Result<Option<Self>> {
         let path = Self::path(world_root);
         if !path.exists() {
             return Ok(None);
@@ -89,14 +85,13 @@ impl WorldParams {
     /// world yet, creates it with `requested` and returns `true`; if it
     /// already has one, `requested` must match it exactly (returning
     /// `false`) or this errors. The whole check-then-maybe-write sequence
-    /// runs under one exclusive lock, so two processes racing to create
-    /// the very same fresh directory -- possibly with *different* numbers
-    /// -- can't both "win": the second one to actually run sees what the
-    /// first one wrote and is validated against it like any other
-    /// pre-existing world.
+    /// runs under `LOCK`, so two threads racing to create the very same
+    /// fresh directory -- possibly with *different* numbers -- can't both
+    /// "win": the second one to actually run sees what the first one wrote
+    /// and is validated against it like any other pre-existing world.
     pub fn create_or_validate(world_root: &Path, requested: WorldParams) -> io::Result<bool> {
-        let _lock = FileLock::exclusive(&Self::lock_path(world_root))?;
-        match Self::read_locked(world_root)? {
+        let _guard = LOCK.lock().unwrap_or_else(PoisonError::into_inner);
+        match Self::read_inner(world_root)? {
             Some(existing) if existing == requested => Ok(false),
             Some(existing) => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,

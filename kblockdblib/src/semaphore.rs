@@ -3,12 +3,12 @@
 //! a crate just for this would break `kblockdblib`'s zero-dependency stance).
 //!
 //! `World` uses this to cap how much real concurrent filesystem work
-//! (`with_chunk`'s `create_dir_all`/`flock`/file I/O) is in flight at
-//! once -- see the "Concurrency" section of `World`'s doc comment for why
-//! that cap exists at all: on at least one real, fast, local SSD (see
-//! that doc comment for how this was measured), concurrent small-file
-//! metadata operations stopped scaling well past a few dozen in flight,
-//! and piling on more made *aggregate* throughput worse, not better.
+//! (`with_chunk`'s `create_dir_all`/file I/O) is in flight at once -- see
+//! the "Concurrency" section of `World`'s doc comment for why that cap
+//! exists at all: on at least one real, fast, local SSD (see that doc
+//! comment for how this was measured), concurrent small-file metadata
+//! operations stopped scaling well past a few dozen in flight, and piling
+//! on more made *aggregate* throughput worse, not better.
 
 use std::sync::{Condvar, Mutex, PoisonError};
 

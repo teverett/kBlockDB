@@ -91,4 +91,4 @@ jobs:
       - name: Run kblockdbperf (smoke test)
         run: |
           ./target/debug/kblockdbperf --cells 10 --concurrency 1,4 --ops-per-client 5 \
-            --region-edges 2,4 --region-reps 1 --instances 2
+            --region-edges 2,4 --region-reps 1

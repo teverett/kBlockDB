@@ -1,6 +1,6 @@
 use crate::chunk::{self, Chunk, CHUNK_DIM};
+use crate::chunk_locks::ChunkLocks;
 pub use crate::coord::Coord;
-use crate::lock::FileLock;
 use crate::params::WorldParams;
 use crate::schema::Schema;
 use crate::semaphore::Semaphore;
@@ -10,7 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Mutex, MutexGuard, PoisonError, RwLockReadGuard, RwLockWriteGuard};
 
 /// Whether a `World::with_chunk` call means to only read a chunk or to
 /// (possibly) write it -- see that method.
@@ -18,6 +18,17 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 enum Access {
     Read,
     Write,
+}
+
+/// Whatever `with_chunk` got back from locking a chunk's `RwLock` for
+/// `access` -- kept alive (as `_guard`) for the rest of the call so the
+/// lock is held for its whole read-apply-[write] sequence, then dropped
+/// (releasing it) when `with_chunk` returns. Neither variant's guard is
+/// ever read -- only held, for its `Drop` -- hence `allow(dead_code)`.
+#[allow(dead_code)]
+enum ChunkGuard<'a> {
+    Read(RwLockReadGuard<'a, ()>),
+    Write(RwLockWriteGuard<'a, ()>),
 }
 
 /// Default number of spatial axes for a *new* world, i.e. what `main`'s demo
@@ -35,7 +46,7 @@ pub const AXES: usize = 3;
 pub const WORLD_DIM: u32 = 10_000;
 
 /// Default cap on how many `with_chunk` calls -- i.e. real concurrent
-/// filesystem operations (`create_dir_all`/`flock`/file I/O) -- a `World`
+/// filesystem operations (`create_dir_all`/file I/O) -- a `World`
 /// will have in flight at once. Override with
 /// `World::with_max_concurrent_disk_ops`.
 ///
@@ -150,11 +161,10 @@ impl Iterator for RegionIter {
 /// The on-disk, chunked, columnar key-value world.
 ///
 /// Layout on disk under `root`:
-///   root/world.txt                       -- this world's axes/world_dim (see params.rs)
-///   root/schema.txt                      -- key string <-> id registry (see schema.rs)
-///   root/<c0>/<c1>/.../<c_n-1>.chunk      -- one file per non-empty chunk,
-///                                            nested axes-1 directories deep
-///   root/<c0>/<c1>/.../<c_n-1>.chunk.lock -- that chunk's lock file (see below)
+///   root/world.txt                  -- this world's axes/world_dim (see params.rs)
+///   root/schema.txt                 -- key string <-> id registry (see schema.rs)
+///   root/<c0>/<c1>/.../<c_n-1>.chunk -- one file per non-empty chunk,
+///                                       nested axes-1 directories deep
 ///
 /// The directory nesting keeps any single directory to at most
 /// `chunks_per_axis()` entries no matter how large the world gets, and
@@ -163,37 +173,52 @@ impl Iterator for RegionIter {
 /// proportional to how much of it is actually populated, not to its
 /// nominal size.
 ///
-/// **Concurrency.** Any number of processes (e.g. multiple `kblockdbserver`
-/// instances) can safely open the same `root` at once: every operation
-/// locks (via `crate::lock::FileLock`) exactly the chunk file(s) it
-/// touches -- shared for a read, exclusive for a write -- reads that
-/// chunk's *current* on-disk contents fresh, applies the change, and
-/// writes it straight back before releasing the lock, all before
-/// returning. There is no in-process cache of chunk contents to go stale
-/// or to lose an update on eviction: every `set`/`remove` is durable the
-/// moment its call returns, and every `get` sees whatever the last writer
-/// actually wrote, never a stale or partially-written copy. The schema
-/// (`schema.rs`) gets the same treatment: interning a new key takes an
-/// exclusive lock on `schema.txt` and re-reads it first, so two processes
-/// racing to intern two *different* new keys can't collide on the same
-/// id. What this does *not* give you is cross-call atomicity: a `get`
-/// immediately followed by a `set` from the same caller is two separate
-/// locked operations, not one transaction, so another process's write can
-/// land in between them -- same as most simple key/value stores without
-/// an explicit read-modify-write or transaction API.
+/// **Concurrency.** Exactly one `World` is ever meant to be open against a
+/// given `root` at a time, shared across as many *threads* of that one
+/// process as needed -- not one `World` per thread, and never two
+/// processes pointed at the same directory at once (see `kblockdbserver/
+/// src/state.rs`, which holds its one `World` behind a plain `Arc`, shared
+/// by every request-handling thread). Within that one `World`, every
+/// operation locks (via `crate::chunk_locks::ChunkLocks`, a plain
+/// in-memory per-chunk `RwLock`, not an OS-level file lock) exactly the
+/// chunk(s) it touches -- shared for a read, exclusive for a write --
+/// reads that chunk's *current* on-disk contents fresh, applies the
+/// change, and writes it straight back before releasing the lock, all
+/// before returning. There is no in-process cache of chunk contents to go
+/// stale or to lose an update on eviction: every `set`/`remove` is durable
+/// the moment its call returns, and every `get` sees whatever the last
+/// writer actually wrote, never a stale or partially-written copy. The
+/// schema (`schema.rs`) gets the same treatment: it's held behind `World`'s
+/// own `Mutex<Schema>`, so two threads racing to intern two *different*
+/// new keys can't collide on the same id. What this does *not* give you is
+/// cross-call atomicity: a `get` immediately followed by a `set` from the
+/// same caller is two separate locked operations, not one transaction, so
+/// another thread's write can land in between them -- same as most simple
+/// key/value stores without an explicit read-modify-write or transaction
+/// API.
 ///
 /// **All of this is also why every method takes `&self`, not `&mut
 /// self`.** `World` holds no cache and no other state that a second
-/// concurrent call could corrupt in-process -- its only interior state is
-/// `schema` (behind its own `Mutex`) and two atomic counters -- so a
-/// single process can hold one `World` behind an `Arc` (no outer `Mutex`
-/// needed) and let concurrent requests actually run concurrently, limited
-/// only by the same per-chunk file locks that already make concurrent
-/// *processes* safe. `kblockdbserver` does exactly this (see
-/// `kblockdbserver/src/state.rs`): earlier, it serialized every request through
-/// one `Mutex<World>`, which meant one slow request -- or just a lot of
-/// concurrent ones -- stalled every other request in that process
+/// concurrent call could corrupt -- its only interior state is `schema`
+/// (behind its own `Mutex`), a lazily-populated table of per-chunk locks,
+/// and a couple of atomic counters -- so the one process can hold its one
+/// `World` behind an `Arc` (no outer `Mutex<World>` needed) and let
+/// concurrent requests actually run concurrently, limited only by the same
+/// per-chunk locks that keep two threads from corrupting the same chunk.
+/// `kblockdbserver` does exactly this: earlier, it serialized every
+/// request through one `Mutex<World>`, which meant one slow request -- or
+/// just a lot of concurrent ones -- stalled every other request
 /// regardless of whether they touched the same chunk at all.
+///
+/// **Opening more than one `World` (in this process or another) against
+/// the same `root` at the same time is not supported and will corrupt
+/// data.** Each `World` keeps its own private chunk-lock table and its own
+/// private `Schema` cache, so two independent `World`s have no way to
+/// coordinate a write to the same chunk file -- exactly the failure mode
+/// the old, OS-level-file-lock-based design existed to prevent when
+/// multiple processes were a supported deployment shape. They no longer
+/// are: run exactly one process, with as many threads as you like, sharing
+/// one `World`.
 /// Aggregate on-disk statistics for a world's data, as of whenever
 /// `World::stats` was called -- a live snapshot, not tracked incrementally,
 /// so it reflects concurrent writers too (see `World::stats`).
@@ -234,6 +259,9 @@ pub struct World {
     /// Caps how many `with_chunk` calls run concurrently -- see
     /// `DEFAULT_MAX_CONCURRENT_DISK_OPS`.
     disk_io: Semaphore,
+    /// One in-memory `RwLock` per chunk actually touched so far -- see
+    /// `with_chunk` and `crate::chunk_locks`.
+    chunk_locks: ChunkLocks<ChunkKey>,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -315,6 +343,7 @@ impl World {
             chunks_read_from_disk: AtomicU64::new(0),
             chunks_written_to_disk: AtomicU64::new(0),
             disk_io: Semaphore::new(DEFAULT_MAX_CONCURRENT_DISK_OPS),
+            chunk_locks: ChunkLocks::new(),
         })
     }
 
@@ -436,22 +465,16 @@ impl World {
         Ok((ckey, local_idx))
     }
 
-    fn chunk_lock_path(&self, ckey: &ChunkKey) -> PathBuf {
-        let mut p = self.chunk_path(ckey).into_os_string();
-        p.push(".lock");
-        PathBuf::from(p)
-    }
-
     /// Runs `f` against chunk `ckey`'s *current* on-disk contents, having
-    /// first acquired `access` on that chunk's lock file -- shared for
-    /// `Access::Read`, exclusive for `Access::Write`. `f` gets a `Chunk`
-    /// freshly read from disk (or a fresh empty one, if the chunk has
-    /// never been written), and for `Access::Write` that chunk is written
-    /// straight back (or its file deleted, if `f` left it empty) before
-    /// the lock is released. This is the one place `World` touches a
-    /// chunk file, and it's the whole of `World`'s cross-process
-    /// concurrency story -- see the "Concurrency" section of `World`'s own
-    /// doc comment.
+    /// first acquired `access` on that chunk's in-memory lock -- shared
+    /// for `Access::Read`, exclusive for `Access::Write` (see
+    /// `crate::chunk_locks`). `f` gets a `Chunk` freshly read from disk (or
+    /// a fresh empty one, if the chunk has never been written), and for
+    /// `Access::Write` that chunk is written straight back (or its file
+    /// deleted, if `f` left it empty) before the lock is released. This is
+    /// the one place `World` touches a chunk file, and it's the whole of
+    /// `World`'s concurrency story -- see the "Concurrency" section of
+    /// `World`'s own doc comment.
     fn with_chunk<T>(
         &self,
         ckey: &ChunkKey,
@@ -461,16 +484,21 @@ impl World {
         // Held for the rest of this function -- see `disk_io`'s field doc
         // comment and `DEFAULT_MAX_CONCURRENT_DISK_OPS`. Acquired before
         // any filesystem call at all, including `create_dir_all`: that one
-        // showed the same concurrency-128 slowdown as the lock/read/write
-        // calls below it when measured in isolation, so it's inside the
-        // cap too, not just the chunk file I/O.
+        // showed the same concurrency-128 slowdown as the read/write calls
+        // below it when measured in isolation, so it's inside the cap too,
+        // not just the chunk file I/O.
         let _permit = self.disk_io.acquire();
 
-        let lock_path = self.chunk_lock_path(ckey);
-        fs::create_dir_all(lock_path.parent().unwrap())?;
-        let _lock = match access {
-            Access::Read => FileLock::shared(&lock_path)?,
-            Access::Write => FileLock::exclusive(&lock_path)?,
+        // Kept alive for the rest of this function so `_guard` (below) can
+        // borrow through it -- see `ChunkLocks::get`.
+        let chunk_lock = self.chunk_locks.get(ckey);
+        let _guard = match access {
+            Access::Read => {
+                ChunkGuard::Read(chunk_lock.read().unwrap_or_else(PoisonError::into_inner))
+            }
+            Access::Write => {
+                ChunkGuard::Write(chunk_lock.write().unwrap_or_else(PoisonError::into_inner))
+            }
         };
 
         let chunk_path = self.chunk_path(ckey);
@@ -491,6 +519,7 @@ impl World {
                 // -- don't leave a pointless empty file around.
                 let _ = fs::remove_file(&chunk_path);
             } else {
+                fs::create_dir_all(chunk_path.parent().unwrap())?;
                 let file = File::create(&chunk_path)?;
                 let mut w = BufWriter::new(file);
                 chunk.write_to(&mut w)?;
@@ -517,7 +546,7 @@ impl World {
         // this doubles as a request-validation boundary for callers (like
         // kblockdbserver) that pass through attacker-/user-supplied coordinates.
         let (ckey, local_idx) = self.split(coord)?;
-        let Some(key_id) = self.schema().id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(None); // this key has never been written anywhere in the world
         };
         self.with_chunk(&ckey, Access::Read, |chunk| chunk.get(local_idx, key_id))
@@ -542,7 +571,7 @@ impl World {
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
         let (ckey, local_idx) = self.split(coord)?;
-        let Some(key_id) = self.schema().id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key) else {
             // Distinct from "key exists but isn't set on this cell"
             // (routine, logged as INFO below): this key has never been
             // interned anywhere in the world, which more likely means a
@@ -607,7 +636,7 @@ impl World {
     pub fn get_region(&self, region: &Region, key: &str) -> io::Result<Vec<Option<Value>>> {
         self.check_region(region)?;
         let mut out = vec![None; region.volume() as usize];
-        let Some(key_id) = self.schema().id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(out); // never interned anywhere: every cell is None
         };
         for (ckey, cells) in self.group_region_by_chunk(region)? {
@@ -685,7 +714,7 @@ impl World {
         if region.volume() == 0 {
             return Ok(());
         }
-        let Some(key_id) = self.schema().id_for_key(key)? else {
+        let Some(key_id) = self.schema().id_for_key(key) else {
             crate::logger::warn(format!(
                 "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
             ));
@@ -1486,29 +1515,27 @@ mod tests {
         assert!(got.iter().all(|v| *v == Some(Value::Str("stone".into()))));
     }
 
-    // --- Concurrency: multiple independent `World` handles on one directory ---
+    // --- Concurrency: many threads sharing one `World` ---
     //
-    // These open a separate `World::open` handle per thread rather than
-    // sharing one `World` across threads: the locking this crate relies on
-    // (`crate::lock::FileLock`) is OS-level, per open file description, so
-    // independent handles genuinely exercise the same cross-*process*
-    // exclusion multiple `kblockdbserver` instances would rely on -- not just
-    // "was `&mut World` enforced", which the type system already
-    // guarantees for free and wouldn't be testing anything.
+    // kBlockDB now assumes exactly one `World` is ever open against a given
+    // directory at a time (see `World`'s "Concurrency" doc comment), so
+    // these share one `World` behind an `Arc` across every thread -- the
+    // actually-supported shape -- rather than opening a separate `World`
+    // handle per thread the way an older, cross-process-safe design's
+    // tests did.
 
     #[test]
     fn concurrent_writers_to_sibling_keys_on_the_same_cell_do_not_lose_updates() {
         let dir = TempDir::new("concurrent-siblings");
-        World::create(&dir, AXES, WORLD_DIM).unwrap();
+        let w = std::sync::Arc::new(create(&dir));
         let c = coord3(1, 1, 1);
         let n = 16;
 
         let handles: Vec<_> = (0..n)
             .map(|i| {
-                let path = PathBuf::from(dir.as_ref());
+                let w = std::sync::Arc::clone(&w);
                 let c = c.clone();
                 thread::spawn(move || {
-                    let w = World::open(&path).unwrap();
                     w.set(&c, &format!("key{i}"), Value::I64(i)).unwrap();
                 })
             })
@@ -1517,7 +1544,6 @@ mod tests {
             h.join().unwrap();
         }
 
-        let w = World::open(&dir).unwrap();
         for i in 0..n {
             assert_eq!(
                 w.get(&c, &format!("key{i}")).unwrap(),
@@ -1530,20 +1556,20 @@ mod tests {
     #[test]
     fn concurrent_interning_of_different_new_keys_does_not_collide() {
         // Regression: Schema::intern used to compute a new key's id from
-        // its own in-memory count without ever re-checking schema.txt, so
-        // two processes interning two different new keys at once could
-        // both assign the same id -- corrupting schema.txt (a
-        // non-dense/out-of-order id sequence) badly enough that even
-        // *reopening* the world later would panic.
+        // its own in-memory count without any synchronization, so two
+        // threads interning two different new keys at once could both
+        // assign the same id -- corrupting schema.txt (a non-dense/
+        // out-of-order id sequence) badly enough that even *reopening* the
+        // world later would panic. `World`'s `Mutex<Schema>` is what
+        // prevents that now (see `Schema`'s "Concurrency" doc comment).
         let dir = TempDir::new("concurrent-intern");
-        World::create(&dir, AXES, WORLD_DIM).unwrap();
+        let w = std::sync::Arc::new(create(&dir));
         let n = 16;
 
         let handles: Vec<_> = (0..n)
             .map(|i| {
-                let path = PathBuf::from(dir.as_ref());
+                let w = std::sync::Arc::clone(&w);
                 thread::spawn(move || {
-                    let w = World::open(&path).unwrap();
                     w.set(&coord3(0, 0, 0), &format!("key{i}"), Value::I64(i))
                         .unwrap();
                 })
@@ -1553,13 +1579,12 @@ mod tests {
             h.join().unwrap();
         }
 
-        // Reopening must not panic (the dense/in-order id invariant must
-        // still hold), and every key must have made it in with its own
-        // distinct id -- if two keys had collided on one id, at least one
-        // of these reads would come back wrong (a different key's value,
-        // or a type mismatch panic in Chunk::set from two different
-        // value types sharing a column).
-        let w = World::open(&dir).unwrap();
+        // Every key must have made it in with its own distinct id -- if
+        // two keys had collided on one id, at least one of these reads
+        // would come back wrong (a different key's value, or a type
+        // mismatch panic in Chunk::set from two different value types
+        // sharing a column). Reopening must also not panic (the
+        // dense/in-order id invariant must still hold on disk).
         assert_eq!(w.schema_len(), n as usize);
         for i in 0..n {
             assert_eq!(
@@ -1567,12 +1592,14 @@ mod tests {
                 Some(Value::I64(i))
             );
         }
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(reopened.schema_len(), n as usize);
     }
 
     #[test]
     fn concurrent_set_region_on_overlapping_regions_does_not_corrupt_a_chunk() {
         let dir = TempDir::new("concurrent-overlapping-regions");
-        World::create(&dir, AXES, WORLD_DIM).unwrap();
+        let w = std::sync::Arc::new(create(&dir));
 
         // Same box, different keys: both threads' writes land fully in the
         // same set of chunks, at the same time, under different keys --
@@ -1583,11 +1610,10 @@ mod tests {
         let handles: Vec<_> = ["a", "b"]
             .into_iter()
             .map(|key| {
-                let path = PathBuf::from(dir.as_ref());
+                let w = std::sync::Arc::clone(&w);
                 let region = region.clone();
                 let values = fill(&region, Value::Str(key.into()));
                 thread::spawn(move || {
-                    let w = World::open(&path).unwrap();
                     w.set_region(&region, key, &values).unwrap();
                 })
             })
@@ -1596,7 +1622,6 @@ mod tests {
             h.join().unwrap();
         }
 
-        let w = World::open(&dir).unwrap();
         let a = w.get_region(&region, "a").unwrap();
         let b = w.get_region(&region, "b").unwrap();
         assert!(a.iter().all(|v| *v == Some(Value::Str("a".into()))));

@@ -1,4 +1,4 @@
-# kblockdb
+# kBlockDB
 
 A Cargo workspace with four crates:
 
@@ -15,9 +15,8 @@ A Cargo workspace with four crates:
   dependency-free constraint was specific to `kblockdblib`'s storage format, not to
   everything built on top of it.
 - **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
-  (or several) over real HTTP and measures it: single-cell and region
-  throughput/latency, concurrency scaling, lock contention, and multi-process
-  scaling across several instances sharing one data directory.
+  over real HTTP and measures it: single-cell and region throughput/latency,
+  concurrency scaling, and lock contention.
 - **`kblockdbcli`** -- a small command-line client for kblockdbserver's REST API:
   `get`/`set`/`remove` a single cell's value from a shell, authenticating
   like `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
@@ -84,49 +83,64 @@ kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdb
 
 ### Concurrency
 
-Any number of processes -- multiple `kblockdbserver` instances included -- can
-safely share one world directory. There's no in-process cache to go stale
-or to lose an update on eviction: every `get`/`set`/`remove` (and, at chunk
-granularity, every `*_region` call) takes an OS-level advisory lock
-(`kblockdblib/src/lock.rs`, via `std::fs::File::lock`/`lock_shared` -- stable in
-`std`, so this needs no dependency either) on exactly the chunk file(s) it
-touches, shared for a read and exclusive for a write, reads that chunk's
-*current* on-disk contents fresh, applies the change, and (for a write)
-writes it straight back before releasing the lock and returning. The
-schema (`schema.txt`) gets the same treatment: interning a new key takes an
-exclusive lock and re-reads the file first, so two processes racing to
-intern two *different* new keys can't collide on the same id (which used
-to be able to corrupt `schema.txt` badly enough that even reopening the
-world later would fail). `World::create` is similarly race-free: two
-processes racing to create the very same fresh directory, possibly with
-*different* `axes`/`world_dim`, resolve safely -- one creates it, the other
-sees what was just created and is validated against it like any other
-pre-existing world, under one exclusive lock around the whole
-check-then-maybe-write sequence.
+**kBlockDB assumes exactly one process, with as many threads as you like,
+ever has a given world directory open at a time.** There is no
+cross-process coordination any more (see below for why) -- run exactly one
+`kblockdbserver` per `--data-dir`, never two pointed at the same
+directory, and never open more than one `World` handle on the same
+directory concurrently within one process either.
+
+Within that one process, any number of threads can share one `World`
+safely. There's no in-process cache to go stale or to lose an update on
+eviction: every `get`/`set`/`remove` (and, at chunk granularity, every
+`*_region` call) takes an in-memory lock (`kblockdblib/src/chunk_locks.rs`, a
+plain `std::sync::RwLock` per chunk, created lazily the first time that
+chunk is touched) on exactly the chunk(s) it touches, shared for a read
+and exclusive for a write, reads that chunk's *current* on-disk contents
+fresh, applies the change, and (for a write) writes it straight back
+before releasing the lock and returning. The schema (`schema.txt`) gets
+the same treatment: it lives behind `World`'s own `Mutex<Schema>`, so two
+threads racing to intern two *different* new keys can't collide on the
+same id. `World::create` is similarly race-free under concurrent threads:
+a process-wide lock guards the whole check-then-maybe-write sequence, so
+two threads racing to create the very same fresh directory, possibly with
+*different* `axes`/`world_dim`, resolve safely.
 
 What this does *not* give you is cross-call atomicity: a `get` immediately
 followed by a `set` from the same caller is two separate locked
-operations, not one transaction, so another process's write can land in
+operations, not one transaction, so another thread's write can land in
 between them -- same as most simple key/value stores without an explicit
 read-modify-write or transaction API.
 
-The cost of dropping the in-process cache is that every single-cell
-operation is now its own disk round trip (a chunk touched by four `set`
-calls in a row, even for four different keys on the same cell, is four
-separate chunk-file rewrites, not one batched one) -- correctness across
-processes traded away the free win a private, unsynchronized cache used to
-give a single process. `get_region`/`set_region`/`remove_region` claw part
-of that back for the common case where a region spans far fewer chunks
-than cells: they group a region's cells by chunk first, so each chunk a
-region touches is still locked, read, and (for a write) written back
-exactly once, no matter how many of the region's cells land in it.
+There's still no in-process *cache* of chunk contents (see the design
+bullets above), so every single-cell operation is its own disk round trip
+(a chunk touched by four `set` calls in a row, even for four different
+keys on the same cell, is four separate chunk-file rewrites, not one
+batched one). `get_region`/`set_region`/`remove_region` claw part of that
+back for the common case where a region spans far fewer chunks than
+cells: they group a region's cells by chunk first, so each chunk a region
+touches is still locked, read, and (for a write) written back exactly
+once, no matter how many of the region's cells land in it.
 
 **Every `World` method takes `&self`, not `&mut self`.** `World` holds no
-cache -- its only interior state is a locked `Schema` and a couple of
-atomic counters -- so a single process can share one `World` behind a
-plain `Arc` (no `Mutex<World>` needed) and let concurrent calls actually
-run concurrently, limited only by the same per-chunk file locks that
-already make concurrent *processes* safe. `kblockdbserver` does exactly this.
+cache -- its only interior state is a locked `Schema`, a lazily-populated
+table of per-chunk `RwLock`s, and a couple of atomic counters -- so the one
+process can share one `World` behind a plain `Arc` (no `Mutex<World>`
+needed) and let concurrent calls actually run concurrently, limited only
+by the same per-chunk locks that keep two threads from corrupting the
+same chunk. `kblockdbserver` does exactly this.
+
+**Why not just keep the old OS-level file locks and support multiple
+processes too?** An earlier version of kBlockDB did exactly that (an
+advisory `flock` per chunk, so any number of processes -- e.g. several
+`kblockdbserver`s behind a load balancer -- could safely share one world
+directory). Committing to a single multi-threaded process instead trades
+that away for two things: an in-memory `RwLock` needs no syscall to
+acquire (the old design's `open`/`lock` on a sidecar `.lock` file per
+chunk was itself real, measurable filesystem work -- see the concurrency
+cap below), and the schema no longer needs to re-read `schema.txt` on
+every cache miss (see `Schema`'s doc comment) since nothing else can have
+appended to it behind this process's back.
 
 **Concurrent filesystem operations don't scale indefinitely, though.**
 Measured on one real, fast, local SSD: going from 1 to 8-32 concurrent
@@ -134,7 +148,7 @@ Measured on one real, fast, local SSD: going from 1 to 8-32 concurrent
 roughly doubled throughput, as expected -- but pushing to 128 concurrent
 calls made aggregate throughput *worse* than at 1, not just diminishing --
 confirmed to be real OS/filesystem-level contention (reproduced with a
-synthetic probe doing only `create_dir_all`/`flock`/file I/O, no `kblockdblib` code
+synthetic probe doing only `create_dir_all`/file I/O, no `kblockdblib` code
 at all, and ruled out an in-memory `Mutex` bottleneck the same way: a pure
 lock-contention probe at the same thread count showed no degradation at
 all). `World` caps how many `with_chunk` calls run concurrently
@@ -214,10 +228,10 @@ packed value array. That costs two different things:
   prototype could use -- `Coord` avoids a `Vec<u32>`-per-coordinate heap
   allocation for the common case (a handful of axes) without adding a
   `smallvec` dependency.
-- `kblockdblib/src/lock.rs`   -- `FileLock`, the RAII wrapper around
-  `std::fs::File::lock`/`lock_shared` everything else in this list uses for
-  cross-process locking (see "Concurrency" above). Private to the crate --
-  an implementation detail, not part of the public API.
+- `kblockdblib/src/chunk_locks.rs` -- `ChunkLocks`, the in-memory,
+  per-chunk `RwLock` table `World::with_chunk` locks against (see
+  "Concurrency" above). Private to the crate -- an implementation detail,
+  not part of the public API.
 - `kblockdblib/src/params.rs` -- `WorldParams` (axes, world_dim), read/written as
   `world.txt` at the world root, and `create_or_validate`, the one
   lock-guarded operation `World::create` needs.
@@ -283,11 +297,13 @@ OPTIONS:
 `--data-dir` (via `World::create`); reopening an existing one reads its
 real shape back from its `world.txt` and ignores these flags.
 
-**Multiple `kblockdbserver` instances can safely point `--data-dir` at the same
-directory** -- e.g. several instances behind a load balancer -- and read
-and write concurrently without corrupting anything. `kblockdblib` itself is what
-makes that safe (see its "Concurrency" section above); this server doesn't
-need to know or do anything special.
+**Run exactly one `kblockdbserver` process per `--data-dir`.** `kblockdblib`'s
+locking is in-process only now (see its "Concurrency" section above), so a
+second `kblockdbserver` -- or anything else -- pointed at the same
+directory at the same time has no way to coordinate with the first and
+can corrupt data. Scale by giving this one process more concurrent
+requests (it already handles them on as many threads as the async runtime
+has), not by running more of it.
 
 ### Config file
 
@@ -452,16 +468,16 @@ curl -u admin:change-me localhost:8080/stats
 
 ## `kblockdbperf`: the performance test suite
 
-Drives a real `kblockdbserver` process (by default, one or more it spawns and
-tears down itself) over real HTTP and measures it -- this is a measurement
-of what a client actually experiences, not a microbenchmark of `kblockdblib`'s
+Drives a real `kblockdbserver` process (by default, one it spawns and tears
+down itself) over real HTTP and measures it -- this is a measurement of
+what a client actually experiences, not a microbenchmark of `kblockdblib`'s
 internals.
 
 ### Build & run
 
 ```sh
 cargo build --workspace --release
-./target/release/kblockdbperf                       # spawns its own instance(s), runs every scenario
+./target/release/kblockdbperf                       # spawns its own instance, runs every scenario
 ./target/release/kblockdbperf --scenario set_cell    # just one scenario
 ./target/release/kblockdbperf --json > results.json  # machine-readable output
 
@@ -470,16 +486,16 @@ cargo build --workspace --release
 ./target/release/kblockdbperf --url http://localhost:8080 --user admin --password change-me
 ```
 
-When it spawns its own instance(s), kblockdbperf writes each one a minimal
-config file itself (`admin_password` only) and authenticates as `admin`
+When it spawns its own instance, kblockdbperf writes it a minimal config
+file itself (`admin_password` only) and authenticates as `admin`
 automatically -- `--user`/`--password` only matter with `--url`, against a
 server whose config you don't control. Pass `--password` to pin the
-generated instances' password too (e.g. to `curl` one mid-run); otherwise
+generated instance's password too (e.g. to `curl` it mid-run); otherwise
 it's a random one-off.
 
 Run `--help` for the full flag list (concurrency levels, op counts, region
-sizes, instance count, etc.) -- everything has a default chosen to finish a
-full run in well under a minute, and every default is overridable.
+sizes, etc.) -- everything has a default chosen to finish a full run in
+well under a minute, and every default is overridable.
 
 ### Scenarios
 
@@ -501,30 +517,15 @@ full run in well under a minute, and every default is overridable.
 - **`contended_cell`** -- the same concurrency sweep, but every client
   targets the *same* cell (different keys, so it's not just racing an
   identical overwrite). `kblockdblib::World::set` takes an exclusive lock on that
-  cell's chunk file per call and must read-modify-write the *whole* chunk
-  file every time (more expensive the more distinct keys have accumulated
-  in it), so this is typically much slower than `concurrency_scan` even at
+  cell's chunk per call and must read-modify-write the *whole* chunk file
+  every time (more expensive the more distinct keys have accumulated in
+  it), so this is typically much slower than `concurrency_scan` even at
   the same concurrency level -- contrasting the two is the point.
-- **`multi_instance`** -- the same disjoint-cell concurrency sweep, run
-  once against one server and once against several servers (`--instances`,
-  sharing one data directory, round-robin) at the same total concurrency.
-  A single `kblockdbserver` process serializes every request through one
-  `Mutex<World>` regardless of `kblockdblib`'s own per-chunk locking (see
-  `kblockdbserver/src/state.rs`), so that lock only stops being the bottleneck
-  once there's more than one *process* to spread load across -- this is
-  the scenario that actually demonstrates multi-process scaling, and the
-  reason `kblockdbperf` spawns multiple instances by default. Interpreting the
-  result honestly: on one machine, multiple `kblockdbserver` processes also
-  compete for the same CPU cores and disk, so how much (if any) improvement
-  shows up depends on real available headroom -- this scenario is most
-  meaningful comparing genuinely separate deployments (e.g. `--url` pointed
-  at instances on different machines/containers), where that competition
-  doesn't exist.
 
 ### Layout
 
 - `kblockdbperf/src/main.rs`      -- CLI parsing and orchestration: spawn or
-  connect to server(s), run the selected scenarios, print the report.
+  connect to a server, run the selected scenarios, print the report.
 - `kblockdbperf/src/client.rs`    -- a thin async HTTP client for kblockdbserver's
   REST API (every value used is an `i64`, so payload shape stays constant
   across scenarios).
@@ -538,8 +539,7 @@ full run in well under a minute, and every default is overridable.
   this doesn't have).
 - `kblockdbperf/src/report.rs`    -- table/JSON output.
 - `kblockdbperf/src/tests.rs`     -- integration tests that spawn a real
-  `kblockdbserver` (or two, sharing one data dir) and run a real scenario
-  against it.
+  `kblockdbserver` and run a real scenario against it.
 
 ## `kblockdbcli`: the command-line client
 
