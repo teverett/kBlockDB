@@ -29,6 +29,7 @@ utoipa-swagger-ui = { version = "10", features = ["axum"] }
 # The query language's grammar (query.pest) -- see query.rs.
 pest = "2"
 pest_derive = "2"
+hostname = "0.4.2"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -102,8 +102,17 @@ pub fn router(state: AppState) -> Router {
 #[derive(Serialize, ToSchema)]
 pub struct HealthResponse {
     status: String,
+    /// Which instance answered -- the OS hostname, or whatever the
+    /// `hostname` config key overrides it to. Useful behind a load
+    /// balancer, where the point of polling `/rest/health` is often to
+    /// find out *which* backend is unhealthy.
+    hostname: String,
     axes: usize,
     world_dim: u32,
+    /// Cells per axis in one chunk file -- the world's on-disk
+    /// granularity, fixed when the world was created (see
+    /// `kblockdblib::World::chunk_dim`).
+    chunk_dim: u32,
     /// Seconds since the Unix epoch, per this server's own clock -- lets a
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
@@ -119,12 +128,15 @@ pub struct HealthResponse {
     ),
 )]
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    // No lock needed at all: World::axes/world_dim are plain field reads
-    // via &self, and state.world is a bare Arc<World> now (see state.rs).
+    // No lock needed at all: World::axes/world_dim/chunk_dim are plain
+    // field reads via &self, and state.world is a bare Arc<World> now
+    // (see state.rs).
     Json(HealthResponse {
         status: "ok".to_string(),
+        hostname: state.hostname.to_string(),
         axes: state.world.axes(),
         world_dim: state.world.world_dim(),
+        chunk_dim: state.world.chunk_dim(),
         timestamp: unix_timestamp(),
     })
 }

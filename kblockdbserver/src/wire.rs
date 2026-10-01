@@ -73,7 +73,8 @@
 //! 0x05 Unauthorized: <message>
 //! 0x06 Forbidden:    <message>
 //! 0x07 Internal:     <message>
-//! 0x08 Health:       [u8 axes][u32 LE world_dim][u64 LE timestamp_seconds]
+//! 0x08 Health:       [u8 axes][u32 LE world_dim][u32 LE chunk_dim]
+//!                    [u64 LE timestamp_seconds] <hostname as a message>
 //! 0x09 Stats:        [u64 LE total_chunks][u64 LE total_bytes][u64 LE total_blocks]
 //! 0x0a RegionValues: [u32 LE count][count * ([u8 present] [<value> if present])]
 //! 0x0b Query:        [u8 kind] <query-specific fields>
@@ -204,7 +205,9 @@ pub enum Response {
     Health {
         axes: u8,
         world_dim: u32,
+        chunk_dim: u32,
         timestamp: u64,
+        hostname: String,
     },
     Stats {
         total_chunks: u64,
@@ -387,12 +390,16 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
         Response::Health {
             axes,
             world_dim,
+            chunk_dim,
             timestamp,
+            hostname,
         } => {
             buf.push(0x08);
             buf.push(*axes);
             buf.extend_from_slice(&world_dim.to_le_bytes());
+            buf.extend_from_slice(&chunk_dim.to_le_bytes());
             buf.extend_from_slice(&timestamp.to_le_bytes());
+            put_message(&mut buf, hostname);
         }
         Response::Stats {
             total_chunks,
@@ -717,7 +724,9 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
         0x08 => Ok(Response::Health {
             axes: r.u8()?,
             world_dim: r.u32()?,
+            chunk_dim: r.u32()?,
             timestamp: r.u64()?,
+            hostname: r.message()?,
         }),
         0x09 => Ok(Response::Stats {
             total_chunks: r.u64()?,
@@ -964,7 +973,19 @@ mod tests {
         roundtrip_response(Response::Health {
             axes: 3,
             world_dim: 10_000,
+            chunk_dim: 32,
             timestamp: 123,
+            hostname: "db-1.example.com".into(),
+        });
+        // An empty hostname is still a well-formed frame -- the server
+        // substitutes "unknown" rather than sending one, but decoding
+        // must not depend on that.
+        roundtrip_response(Response::Health {
+            axes: 1,
+            world_dim: 1,
+            chunk_dim: 1,
+            timestamp: 0,
+            hostname: String::new(),
         });
         roundtrip_response(Response::Stats {
             total_chunks: 2,

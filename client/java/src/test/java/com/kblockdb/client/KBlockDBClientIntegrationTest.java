@@ -194,7 +194,11 @@ class KBlockDBClientIntegrationTest {
             Health health = client.health();
             assertEquals(3, health.axes());
             assertEquals(10_000, health.worldDim());
+            assertEquals(32, health.chunkDim());
             assertTrue(health.timestamp() > 0);
+            // Which hostname the test machine has isn't knowable here;
+            // that one was reported at all is.
+            assertFalse(health.hostname().isEmpty());
         }
     }
 

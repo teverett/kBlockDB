@@ -180,7 +180,9 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
         Request::Health => Response::Health {
             axes: state.world.axes() as u8,
             world_dim: state.world.world_dim(),
+            chunk_dim: state.world.chunk_dim(),
             timestamp: crate::routes::unix_timestamp(),
+            hostname: state.hostname.to_string(),
         },
         Request::Stats => {
             if let Err(response) = require_authenticated(account) {
@@ -350,6 +352,18 @@ mod tests {
     }
 
     async fn spawn_test_server(axes: usize, world_dim: u32) -> TestServer {
+        spawn_server(axes, world_dim, None).await
+    }
+
+    async fn spawn_test_server_with_hostname(
+        axes: usize,
+        world_dim: u32,
+        hostname: &str,
+    ) -> TestServer {
+        spawn_server(axes, world_dim, Some(hostname.to_string())).await
+    }
+
+    async fn spawn_server(axes: usize, world_dim: u32, hostname: Option<String>) -> TestServer {
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!(
@@ -373,7 +387,10 @@ mod tests {
                 read_only: true,
             },
         );
-        let state = AppState::new(world, Arc::new(credentials));
+        let mut state = AppState::new(world, Arc::new(credentials));
+        if let Some(hostname) = hostname {
+            state = state.with_hostname(hostname);
+        }
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -491,6 +508,43 @@ mod tests {
             roundtrip(&mut stream, &Request::Health).await,
             Response::Health { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn health_reports_the_worlds_shape_and_this_instances_hostname() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        match roundtrip(&mut stream, &Request::Health).await {
+            Response::Health {
+                axes,
+                world_dim,
+                chunk_dim,
+                hostname,
+                ..
+            } => {
+                assert_eq!(axes, 3);
+                assert_eq!(world_dim, 10_000);
+                assert_eq!(chunk_dim, 32);
+                // Which hostname the test machine has isn't knowable
+                // here; that one was reported at all is.
+                assert!(!hostname.is_empty());
+            }
+            other => panic!("expected Response::Health, got {other:?}"),
+        }
+    }
+
+    /// The binary protocol and the REST API read these from the same
+    /// `AppState`, so a `hostname` config override has to reach both.
+    #[tokio::test]
+    async fn health_reports_the_configured_hostname_override() {
+        let server = spawn_test_server_with_hostname(3, 10_000, "db-1.example.com").await;
+        let mut stream = connect(&server).await;
+
+        match roundtrip(&mut stream, &Request::Health).await {
+            Response::Health { hostname, .. } => assert_eq!(hostname, "db-1.example.com"),
+            other => panic!("expected Response::Health, got {other:?}"),
+        }
     }
 
     #[tokio::test]

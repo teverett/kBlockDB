@@ -91,8 +91,19 @@ class ValueWithMeta:
 
 @dataclass(frozen=True, slots=True)
 class Health:
+    """The server's identity, world shape, and clock.
+
+    ``hostname`` is which instance answered -- its OS hostname, or
+    whatever the server's ``hostname`` config key overrides it to. Never
+    empty: a server that can't determine its own hostname reports
+    ``"unknown"``. ``chunk_dim`` is cells per axis in one chunk file, the
+    world's on-disk granularity, fixed when the world was created.
+    """
+
+    hostname: str
     axes: int
     world_dim: int
+    chunk_dim: int
     timestamp: int
 
 

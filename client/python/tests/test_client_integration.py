@@ -153,8 +153,11 @@ class ClientIntegrationTest(unittest.TestCase):
     def test_health_and_stats(self) -> None:
         with self.connect() as client:
             health = client.health()
-            self.assertEqual((3, 10_000), (health.axes, health.world_dim))
+            self.assertEqual((3, 10_000, 32), (health.axes, health.world_dim, health.chunk_dim))
             self.assertGreater(health.timestamp, 0)
+            # Which hostname the test machine has isn't knowable here;
+            # that one was reported at all is.
+            self.assertTrue(health.hostname)
             client.set((20, 20, 20), "stats-key", I64(1))
             stats = client.stats()
             self.assertGreater(stats.total_chunks, 0)

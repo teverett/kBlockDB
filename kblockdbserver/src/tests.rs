@@ -159,6 +159,48 @@ async fn health_reports_the_worlds_shape() {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["axes"], 3);
     assert_eq!(body["world_dim"], 100);
+    assert_eq!(body["chunk_dim"], 32);
+}
+
+/// Nothing here can assert *which* hostname the machine running the
+/// tests has, only that one was reported and that it isn't empty --
+/// `os_hostname` substitutes `"unknown"` rather than ever reporting
+/// nothing.
+#[tokio::test]
+async fn health_reports_a_non_empty_hostname() {
+    let (status, body) = send(test_app().0, get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    let hostname = body["hostname"]
+        .as_str()
+        .expect("hostname should be a string");
+    assert!(!hostname.is_empty());
+}
+
+#[tokio::test]
+async fn health_reports_the_configured_hostname_override() {
+    let (_, dir) = test_app();
+    let world = World::open(&dir.0).unwrap();
+    let state = AppState::new(world, Arc::new(HashMap::new()))
+        .with_hostname("db-1.example.com".to_string());
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["hostname"], "db-1.example.com");
+}
+
+/// `/rest/health` is what a load balancer polls, so it must stay
+/// unauthenticated even though it now names the instance.
+#[tokio::test]
+async fn health_still_needs_no_credentials() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/health")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["hostname"].is_string());
+    assert_eq!(body["chunk_dim"], 32);
 }
 
 #[tokio::test]

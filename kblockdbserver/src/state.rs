@@ -35,6 +35,9 @@ pub struct Account {
 #[derive(Clone)]
 pub struct AppState {
     pub world: Arc<World>,
+    /// What `/rest/health` (and the binary protocol's `Health`) reports as
+    /// this instance's name -- see [`AppState::with_hostname`].
+    pub hostname: Arc<str>,
     credentials: Arc<HashMap<String, Account>>,
 }
 
@@ -42,8 +45,20 @@ impl AppState {
     pub fn new(world: World, credentials: Arc<HashMap<String, Account>>) -> Self {
         AppState {
             world: Arc::new(world),
+            hostname: Arc::from(os_hostname()),
             credentials,
         }
+    }
+
+    /// Overrides the reported hostname, for a deployment where the OS
+    /// hostname isn't the name callers should see -- several instances
+    /// behind one load balancer, say, where what identifies the instance
+    /// that answered is a name the orchestrator assigned rather than
+    /// whatever `gethostname` returns. `kblockdbserver`'s `hostname`
+    /// config key is the only caller.
+    pub fn with_hostname(mut self, hostname: String) -> Self {
+        self.hostname = Arc::from(hostname);
+        self
     }
 
     /// The account `username`/`password` matches, if any. The password
@@ -75,6 +90,19 @@ impl AppState {
             .expect("worker thread panicked")
             .map_err(ApiError::from)
     }
+}
+
+/// This machine's hostname, or `"unknown"` if the OS won't say (or says
+/// something that isn't UTF-8). Deliberately not an error: `/rest/health`
+/// is the endpoint a load balancer polls to decide whether this process
+/// is alive, so failing to name the host must never be what makes it look
+/// unhealthy.
+pub fn os_hostname() -> String {
+    hostname::get()
+        .ok()
+        .and_then(|name| name.into_string().ok())
+        .filter(|name| !name.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
 }
 
 /// Compares two byte strings in time that depends only on their lengths,
@@ -164,6 +192,29 @@ mod tests {
             .state
             .authenticate("nobody", "whatever")
             .is_none());
+    }
+
+    #[test]
+    fn os_hostname_is_never_empty() {
+        // Whatever this machine is called -- and even if the OS won't say
+        // at all -- health must always have a name to report.
+        assert!(!os_hostname().is_empty());
+    }
+
+    #[test]
+    fn app_state_defaults_its_hostname_to_the_os_hostname() {
+        let test = state_with_accounts();
+        assert_eq!(&*test.state.hostname, os_hostname().as_str());
+    }
+
+    #[test]
+    fn with_hostname_overrides_the_os_hostname() {
+        let test = state_with_accounts();
+        let state = test
+            .state
+            .clone()
+            .with_hostname("db-1.example.com".to_string());
+        assert_eq!(&*state.hostname, "db-1.example.com");
     }
 
     #[test]

@@ -331,8 +331,27 @@ class WireTest {
         buf.write(0x08);
         buf.write(3);
         Wire.writeU32(buf, 10_000);
+        Wire.writeU32(buf, 32);
         writeU64(buf, 123);
-        assertEquals(new Wire.HealthResp(new Health(3, 10_000, 123)), Wire.decodeResponse(buf.toByteArray()));
+        byte[] hostname = "db-1.example.com".getBytes(StandardCharsets.UTF_8);
+        Wire.writeU16(buf, hostname.length);
+        buf.write(hostname);
+        assertEquals(
+                new Wire.HealthResp(new Health("db-1.example.com", 3, 10_000, 32, 123)),
+                Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodingATruncatedHealthResponseIsAProtocolException() throws IOException {
+        // Everything but the hostname -- a client built against the
+        // pre-hostname format would stop exactly here.
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x08);
+        buf.write(3);
+        Wire.writeU32(buf, 10_000);
+        Wire.writeU32(buf, 32);
+        writeU64(buf, 123);
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(buf.toByteArray()));
     }
 
     @Test

@@ -76,7 +76,7 @@ try (KBlockDBClient db =
 |---|---|---|
 | `connect(host, port, username, password)` | `KBlockDBClient` | Connects and authenticates. |
 | `reauthenticate(username, password)` | `void` | Changes the account on the existing connection. |
-| `health()` | `Health` | Returns the world's shape and server timestamp. |
+| `health()` | `Health` | Returns the server's `hostname`, the world's shape (`axes`, `worldDim`, `chunkDim`), and the server `timestamp`. |
 | `stats()` | `Stats` | Returns live on-disk chunk, byte, and block totals. |
 | `get(coord, key)` | `Optional<Value>` | Reads one value. |
 | `getWithMeta(coord, key)` | `Optional<ValueWithMeta>` | Reads one value with timestamps and version. |

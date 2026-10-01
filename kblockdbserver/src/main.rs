@@ -184,6 +184,8 @@ fn print_help() {
          kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
          cache's benefit without disabling the server)\n    \
          -h, --help           Print this help\n\n\
+         hostname (config file only) overrides what /rest/health reports as this\n\
+         instance's name; it defaults to the OS hostname.\n\n\
          compression (config file only, default false) zstd-compresses every chunk\n\
          file the server writes. It can be turned on or off on an existing world at\n\
          any time: each chunk file records its own encoding, so a world may hold a\n\
@@ -269,7 +271,11 @@ async fn main() {
         credentials.len()
     );
 
-    let state = AppState::new(world, std::sync::Arc::new(credentials));
+    let mut state = AppState::new(world, std::sync::Arc::new(credentials));
+    if let Some(hostname) = config.hostname.clone() {
+        state = state.with_hostname(hostname);
+    }
+    println!("kblockdbserver: reporting hostname '{}'", state.hostname);
 
     if let Some(binary_addr) = binary_addr {
         let binary_listener = tokio::net::TcpListener::bind(&binary_addr)

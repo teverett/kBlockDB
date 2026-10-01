@@ -341,6 +341,21 @@ def _read_value_type(reader: "_Reader") -> ValueType:
         raise ProtocolError(f"unknown value type tag 0x{tag:x}") from None
 
 
+def _read_health(reader: "_Reader") -> Health:
+    """``[u8 axes][u32 LE world_dim][u32 LE chunk_dim][u64 LE ts]<hostname>``.
+
+    Read field by field rather than inline: ``Health``'s fields are in a
+    different order than the wire puts them in, and Python evaluates
+    constructor arguments left to right, so building it inline would read
+    the frame out of order.
+    """
+    axes = reader.u8()
+    world_dim = reader.u32()
+    chunk_dim = reader.u32()
+    timestamp = reader.u64()
+    return Health(reader.key(), axes, world_dim, chunk_dim, timestamp)
+
+
 def decode_response(payload: bytes) -> Response:
     reader = _Reader(payload)
     status = reader.u8()
@@ -355,7 +370,7 @@ def decode_response(payload: bytes) -> Response:
     if 0x04 <= status <= 0x07 or status == 0x0D:
         return ErrorResponse(status, reader.string(reader.u16()))
     if status == 0x08:
-        return HealthResponse(Health(reader.u8(), reader.u32(), reader.u64()))
+        return HealthResponse(_read_health(reader))
     if status == 0x09:
         return StatsResponse(Stats(reader.u64(), reader.u64(), reader.u64()))
     if status == 0x0A:

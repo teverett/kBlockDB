@@ -66,6 +66,12 @@ pub struct Config {
     /// encoding individually.
     #[serde(default)]
     pub compression: bool,
+    /// What `/rest/health` reports as this instance's name. Defaults to
+    /// the OS hostname; set this when that isn't the name callers should
+    /// see -- several instances behind one load balancer, say. An empty
+    /// string is rejected rather than silently reporting nothing.
+    #[serde(default)]
+    pub hostname: Option<String>,
     pub admin_password: String,
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -95,6 +101,9 @@ impl Config {
     fn validate(&self) -> Result<(), String> {
         if self.admin_password.is_empty() {
             return Err("admin_password must not be empty".to_string());
+        }
+        if self.hostname.as_deref().is_some_and(str::is_empty) {
+            return Err("hostname must not be empty".to_string());
         }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         seen.insert("admin");
@@ -327,6 +336,36 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("compression"), "{err}");
+    }
+
+    #[test]
+    fn hostname_defaults_to_unset_meaning_the_os_hostname() {
+        let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
+        assert_eq!(config.hostname, None);
+    }
+
+    #[test]
+    fn hostname_can_be_overridden() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            hostname = "db-1.example.com"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.hostname.as_deref(), Some("db-1.example.com"));
+    }
+
+    #[test]
+    fn an_empty_hostname_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            hostname = ""
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("hostname"), "{err}");
     }
 
     #[test]

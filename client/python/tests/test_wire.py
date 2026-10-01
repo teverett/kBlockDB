@@ -87,15 +87,27 @@ class WireEncodingTest(unittest.TestCase):
 
 
 class WireDecodingTest(unittest.TestCase):
+    def test_decoding_a_health_response_without_a_hostname_is_an_error(self) -> None:
+        # Exactly what a pre-hostname server would send: the frame ends
+        # where the hostname should start.
+        with self.assertRaises(ProtocolError):
+            _wire.decode_response(
+                b"\x08\x03" + struct.pack("<II", 10_000, 32) + struct.pack("<Q", 123)
+            )
+
     def test_decodes_hello_health_and_stats(self) -> None:
         self.assertEqual(
             _wire.HelloOk(3, 10_000, False),
             _wire.decode_response(b"\x00\x03" + struct.pack("<I", 10_000) + b"\x00"),
         )
         self.assertEqual(
-            _wire.HealthResponse(Health(3, 10_000, 123)),
+            _wire.HealthResponse(Health("db-1.example.com", 3, 10_000, 32, 123)),
             _wire.decode_response(
-                b"\x08\x03" + struct.pack("<I", 10_000) + struct.pack("<Q", 123)
+                b"\x08\x03"
+                + struct.pack("<II", 10_000, 32)
+                + struct.pack("<Q", 123)
+                + struct.pack("<H", 16)
+                + b"db-1.example.com"
             ),
         )
         self.assertEqual(

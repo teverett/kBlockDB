@@ -365,7 +365,7 @@ final class Wire {
             case 0x07:
                 return new Internal(r.message());
             case 0x08:
-                return new HealthResp(new Health(r.u8(), r.u32(), r.u64()));
+                return new HealthResp(healthOf(r));
             case 0x09:
                 return new StatsResp(new Stats(r.u64(), r.u64(), r.u64()));
             case 0x0A:
@@ -379,6 +379,22 @@ final class Wire {
             default:
                 throw new ProtocolException("unknown status 0x" + Integer.toHexString(status));
         }
+    }
+
+    /**
+     * {@code 0x08 Health}: {@code [u8 axes][u32 LE world_dim]
+     * [u32 LE chunk_dim][u64 LE timestamp]<hostname>}. Pulled out of the
+     * {@code switch} above so the field order reads in one place -- the
+     * arguments to {@link Health}'s constructor are in a different order
+     * than the wire puts them in, and evaluating them inline would make
+     * that reordering invisible.
+     */
+    private static Health healthOf(Reader r) throws ProtocolException {
+        int axes = r.u8();
+        long worldDim = r.u32();
+        long chunkDim = r.u32();
+        long timestamp = r.u64();
+        return new Health(r.message(), axes, worldDim, chunkDim, timestamp);
     }
 
     /**

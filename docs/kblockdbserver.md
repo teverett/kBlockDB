@@ -71,6 +71,8 @@ data_dir = "./data"          # optional
 max_concurrent_disk_ops = 32 # optional
 max_cached_chunks = 100000   # optional
 compression = false          # optional; zstd-compress every chunk file written
+hostname = "db-1.example.com" # optional; what /rest/health reports as this
+                             # instance's name (defaults to the OS hostname)
 admin_password = "change-me" # required
 
 # Only matters the first time a world is created at data_dir above --
@@ -166,7 +168,7 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/rest/health` | | `200` `{"status":"ok","axes":3,"world_dim":10000,"timestamp":1735689600}` |
+| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","axes":3,"world_dim":10000,"chunk_dim":32,"timestamp":1735689600}` |
 | `GET` | `/rest/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset |
 | `PUT` | `/rest/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/cells/{coords}/{key}` | | `204` |
@@ -177,6 +179,18 @@ A cell value on the wire is a small tagged JSON object:
 | `GET` | `/rest/columns` | | `200 {"columns": [{"key": "material", "type": "str"}, ...]}` |
 | `PUT` | `/rest/columns/{key}` | `{"type": "str"}` | `204`, or `409` if the column exists |
 | `DELETE` | `/rest/columns/{key}` | | `204`, or `404` if there's no such column |
+
+`/rest/health`'s `hostname` identifies *which* instance answered, which is
+what makes it useful behind a load balancer: without it, polling a pool
+tells you some server is up but never which one. It's the OS hostname by
+default, or the config file's `hostname` key when set (useful when the OS
+name isn't the name you route by). It's never empty -- a server that
+can't determine its own hostname reports `"unknown"` rather than failing
+the health check, since an unnameable host is still a serving one.
+`chunk_dim` is the world's on-disk granularity, cells per axis in one
+chunk file, fixed when the world was created; together with `axes` and
+`world_dim` it's the whole shape, so a client can size its region reads
+to chunk boundaries without a separate call.
 
 `/rest/stats` walks the on-disk chunk files under `--data-dir` and reports:
 `total_chunks` (chunk files currently on disk -- see `kblockdblib`'s "Layout on
@@ -440,7 +454,10 @@ Every message, either direction, is a length-prefixed frame
 (`[u32 LE payload_len][payload_len bytes]`) -- see
 `kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
 of every request (`Hello`, health/stats, cell/region operations, column
-add/remove/list, and queries) and response kind. A
+add/remove/list, and queries) and response kind. The `Health` response
+carries the same five fields as `/rest/health` -- hostname, axes,
+world_dim, chunk_dim, timestamp -- read from the same server state, so
+the two transports can never disagree about what this instance is. A
 successful `Get`'s `Value` response carries the cell's metadata alongside
 its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
 fields the REST API's single-cell `GET` reports (see "Cells and regions"
@@ -461,7 +478,7 @@ respective runtimes.
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
   (http_addr/binary_addr/data_dir/max_concurrent_disk_ops/max_cached_chunks/
-  compression,
+  compression, hostname,
   admin_password, `[[users]]`, and a `[worldparameters]` table for
   axes/world_dim/chunk_size) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied

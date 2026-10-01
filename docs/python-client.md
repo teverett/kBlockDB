@@ -65,7 +65,7 @@ with KBlockDBClient.connect(
 |---|---|---|
 | `connect(host, port, username, password, timeout=None)` | `KBlockDBClient` | Connects and authenticates. |
 | `reauthenticate(username, password)` | `None` | Changes the account on the existing connection. |
-| `health()` | `Health` | Returns the world's shape and server timestamp. |
+| `health()` | `Health` | Returns the server's `hostname`, the world's shape (`axes`, `world_dim`, `chunk_dim`), and the server `timestamp`. |
 | `stats()` | `Stats` | Returns live on-disk chunk, byte, and block totals. |
 | `get(coord, key)` | `Value \| None` | Reads one value. |
 | `get_with_meta(coord, key)` | `ValueWithMeta \| None` | Reads one value with timestamps and version. |
