@@ -3,6 +3,12 @@
 **/kblockdblib.log
 /.idea
 
+# Python client build artifacts
+**/__pycache__
+**/*.egg-info
+/client/python/build
+/client/python/dist
+
 # Cargo.lock is committed: this workspace produces binaries (the kblockdblib demo
 # and kblockdbserver), where a locked dependency tree is the point, not just a
 # library.

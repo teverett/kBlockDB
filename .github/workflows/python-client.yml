@@ -1,0 +1,57 @@
+name: Python client
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: test (${{ matrix.os }}, Python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build kblockdbserver
+        run: cargo build -p kblockdbserver
+
+      - name: Install Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build Python client wheel
+        run: python -m pip wheel --no-deps --wheel-dir client/python/dist ./client/python
+
+      - name: Install Python client wheel
+        run: python -m pip install --find-links client/python/dist --no-index kblockdb-client
+
+      - name: Test Python client
+        env:
+          # No PYTHONPATH: the tests import the installed wheel so packaging
+          # regressions fail here instead of shipping silently.
+          KBLOCKDB_REQUIRE_SERVER: "1"
+        run: python -m unittest discover -s client/python/tests -v
+
+      - name: Upload Python client wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-client-${{ matrix.os }}-${{ matrix.python }}
+          path: client/python/dist/*.whl

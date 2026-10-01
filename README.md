@@ -26,9 +26,8 @@ A Cargo workspace with four crates:
   `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
   kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
 
-Plus a standalone (non-Cargo) Java client at `client/java`: `KBlockDBClient`
-speaks kblockdbserver's binary protocol, packaged as a plain jar via Maven
-with no runtime dependencies.
+Plus standalone, dependency-free Java and Python clients under `client/`.
+Both expose the complete binary API.
 
 ```
 kblockdblib/         the storage engine (library `kblockdblib` + demo binary `kblockdblib`)
@@ -36,6 +35,7 @@ kblockdbserver/   the REST server (binary `kblockdbserver`, depends on kblockdbl
 kblockdbperf/     the performance test suite (binary `kblockdbperf`, drives kblockdbserver over HTTP)
 kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdbserver over HTTP)
 client/java/      the Java client (KBlockDBClient, speaks the binary protocol; Maven, not Cargo)
+client/python/    the Python 3 client (KBlockDBClient, standard library only)
 ```
 
 ## Documentation
@@ -45,6 +45,7 @@ client/java/      the Java client (KBlockDBClient, speaks the binary protocol; M
 - [`kblockdbperf`](docs/kblockdbperf.md) -- performance suite usage and scenarios.
 - [`kblockdbcli`](docs/kblockdbcli.md) -- command-line client usage.
 - [Java client](docs/java-client.md) -- dependency-free Java binary-protocol client.
+- [Python client](docs/python-client.md) -- dependency-free Python binary-protocol client.
 
 ## Build & test everything
 

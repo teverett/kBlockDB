@@ -1,7 +1,6 @@
 version: 2
 updates:
-  # kblockdblib/kblockdbserver/kblockdbperf are one Cargo workspace rooted here -- Dependabot
-  # resolves all three members' Cargo.toml files from this one entry.
+  # All four Rust crates are one Cargo workspace rooted here.
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -11,8 +10,25 @@ updates:
         patterns:
           - "*"
 
-  # Keeps the actions pinned in ci.yml (actions/checkout, dtolnay/rust-toolchain,
-  # Swatinem/rust-cache) current too.
+  - package-ecosystem: "maven"
+    directory: "/client/java"
+    schedule:
+      interval: "weekly"
+    groups:
+      java-client-dependencies:
+        patterns:
+          - "*"
+
+  - package-ecosystem: "pip"
+    directory: "/client/python"
+    schedule:
+      interval: "weekly"
+    groups:
+      python-client-dependencies:
+        patterns:
+          - "*"
+
+  # Keeps every action used by the Rust, Java, and Python workflows current.
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:

@@ -394,8 +394,9 @@ bad coordinate, and so on) becomes an error response rather than closing
 the connection.
 
 `kblockdbperf/src/binary_client.rs` uses the server's published `wire`
-module directly. The standalone Java client reimplements the format for
-the JVM and is documented in [Java client](java-client.md).
+module directly. The standalone [Java client](java-client.md) and
+[Python client](python-client.md) reimplement the format for their
+respective runtimes.
 
 ## Layout
 
