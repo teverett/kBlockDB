@@ -6,16 +6,19 @@ from typing import Iterable
 from . import _wire
 from .exceptions import (
     BadRequestError,
+    ConflictError,
     ForbiddenError,
     InternalServerError,
     ProtocolError,
     UnauthorizedError,
 )
 from .models import (
+    Column,
     Health,
     QueryResult,
     Stats,
     Value,
+    ValueType,
     ValueWithMeta,
 )
 
@@ -158,6 +161,41 @@ class KBlockDBClient:
             return response.result
         raise _to_exception(response)
 
+    def columns(self) -> tuple[Column, ...]:
+        """Every column in this world's schema, sorted by key.
+
+        Includes columns created implicitly by :meth:`set` as well as
+        those declared with :meth:`add_column`.
+        """
+        response = self._roundtrip(_wire.encode_list_columns())
+        if isinstance(response, _wire.ColumnsResponse):
+            return response.columns
+        raise _to_exception(response)
+
+    def add_column(self, key: str, value_type: ValueType) -> None:
+        """Create a column for ``key``, fixing it to ``value_type``.
+
+        Only needed to declare a column's type up front -- writing a value
+        creates its column implicitly otherwise.
+
+        Raises :class:`ConflictError` if ``key`` already has a column.
+        """
+        self._expect_ok(self._roundtrip(_wire.encode_add_column(key, value_type)))
+
+    def remove_column(self, key: str) -> bool:
+        """Drop ``key``'s column and every value ever written for it.
+
+        Returns ``False`` if there was no such column. Not reversible:
+        re-creating the column later starts it empty, and it may be given
+        a different :class:`ValueType` than it had.
+        """
+        response = self._roundtrip(_wire.encode_remove_column(key))
+        if isinstance(response, _wire.Ok):
+            return True
+        if isinstance(response, _wire.NotFound):
+            return False
+        raise _to_exception(response)
+
     @staticmethod
     def _expect_ok(response: _wire.Response) -> None:
         if not isinstance(response, _wire.Ok):
@@ -181,6 +219,7 @@ def _to_exception(response: _wire.Response) -> OSError:
             0x05: UnauthorizedError,
             0x06: ForbiddenError,
             0x07: InternalServerError,
+            0x0D: ConflictError,
         }
         return error_types[response.status](response.message)
     return ProtocolError(f"unexpected {type(response).__name__} response")

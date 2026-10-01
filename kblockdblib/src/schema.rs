@@ -4,6 +4,31 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
+/// The 4th field marking a `schema.txt` line as a tombstone rather than a
+/// new entry -- see `Schema`'s doc comment.
+const REMOVED_MARKER: &str = "removed";
+
+/// Rejects key names `schema.txt`'s one-line-per-key, tab-separated format
+/// can't round-trip. Without this a key containing a tab or newline would
+/// be written out happily and then either mis-parse or panic the *next*
+/// time the world was opened -- a corruption that outlives the process
+/// that caused it.
+fn validate_key(key: &str) -> io::Result<()> {
+    let problem = if key.is_empty() {
+        "must not be empty"
+    } else if key.contains('\t') {
+        "must not contain a tab"
+    } else if key.contains('\n') || key.contains('\r') {
+        "must not contain a line break"
+    } else {
+        return Ok(());
+    };
+    Err(io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("invalid key '{key}': a key {problem}"),
+    ))
+}
+
 /// Global key-string <-> integer-id registry for the whole world.
 ///
 /// Storing "temperature" as a 4-byte id instead of an 11-byte string in every
@@ -14,6 +39,13 @@ use std::path::{Path, PathBuf};
 /// The mapping is append-only and persisted as a plain `id\tkey\ttype` text
 /// file (`schema.txt`) at the world root, so ids never move and old chunk
 /// files stay valid no matter how many new keys get introduced later.
+///
+/// **Removal is a tombstone, never a rewrite.** `remove` appends an
+/// `id\tkey\ttype\tremoved` line rather than deleting the original, so ids
+/// stay dense and in order and a removed id is never reissued. Re-adding a
+/// removed key gets a brand new id, which is what lets it come back with a
+/// different type than it had before. Lines are matched to ids positionally
+/// on load, so a file written before removal existed parses identically.
 ///
 /// **A key's type is fixed the first time it's ever set, for the life of
 /// the world.** `intern` records it then and rejects any later `set` for
@@ -40,6 +72,18 @@ pub struct Schema {
     key_to_id: HashMap<String, u32>,
     id_to_key: Vec<String>,
     id_to_type: Vec<ValueType>,
+    /// Parallel to `id_to_key`: whether that id has been `remove`d. A
+    /// removed id keeps its slot (ids must stay dense) but is gone from
+    /// `key_to_id`, so it can never be looked up or reissued again.
+    id_removed: Vec<bool>,
+}
+
+/// One live column in a world's schema: a key and the value type fixed for
+/// it when it was created. Returned by `Schema::columns`/`World::columns`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ColumnInfo {
+    pub key: String,
+    pub value_type: ValueType,
 }
 
 impl Schema {
@@ -49,6 +93,7 @@ impl Schema {
             key_to_id: HashMap::new(),
             id_to_key: Vec::new(),
             id_to_type: Vec::new(),
+            id_removed: Vec::new(),
         };
         schema.load()?;
         Ok(schema)
@@ -73,11 +118,12 @@ impl Schema {
         let mut key_to_id = HashMap::with_capacity(self.id_to_key.len());
         let mut id_to_key = Vec::with_capacity(self.id_to_key.len());
         let mut id_to_type = Vec::with_capacity(self.id_to_key.len());
+        let mut id_removed = Vec::with_capacity(self.id_to_key.len());
         for line in text.lines() {
             if line.is_empty() {
                 continue;
             }
-            let mut parts = line.splitn(3, '\t');
+            let mut parts = line.splitn(4, '\t');
             let id_str = parts
                 .next()
                 .expect("corrupt schema.txt: expected 'id<TAB>key<TAB>type' per line");
@@ -87,21 +133,48 @@ impl Schema {
             let type_str = parts
                 .next()
                 .expect("corrupt schema.txt: expected 'id<TAB>key<TAB>type' per line");
+            // A 4th field marks a tombstone for an id written earlier in
+            // the file (see `remove`); its absence is the original,
+            // pre-removal line format, which still parses unchanged.
+            let flag = parts.next();
             let id: u32 = id_str.parse().expect("corrupt schema.txt: non-numeric id");
             let value_type = ValueType::parse(type_str)
                 .unwrap_or_else(|| panic!("corrupt schema.txt: unknown type '{type_str}'"));
-            assert_eq!(
-                id as usize,
-                id_to_key.len(),
-                "corrupt schema.txt: ids must be dense and in order"
-            );
-            id_to_key.push(key.to_string());
-            id_to_type.push(value_type);
-            key_to_id.insert(key.to_string(), id);
+
+            match flag {
+                None => {
+                    assert_eq!(
+                        id as usize,
+                        id_to_key.len(),
+                        "corrupt schema.txt: ids must be dense and in order"
+                    );
+                    id_to_key.push(key.to_string());
+                    id_to_type.push(value_type);
+                    id_removed.push(false);
+                    key_to_id.insert(key.to_string(), id);
+                }
+                Some(REMOVED_MARKER) => {
+                    assert!(
+                        (id as usize) < id_to_key.len(),
+                        "corrupt schema.txt: removal of id {id}, which was never added"
+                    );
+                    id_removed[id as usize] = true;
+                    // Only if this id is still the one that owns the key:
+                    // the key may since have been re-added under a later
+                    // id, whose mapping this removal must not clobber.
+                    if key_to_id.get(key) == Some(&id) {
+                        key_to_id.remove(key);
+                    }
+                }
+                Some(other) => {
+                    panic!("corrupt schema.txt: unknown flag '{other}' on id {id}")
+                }
+            }
         }
         self.key_to_id = key_to_id;
         self.id_to_key = id_to_key;
         self.id_to_type = id_to_type;
+        self.id_removed = id_removed;
         Ok(())
     }
 
@@ -116,15 +189,93 @@ impl Schema {
     /// interned for, or `None` if `id` was never issued by this `Schema`
     /// (e.g. a stale id from a different world).
     pub fn key_for_id(&self, id: u32) -> Option<&str> {
+        if *self.id_removed.get(id as usize)? {
+            // Data written under a removed id is unreachable by name --
+            // reporting it as a live key would resurrect a dropped column.
+            return None;
+        }
         self.id_to_key.get(id as usize).map(String::as_str)
     }
 
-    pub fn len(&self) -> usize {
+    /// How many ids have ever been issued, removed ones included -- the
+    /// exclusive upper bound for `key_for_id`. Distinct from `len`, which
+    /// counts only live columns.
+    pub fn id_space(&self) -> usize {
         self.id_to_key.len()
     }
 
+    /// Every live (non-removed) column, sorted by key.
+    pub fn columns(&self) -> Vec<ColumnInfo> {
+        let mut columns: Vec<ColumnInfo> = self
+            .key_to_id
+            .iter()
+            .map(|(key, &id)| ColumnInfo {
+                key: key.clone(),
+                value_type: self.id_to_type[id as usize],
+            })
+            .collect();
+        columns.sort_by(|a, b| a.key.cmp(&b.key));
+        columns
+    }
+
+    /// The value type fixed for `key`, or `None` if it isn't a live
+    /// column.
+    pub fn type_for_key(&self, key: &str) -> Option<ValueType> {
+        self.key_to_id
+            .get(key)
+            .map(|&id| self.id_to_type[id as usize])
+    }
+
+    pub fn len(&self) -> usize {
+        self.key_to_id.len()
+    }
+
     pub fn is_empty(&self) -> bool {
-        self.id_to_key.is_empty()
+        self.key_to_id.is_empty()
+    }
+
+    /// Creates `key` as a brand new column of type `value_type`, failing
+    /// with `AlreadyExists` if it's already a live column -- unlike
+    /// `intern`, which is get-or-create and happily returns the existing
+    /// id. This is the explicit "add a column" operation: it fixes the
+    /// key's type up front, before any cell has ever been written to it.
+    ///
+    /// A key that was previously `remove`d counts as absent, and gets a
+    /// fresh id here -- so it may come back with a different type.
+    pub fn add(&mut self, key: &str, value_type: ValueType) -> io::Result<u32> {
+        if self.key_to_id.contains_key(key) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("key '{key}' already exists"),
+            ));
+        }
+        self.intern(key, value_type)
+    }
+
+    /// Drops `key` from the schema, returning the id it had, or `None` if
+    /// it wasn't a live column. The id is tombstoned, never reused or
+    /// renumbered (see `Schema`'s doc comment).
+    ///
+    /// This is a schema-level operation only: it does nothing about cell
+    /// data already written under the old id. `World::remove_column` is
+    /// what pairs this with purging that data.
+    pub fn remove(&mut self, key: &str) -> io::Result<Option<u32>> {
+        let Some(id) = self.key_to_id.get(key).copied() else {
+            return Ok(None);
+        };
+        let value_type = self.id_to_type[id as usize];
+
+        // Persisted before the in-memory state changes, so a failure here
+        // leaves the schema exactly as it was rather than dropping a
+        // column only until the next restart.
+        self.append_line(&format!(
+            "{id}\t{key}\t{}\t{REMOVED_MARKER}\n",
+            value_type.as_str()
+        ))?;
+
+        self.key_to_id.remove(key);
+        self.id_removed[id as usize] = true;
+        Ok(Some(id))
     }
 
     /// Look up `key`'s id, interning (and durably persisting) a new one --
@@ -137,24 +288,29 @@ impl Schema {
         if let Some(&id) = self.key_to_id.get(key) {
             return self.check_type(id, key, value_type).map(|()| id);
         }
+        validate_key(key)?;
 
         let id = self.id_to_key.len() as u32;
+        self.append_line(&format!("{id}\t{key}\t{}\n", value_type.as_str()))?;
 
-        // Append-only on disk too: we never rewrite schema.txt, only add
-        // to it. One write_all call (not e.g. writeln!, which could split
-        // across several small writes to an unbuffered File) so the
-        // append is a single, atomically-visible block from any
-        // concurrent reader's point of view.
+        self.id_to_key.push(key.to_string());
+        self.id_to_type.push(value_type);
+        self.id_removed.push(false);
+        self.key_to_id.insert(key.to_string(), id);
+        Ok(id)
+    }
+
+    /// Append-only on disk: we never rewrite schema.txt, only add to it.
+    /// One `write_all` call (not e.g. `writeln!`, which could split across
+    /// several small writes to an unbuffered `File`) so the append is a
+    /// single, atomically-visible block from any concurrent reader's point
+    /// of view.
+    fn append_line(&self, line: &str) -> io::Result<()> {
         let mut f = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)?;
-        f.write_all(format!("{id}\t{key}\t{}\n", value_type.as_str()).as_bytes())?;
-
-        self.id_to_key.push(key.to_string());
-        self.id_to_type.push(value_type);
-        self.key_to_id.insert(key.to_string(), id);
-        Ok(id)
+        f.write_all(line.as_bytes())
     }
 
     /// `key` (already interned as `id`) must have been first interned with
@@ -293,5 +449,198 @@ mod tests {
         let dir = TempDir::new("key-for-id-miss");
         let schema = Schema::open(dir.as_ref()).unwrap();
         assert_eq!(schema.key_for_id(0), None);
+    }
+
+    // --- Columns: add and remove ---
+
+    #[test]
+    fn add_creates_a_column_with_a_fixed_type() {
+        let dir = TempDir::new("add-column");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let id = schema.add("material", ValueType::Str).unwrap();
+
+        assert_eq!(schema.id_for_key("material"), Some(id));
+        assert_eq!(schema.type_for_key("material"), Some(ValueType::Str));
+        // The type is fixed by `add` alone, with no value ever written.
+        let err = schema.intern("material", ValueType::I64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn add_rejects_a_column_that_already_exists() {
+        let dir = TempDir::new("add-duplicate");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        schema.add("material", ValueType::Str).unwrap();
+
+        let err = schema.add("material", ValueType::Str).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        // Same answer even when the requested type differs.
+        let err = schema.add("material", ValueType::I64).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(schema.len(), 1);
+    }
+
+    #[test]
+    fn add_rejects_a_key_the_file_format_cannot_hold() {
+        let dir = TempDir::new("add-invalid-key");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        for bad in ["", "has\ttab", "has\nnewline", "has\rreturn"] {
+            let err = schema.add(bad, ValueType::Str).unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput, "for {bad:?}");
+        }
+        assert_eq!(schema.len(), 0);
+
+        // And the rejected keys never reached schema.txt: reopening finds
+        // a file that still parses.
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.len(), 0);
+    }
+
+    #[test]
+    fn intern_rejects_an_unstorable_key_too() {
+        let dir = TempDir::new("intern-invalid-key");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let err = schema.intern("has\ttab", ValueType::Str).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn remove_drops_a_column_and_reports_its_old_id() {
+        let dir = TempDir::new("remove-column");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let id = schema.add("material", ValueType::Str).unwrap();
+
+        assert_eq!(schema.remove("material").unwrap(), Some(id));
+        assert_eq!(schema.id_for_key("material"), None);
+        assert_eq!(schema.type_for_key("material"), None);
+        assert_eq!(schema.key_for_id(id), None);
+        assert_eq!(schema.len(), 0);
+    }
+
+    #[test]
+    fn remove_of_an_unknown_column_is_none_not_an_error() {
+        let dir = TempDir::new("remove-missing");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.remove("nonexistent").unwrap(), None);
+        // Removing twice is the same: the second call is a no-op.
+        schema.add("material", ValueType::Str).unwrap();
+        assert!(schema.remove("material").unwrap().is_some());
+        assert_eq!(schema.remove("material").unwrap(), None);
+    }
+
+    #[test]
+    fn a_removal_survives_a_reopen() {
+        let dir = TempDir::new("remove-persists");
+        let id = {
+            let mut schema = Schema::open(dir.as_ref()).unwrap();
+            schema.add("keep", ValueType::I64).unwrap();
+            let id = schema.add("drop", ValueType::Str).unwrap();
+            schema.remove("drop").unwrap();
+            id
+        };
+
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.id_for_key("drop"), None);
+        assert_eq!(schema.key_for_id(id), None);
+        assert_eq!(schema.id_for_key("keep"), Some(0));
+        assert_eq!(schema.len(), 1);
+        // The tombstoned id still occupies its slot, so ids stay dense.
+        assert_eq!(schema.id_space(), 2);
+    }
+
+    #[test]
+    fn a_removed_key_comes_back_with_a_new_id_and_may_change_type() {
+        let dir = TempDir::new("remove-readd");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let first = schema.add("material", ValueType::Str).unwrap();
+        schema.remove("material").unwrap();
+
+        let second = schema.add("material", ValueType::I64).unwrap();
+        assert_ne!(first, second, "a removed id must never be reissued");
+        assert_eq!(schema.type_for_key("material"), Some(ValueType::I64));
+        assert_eq!(schema.key_for_id(first), None);
+        assert_eq!(schema.key_for_id(second), Some("material"));
+    }
+
+    #[test]
+    fn a_re_added_key_survives_a_reopen_without_the_tombstone_winning() {
+        // The tombstone line for the old id sits *before* the re-add line
+        // in schema.txt, so replaying the file in order must leave the key
+        // live, not removed.
+        let dir = TempDir::new("remove-readd-reopen");
+        {
+            let mut schema = Schema::open(dir.as_ref()).unwrap();
+            schema.add("material", ValueType::Str).unwrap();
+            schema.remove("material").unwrap();
+            schema.add("material", ValueType::Bool).unwrap();
+        }
+
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.id_for_key("material"), Some(1));
+        assert_eq!(schema.type_for_key("material"), Some(ValueType::Bool));
+        assert_eq!(schema.len(), 1);
+    }
+
+    #[test]
+    fn a_schema_file_written_before_removals_existed_still_parses() {
+        // The pre-removal format is three tab-separated fields with no
+        // flag; it must keep loading exactly as it always did.
+        let dir = TempDir::new("legacy-format");
+        fs::write(
+            dir.0.join("schema.txt"),
+            "0\tmaterial\tstr\n1\thardness\ti64\n",
+        )
+        .unwrap();
+
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert_eq!(schema.len(), 2);
+        assert_eq!(schema.id_for_key("material"), Some(0));
+        assert_eq!(schema.type_for_key("hardness"), Some(ValueType::I64));
+    }
+
+    #[test]
+    fn columns_lists_live_columns_sorted_by_key() {
+        let dir = TempDir::new("columns-list");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        schema.add("material", ValueType::Str).unwrap();
+        schema.add("density", ValueType::F64).unwrap();
+        schema.add("solid", ValueType::Bool).unwrap();
+        schema.remove("material").unwrap();
+
+        assert_eq!(
+            schema.columns(),
+            vec![
+                ColumnInfo {
+                    key: "density".to_string(),
+                    value_type: ValueType::F64,
+                },
+                ColumnInfo {
+                    key: "solid".to_string(),
+                    value_type: ValueType::Bool,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn columns_of_a_fresh_schema_is_empty() {
+        let dir = TempDir::new("columns-empty");
+        let schema = Schema::open(dir.as_ref()).unwrap();
+        assert!(schema.columns().is_empty());
+        assert!(schema.is_empty());
+    }
+
+    #[test]
+    fn intern_recreates_a_removed_key_with_a_new_id() {
+        // `set` goes through `intern`, not `add`, so a plain write to a
+        // removed key must bring it back rather than fail.
+        let dir = TempDir::new("intern-after-remove");
+        let mut schema = Schema::open(dir.as_ref()).unwrap();
+        let first = schema.intern("material", ValueType::Str).unwrap();
+        schema.remove("material").unwrap();
+
+        let second = schema.intern("material", ValueType::F64).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(schema.type_for_key("material"), Some(ValueType::F64));
     }
 }

@@ -5,6 +5,7 @@ from kblockdb import (
     Affected,
     Bool,
     CellMeta,
+    Column,
     F64,
     Health,
     I64,
@@ -14,6 +15,7 @@ from kblockdb import (
     Rows,
     Stats,
     Str,
+    ValueType,
 )
 from kblockdb import _wire
 
@@ -145,6 +147,75 @@ class WireDecodingTest(unittest.TestCase):
 
     def test_rejects_malformed_responses(self) -> None:
         for payload in (b"", b"\xff", b"\x02\xff", b"\x00\x03"):
+            with self.subTest(payload=payload), self.assertRaises(ProtocolError):
+                _wire.decode_response(payload)
+
+
+class ColumnWireTest(unittest.TestCase):
+    def test_encodes_column_requests(self) -> None:
+        self.assertEqual(b"\x0a", _wire.encode_list_columns())
+        self.assertEqual(
+            b"\x0b\x01\x00k\x01", _wire.encode_add_column("k", ValueType.F64)
+        )
+        self.assertEqual(b"\x0c\x01\x00k", _wire.encode_remove_column("k"))
+
+    def test_add_column_carries_each_types_wire_tag(self) -> None:
+        for value_type in ValueType:
+            with self.subTest(value_type=value_type):
+                encoded = _wire.encode_add_column("k", value_type)
+                self.assertEqual(value_type.value, encoded[-1])
+
+    def test_value_type_of_matches_each_values_wire_tag(self) -> None:
+        for value in (Str("stone"), F64(2.6), I64(7), Bool(True)):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    ValueType.of(value).value, _wire._pack_value(value)[0]
+                )
+
+    def test_value_type_wire_names(self) -> None:
+        self.assertEqual(
+            ["str", "f64", "i64", "bool"], [t.wire_name for t in ValueType]
+        )
+
+    def test_decodes_columns_response(self) -> None:
+        payload = (
+            b"\x0c"
+            + struct.pack("<I", 2)
+            + struct.pack("<H", 8)
+            + b"hardness\x01"
+            + struct.pack("<H", 8)
+            + b"material\x00"
+        )
+        self.assertEqual(
+            _wire.ColumnsResponse(
+                (
+                    Column("hardness", ValueType.F64),
+                    Column("material", ValueType.STR),
+                )
+            ),
+            _wire.decode_response(payload),
+        )
+
+    def test_decodes_an_empty_columns_response(self) -> None:
+        self.assertEqual(
+            _wire.ColumnsResponse(()),
+            _wire.decode_response(b"\x0c" + struct.pack("<I", 0)),
+        )
+
+    def test_decodes_conflict_as_an_error_response(self) -> None:
+        payload = b"\x0d" + struct.pack("<H", 4) + b"nope"
+        self.assertEqual(
+            _wire.ErrorResponse(0x0D, "nope"), _wire.decode_response(payload)
+        )
+
+    def test_rejects_malformed_column_responses(self) -> None:
+        payloads = (
+            # Claims two columns but carries none.
+            b"\x0c" + struct.pack("<I", 2),
+            # One column with a type tag no ValueType uses.
+            b"\x0c" + struct.pack("<I", 1) + struct.pack("<H", 1) + b"k\xfe",
+        )
+        for payload in payloads:
             with self.subTest(payload=payload), self.assertRaises(ProtocolError):
                 _wire.decode_response(payload)
 

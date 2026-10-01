@@ -24,7 +24,7 @@ The server's binary listener must be enabled with `--binary-addr` or the
 ## Usage
 
 ```python
-from kblockdb import Affected, I64, KBlockDBClient, Rows, Str
+from kblockdb import Affected, I64, KBlockDBClient, Rows, Str, ValueType
 
 with KBlockDBClient.connect(
     "localhost", 8081, "admin", "change-me"
@@ -53,6 +53,10 @@ with KBlockDBClient.connect(
         print(result.total_rows)
     elif isinstance(result, Affected):
         print(result.affected_cells)
+
+    db.add_column("hardness", ValueType.F64)
+    columns = db.columns()
+    db.remove_column("hardness")
 ```
 
 ## API
@@ -71,10 +75,20 @@ with KBlockDBClient.connect(
 | `set_region(origin, extent, key, values)` | `None` | Writes a region in axis-0-fastest order. |
 | `remove_region(origin, extent, key)` | `None` | Clears a key throughout a region. |
 | `query(query)` | `Rows \| Affected` | Executes any query-language statement. |
+| `columns()` | `tuple[Column, ...]` | Lists the world's schema, sorted by key. |
+| `add_column(key, value_type)` | `None` | Creates a column, fixing its type. |
+| `remove_column(key)` | `bool` | Drops a column and all its values; `False` if it didn't exist. |
 
 Values use explicit `Str`, `F64`, `I64`, and `Bool` wrappers so their
 binary type is never ambiguous. Coordinates and region values accept any
 iterable and responses use immutable tuples and frozen dataclasses.
+
+`ValueType` names those same four types without a value attached, and is
+what a `Column` carries. `add_column` only ever creates -- re-adding an
+existing key raises `ConflictError` rather than changing its type -- and
+`remove_column` drops every value ever written for the key, across the
+whole world. See the [server's notes](kblockdbserver.md#columns) for the
+details.
 
 See the [query language documentation](kblockdbserver.md#query-language)
 for the grammar and examples.
@@ -87,6 +101,8 @@ All server and protocol errors extend `OSError`:
   queries.
 - `UnauthorizedError` reports rejected credentials.
 - `ForbiddenError` reports a write attempted through a read-only account.
+- `ConflictError` reports an `add_column` for a key that already has a
+  column.
 - `InternalServerError` reports a server-side storage failure.
 - `ProtocolError` reports malformed or incompatible wire data.
 

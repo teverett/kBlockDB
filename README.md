@@ -57,8 +57,9 @@ A Cargo workspace of four Rust crates, plus two standalone clients:
   HTTP API, a read-only web data browser, and (optionally, as a peer to
   REST rather than a replacement) a compact binary protocol with less
   per-call overhead. Supports single cells and axis-aligned regions, a
-  SQL-like query language (`SELECT`/`SET`/`UPDATE`/`DELETE`), and HTTP
-  Basic Auth with per-account read-only access. Unlike `kblockdblib` it
+  SQL-like query language (`SELECT`/`SET`/`UPDATE`/`DELETE`), schema
+  column management, and HTTP Basic Auth with per-account read-only
+  access. Unlike `kblockdblib` it
   uses the usual modern Rust web stack (axum, tokio, serde, pest) --
   the near-dependency-free constraint applies to the storage format, not
   to everything built on top of it.
@@ -66,11 +67,11 @@ A Cargo workspace of four Rust crates, plus two standalone clients:
   it: single-cell and region throughput and latency, concurrency scaling,
   and lock contention.
 - **`kblockdbcli`** -- a command-line client for the REST API: get, set,
-  or remove one cell, or run a query, authenticating the way `curl -u`
-  would.
+  or remove one cell, run a query, or list/add/drop schema columns,
+  authenticating the way `curl -u` would.
 - **Java and Python clients** (`client/java`, `client/python`) -- each
   dependency-free, each covering the complete binary API: health, stats,
-  single cells, regions, and queries.
+  single cells, regions, schema columns, and queries.
 
 ```
 kblockdblib/      the storage engine (library + demo binary `kblockdblib`)

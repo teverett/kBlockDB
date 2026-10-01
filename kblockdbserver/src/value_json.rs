@@ -46,6 +46,40 @@ impl From<ValueJson> for kblockdblib::Value {
     }
 }
 
+/// A `kblockdblib::ValueType` on the wire: the same four lowercase tags
+/// `ValueJson`'s `type` field uses (`"str"`, `"f64"`, `"i64"`, `"bool"`),
+/// but standalone -- a column declares its type without carrying a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "lowercase")]
+pub enum ValueTypeJson {
+    Str,
+    F64,
+    I64,
+    Bool,
+}
+
+impl From<kblockdblib::ValueType> for ValueTypeJson {
+    fn from(t: kblockdblib::ValueType) -> Self {
+        match t {
+            kblockdblib::ValueType::Str => ValueTypeJson::Str,
+            kblockdblib::ValueType::F64 => ValueTypeJson::F64,
+            kblockdblib::ValueType::I64 => ValueTypeJson::I64,
+            kblockdblib::ValueType::Bool => ValueTypeJson::Bool,
+        }
+    }
+}
+
+impl From<ValueTypeJson> for kblockdblib::ValueType {
+    fn from(t: ValueTypeJson) -> Self {
+        match t {
+            ValueTypeJson::Str => kblockdblib::ValueType::Str,
+            ValueTypeJson::F64 => kblockdblib::ValueType::F64,
+            ValueTypeJson::I64 => kblockdblib::ValueType::I64,
+            ValueTypeJson::Bool => kblockdblib::ValueType::Bool,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

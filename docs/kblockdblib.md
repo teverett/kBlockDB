@@ -237,6 +237,44 @@ access pattern:
 The second isn't implemented here -- the prototype optimizes for showing
 the mechanism clearly, not for the last byte of density.
 
+## Columns
+
+A world's schema is the set of keys it has ever stored, each fixed to one
+`ValueType`. It's normally built implicitly -- the first `set` of a key
+interns it and pins its type -- but it can also be managed directly:
+
+```rust
+world.add_column("hardness", kblockdblib::ValueType::F64)?;
+for column in world.columns() {
+    println!("{} {}", column.key, column.value_type.as_str());
+}
+world.remove_column("hardness")?;
+```
+
+- `columns()` lists every live column, sorted by key -- implicitly
+  created ones included.
+- `add_column(key, type)` declares a column up front, so a key's type is
+  fixed before any value is written. `AlreadyExists` if the key already
+  has a column; the only way to change a column's type is to remove it
+  and add it back.
+- `remove_column(key)` drops the column *and every value ever written for
+  it*, across every chunk in the world. Returns `false` if there was no
+  such column.
+
+`schema.txt` is append-only, so a removal is a tombstone line rather than
+a rewrite, and ids are never reissued. Two consequences follow from that:
+
+- A removed key that comes back -- whether through `add_column` or just a
+  `set` -- gets a brand new id, which is why it may come back with a
+  *different* type than it had.
+- `remove_column` writes its tombstone first and only then walks the
+  chunks purging data. A crash partway through leaves unreachable bytes
+  in some chunk files (invisible, since nothing maps that id to a key any
+  more) rather than a half-dropped column that's still partly readable.
+
+Dropping a column rewrites only the chunk files that actually held a
+value for it; a rare column doesn't cost a full-world rewrite.
+
 ## Compression
 
 `World::with_compression(bool)` -- off by default -- zstd-compresses

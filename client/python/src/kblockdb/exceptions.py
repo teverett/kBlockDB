@@ -17,6 +17,13 @@ class ForbiddenError(KBlockDBError):
     """The authenticated account cannot perform the requested write."""
 
 
+class ConflictError(KBlockDBError):
+    """The request conflicts with the world's current state.
+
+    Today, only adding a column for a key that already has one.
+    """
+
+
 class InternalServerError(KBlockDBError):
     """The server encountered a storage error."""
 

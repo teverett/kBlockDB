@@ -28,6 +28,9 @@ pub enum ApiError {
     BadRequest(String),
     /// A `get` found nothing for that key at that cell.
     NotFound(String),
+    /// The request conflicts with the current state: adding a column that
+    /// already exists.
+    Conflict(String),
     /// Something went wrong on this end (disk I/O, a corrupt file, ...)
     /// that the caller couldn't have prevented by sending a different
     /// request.
@@ -45,6 +48,7 @@ impl From<io::Error> for ApiError {
         match e.kind() {
             io::ErrorKind::InvalidInput => ApiError::BadRequest(e.to_string()),
             io::ErrorKind::NotFound => ApiError::NotFound(e.to_string()),
+            io::ErrorKind::AlreadyExists => ApiError::Conflict(e.to_string()),
             _ => ApiError::Internal(e.to_string()),
         }
     }
@@ -55,6 +59,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match self {
             ApiError::BadRequest(m) => (StatusCode::BAD_REQUEST, m),
             ApiError::NotFound(m) => (StatusCode::NOT_FOUND, m),
+            ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::Internal(m) => (StatusCode::INTERNAL_SERVER_ERROR, m),
             ApiError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
             ApiError::Forbidden(m) => (StatusCode::FORBIDDEN, m),

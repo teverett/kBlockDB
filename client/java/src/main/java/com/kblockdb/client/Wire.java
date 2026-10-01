@@ -263,6 +263,25 @@ final class Wire {
         return buf.toByteArray();
     }
 
+    static byte[] encodeListColumns() {
+        return new byte[] {0x0A};
+    }
+
+    static byte[] encodeAddColumn(String key, ValueType valueType) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0B);
+        writeKey(buf, key);
+        buf.write(valueType.tag());
+        return buf.toByteArray();
+    }
+
+    static byte[] encodeRemoveColumn(String key) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0C);
+        writeKey(buf, key);
+        return buf.toByteArray();
+    }
+
     static byte[] encodeQuery(String query) throws IOException {
         byte[] bytes = query.getBytes(StandardCharsets.UTF_8);
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
@@ -316,6 +335,15 @@ final class Wire {
     record QueryResp(QueryResult result) implements Response {
     }
 
+    record Columns(List<Column> columns) implements Response {
+        Columns {
+            columns = List.copyOf(columns);
+        }
+    }
+
+    record Conflict(String message) implements Response {
+    }
+
     static Response decodeResponse(byte[] payload) throws ProtocolException {
         Reader r = new Reader(payload);
         int status = r.u8();
@@ -344,6 +372,10 @@ final class Wire {
                 return new RegionValues(r.regionValues());
             case 0x0B:
                 return new QueryResp(r.queryResult());
+            case 0x0C:
+                return new Columns(r.columns());
+            case 0x0D:
+                return new Conflict(r.message());
             default:
                 throw new ProtocolException("unknown status 0x" + Integer.toHexString(status));
         }
@@ -469,6 +501,24 @@ final class Wire {
                 values.add(u8() == 0 ? Optional.empty() : Optional.of(value()));
             }
             return values;
+        }
+
+        List<Column> columns() throws ProtocolException {
+            int count = count32();
+            List<Column> columns = new ArrayList<>(Math.min(count, remaining()));
+            for (int i = 0; i < count; i++) {
+                columns.add(new Column(string(u16()), valueType()));
+            }
+            return columns;
+        }
+
+        ValueType valueType() throws ProtocolException {
+            int tag = u8();
+            ValueType type = ValueType.fromTag(tag);
+            if (type == null) {
+                throw new ProtocolException("unknown value type tag 0x" + Integer.toHexString(tag));
+            }
+            return type;
         }
 
         QueryResult queryResult() throws ProtocolException {

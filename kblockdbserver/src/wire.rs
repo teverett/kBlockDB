@@ -45,6 +45,9 @@
 //!                    [u32 LE value_count][value_count * <value>]
 //! 0x08 RemoveRegion: <coord origin> <coord extent> <key>
 //! 0x09 Query:        [u32 LE query_len][query bytes]
+//! 0x0a ListColumns:  (no fields)
+//! 0x0b AddColumn:    <key> [u8 value type tag]
+//! 0x0c RemoveColumn: <key>
 //! ```
 //!
 //! `<coord>` is `[u8 axes][axes * i32 LE]` (signed -- kBlockDB's coordinate
@@ -74,6 +77,8 @@
 //! 0x09 Stats:        [u64 LE total_chunks][u64 LE total_bytes][u64 LE total_blocks]
 //! 0x0a RegionValues: [u32 LE count][count * ([u8 present] [<value> if present])]
 //! 0x0b Query:        [u8 kind] <query-specific fields>
+//! 0x0c Columns:      [u32 LE count][count * (<key> [u8 value type tag])]
+//! 0x0d Conflict:     <message>
 //! ```
 //!
 //! `<message>` is `[u16 LE len][len bytes utf8]`. `<meta>` is
@@ -90,7 +95,7 @@
 // crate's `wire` module -- like `kblockdbperf`, which deliberately
 // doesn't depend on `kblockdblib` directly (it treats `kblockdbserver` as
 // a black box) -- can name `Value` without adding that dependency itself.
-pub use kblockdblib::Value;
+pub use kblockdblib::{Value, ValueType};
 use std::fmt;
 
 /// No frame's payload may claim to be larger than this -- see this
@@ -139,6 +144,21 @@ pub enum Request {
     Query {
         query: String,
     },
+    ListColumns,
+    AddColumn {
+        key: String,
+        value_type: ValueType,
+    },
+    RemoveColumn {
+        key: String,
+    },
+}
+
+/// One column in the world's schema, as carried by `Response::Columns`.
+#[derive(Debug, PartialEq)]
+pub struct Column {
+    pub key: String,
+    pub value_type: ValueType,
 }
 
 #[derive(Debug, PartialEq)]
@@ -193,6 +213,8 @@ pub enum Response {
     },
     RegionValues(Vec<Option<Value>>),
     Query(QueryResult),
+    Columns(Vec<Column>),
+    Conflict(String),
 }
 
 #[derive(Debug, PartialEq)]
@@ -307,6 +329,16 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             buf.push(0x09);
             put_long_string(&mut buf, query);
         }
+        Request::ListColumns => buf.push(0x0a),
+        Request::AddColumn { key, value_type } => {
+            buf.push(0x0b);
+            put_key(&mut buf, key);
+            buf.push(value_type.tag());
+        }
+        Request::RemoveColumn { key } => {
+            buf.push(0x0c);
+            put_key(&mut buf, key);
+        }
     }
     buf
 }
@@ -412,6 +444,18 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
                 }
             }
         }
+        Response::Columns(columns) => {
+            buf.push(0x0c);
+            buf.extend_from_slice(&(columns.len() as u32).to_le_bytes());
+            for column in columns {
+                put_key(&mut buf, &column.key);
+                buf.push(column.value_type.tag());
+            }
+        }
+        Response::Conflict(m) => {
+            buf.push(0x0d);
+            put_message(&mut buf, m);
+        }
     }
     buf
 }
@@ -424,7 +468,6 @@ fn put_coord(buf: &mut Vec<u8>, coord: &[i32]) {
     }
 }
 
-#[allow(dead_code)] // client-side only, see encode_request above
 fn put_key(buf: &mut Vec<u8>, key: &str) {
     buf.extend_from_slice(&(key.len() as u16).to_le_bytes());
     buf.extend_from_slice(key.as_bytes());
@@ -572,6 +615,11 @@ impl<'a> Reader<'a> {
         }
     }
 
+    fn value_type(&mut self) -> Result<ValueType, DecodeError> {
+        let tag = self.u8()?;
+        ValueType::from_tag(tag).ok_or(DecodeError::UnknownValueTag(tag))
+    }
+
     /// `<meta>`: `[u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]`.
     fn meta(&mut self) -> Result<(u64, u64, u64), DecodeError> {
         Ok((self.u64()?, self.u64()?, self.u64()?))
@@ -626,6 +674,13 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
             extent: r.coord()?,
             key: r.key()?,
         }),
+        0x0a => Ok(Request::ListColumns),
+        0x0b => {
+            let key = r.key()?;
+            let value_type = r.value_type()?;
+            Ok(Request::AddColumn { key, value_type })
+        }
+        0x0c => Ok(Request::RemoveColumn { key: r.key()? }),
         0x09 => Ok(Request::Query {
             query: r.long_string()?,
         }),
@@ -708,6 +763,18 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
             1 => Ok(Response::Query(QueryResult::Affected(r.u64()?))),
             other => Err(DecodeError::UnknownStatus(other)),
         },
+        0x0c => {
+            let count = r.u32()? as usize;
+            let columns = (0..count)
+                .map(|_| {
+                    let key = r.key()?;
+                    let value_type = r.value_type()?;
+                    Ok(Column { key, value_type })
+                })
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(Response::Columns(columns))
+        }
+        0x0d => Ok(Response::Conflict(r.message()?)),
         other => Err(DecodeError::UnknownStatus(other)),
     }
 }
@@ -951,6 +1018,57 @@ mod tests {
         roundtrip_response(Response::Unauthorized("nope".into()));
         roundtrip_response(Response::Forbidden("read-only".into()));
         roundtrip_response(Response::Internal("disk on fire".into()));
+    }
+
+    #[test]
+    fn every_column_request_round_trips() {
+        roundtrip_request(Request::ListColumns);
+        roundtrip_request(Request::RemoveColumn {
+            key: "material".into(),
+        });
+        for value_type in [
+            ValueType::Str,
+            ValueType::F64,
+            ValueType::I64,
+            ValueType::Bool,
+        ] {
+            roundtrip_request(Request::AddColumn {
+                key: "material".into(),
+                value_type,
+            });
+        }
+    }
+
+    #[test]
+    fn column_responses_round_trip() {
+        roundtrip_response(Response::Columns(vec![]));
+        roundtrip_response(Response::Columns(vec![
+            Column {
+                key: "hardness".into(),
+                value_type: ValueType::F64,
+            },
+            Column {
+                key: "material".into(),
+                value_type: ValueType::Str,
+            },
+            Column {
+                key: "visible".into(),
+                value_type: ValueType::Bool,
+            },
+        ]));
+        roundtrip_response(Response::Conflict(
+            "column 'material' already exists".into(),
+        ));
+    }
+
+    #[test]
+    fn decode_request_rejects_an_unknown_column_type_tag() {
+        // AddColumn("k") with a type tag no `ValueType` uses.
+        let payload = [0x0b, 0x01, 0x00, b'k', 0xFE];
+        assert_eq!(
+            decode_request(&payload),
+            Err(DecodeError::UnknownValueTag(0xFE))
+        );
     }
 
     #[test]

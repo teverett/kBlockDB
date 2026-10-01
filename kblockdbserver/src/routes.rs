@@ -46,12 +46,12 @@ use crate::error::{ApiError, ErrorBody};
 use crate::openapi::ApiDoc;
 use crate::query;
 use crate::state::AppState;
-use crate::value_json::ValueJson;
+use crate::value_json::{ValueJson, ValueTypeJson};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::middleware;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -69,6 +69,8 @@ pub fn router(state: AppState) -> Router {
             get(get_region).put(set_region).delete(remove_region),
         )
         .route("/stats", get(stats))
+        .route("/columns", get(list_columns))
+        .route("/columns/{key}", put(add_column).delete(remove_column))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Not under `protected` -- see this module's doc comment on why
@@ -161,6 +163,111 @@ async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, Api
         total_bytes: stats.total_bytes,
         total_blocks: stats.total_blocks,
     }))
+}
+
+/// One column in the world's schema: a key, and the value type fixed for
+/// it when the column was created.
+#[derive(Serialize, ToSchema)]
+pub struct ColumnResponse {
+    key: String,
+    #[serde(rename = "type")]
+    value_type: ValueTypeJson,
+}
+
+/// Every column in the world's schema, sorted by key.
+#[derive(Serialize, ToSchema)]
+pub struct ColumnsResponse {
+    columns: Vec<ColumnResponse>,
+}
+
+/// The body of `PUT /rest/columns/{key}`: the type to fix the new column
+/// to, e.g. `{"type": "str"}`.
+#[derive(Deserialize, ToSchema)]
+pub struct AddColumnBody {
+    #[serde(rename = "type")]
+    value_type: ValueTypeJson,
+}
+
+#[utoipa::path(
+    get,
+    path = "/rest/columns",
+    tag = "columns",
+    responses(
+        (status = 200, description = "Every column in the world's schema", body = ColumnsResponse),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn list_columns(State(state): State<AppState>) -> Result<Json<ColumnsResponse>, ApiError> {
+    let columns = state.with_world(|w| Ok(w.columns())).await?;
+    Ok(Json(ColumnsResponse {
+        columns: columns
+            .into_iter()
+            .map(|c| ColumnResponse {
+                key: c.key,
+                value_type: c.value_type.into(),
+            })
+            .collect(),
+    }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/rest/columns/{key}",
+    tag = "columns",
+    params(
+        ("key" = String, Path, description = "The column/key to create"),
+    ),
+    request_body = AddColumnBody,
+    responses(
+        (status = 204, description = "The column was created"),
+        (status = 400, description = "Malformed body, or a key the schema can't store", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 409, description = "A column with this key already exists", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn add_column(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+    Json(body): Json<AddColumnBody>,
+) -> Result<StatusCode, ApiError> {
+    let value_type: kblockdblib::ValueType = body.value_type.into();
+    state
+        .with_world(move |w| w.add_column(&key, value_type))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/rest/columns/{key}",
+    tag = "columns",
+    params(
+        ("key" = String, Path, description = "The column/key to drop"),
+    ),
+    responses(
+        (status = 204, description = "The column, and every value ever written for it, was removed"),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such column", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn remove_column(
+    State(state): State<AppState>,
+    Path(key): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let lookup_key = key.clone();
+    let removed = state
+        .with_world(move |w| w.remove_column(&lookup_key))
+        .await?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("no column named '{key}'")))
+    }
 }
 
 #[derive(Serialize, ToSchema)]

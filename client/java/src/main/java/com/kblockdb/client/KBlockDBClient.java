@@ -297,6 +297,67 @@ public final class KBlockDBClient implements Closeable {
         throw toException(response);
     }
 
+    /**
+     * Every column in this world's schema, sorted by key -- including
+     * columns created implicitly by a {@code set} rather than by
+     * {@link #addColumn(String, ValueType)}.
+     *
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public List<Column> columns() throws IOException {
+        Wire.writeFrame(out, Wire.encodeListColumns());
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Columns columns) {
+            return columns.columns();
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Creates a column for {@code key}, fixing it to {@code valueType}.
+     * Only needed to declare a column's type up front -- writing a value
+     * creates its column implicitly otherwise.
+     *
+     * @throws ConflictException     if {@code key} already has a column
+     * @throws BadRequestException   if {@code key} is empty or contains a
+     *                               tab or newline
+     * @throws ForbiddenException    if this connection's account is read-only
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public void addColumn(String key, ValueType valueType) throws IOException {
+        Objects.requireNonNull(key, "key");
+        Objects.requireNonNull(valueType, "valueType");
+        Wire.writeFrame(out, Wire.encodeAddColumn(key, valueType));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return;
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Drops {@code key}'s column and every value ever written for it,
+     * across the whole world. Returns false if there was no such column.
+     *
+     * <p>Not reversible: re-creating the column later starts it empty,
+     * and it may be given a different {@link ValueType} than it had.
+     *
+     * @throws ForbiddenException    if this connection's account is read-only
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public boolean removeColumn(String key) throws IOException {
+        Objects.requireNonNull(key, "key");
+        Wire.writeFrame(out, Wire.encodeRemoveColumn(key));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return true;
+        }
+        if (response instanceof Wire.NotFound) {
+            return false;
+        }
+        throw toException(response);
+    }
+
     /** Closes the underlying connection. Idempotent. */
     @Override
     public void close() throws IOException {
@@ -323,6 +384,9 @@ public final class KBlockDBClient implements Closeable {
         }
         if (response instanceof Wire.Internal r) {
             return new InternalErrorException(r.message());
+        }
+        if (response instanceof Wire.Conflict r) {
+            return new ConflictException(r.message());
         }
         return new ProtocolException("unexpected response: " + response);
     }

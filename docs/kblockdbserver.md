@@ -174,6 +174,9 @@ A cell value on the wire is a small tagged JSON object:
 | `PUT` | `/rest/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
 | `DELETE` | `/rest/regions/{origin}/{extent}/{key}` | | `204` |
 | `GET` | `/rest/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
+| `GET` | `/rest/columns` | | `200 {"columns": [{"key": "material", "type": "str"}, ...]}` |
+| `PUT` | `/rest/columns/{key}` | `{"type": "str"}` | `204`, or `409` if the column exists |
+| `DELETE` | `/rest/columns/{key}` | | `204`, or `404` if there's no such column |
 
 `/rest/stats` walks the on-disk chunk files under `--data-dir` and reports:
 `total_chunks` (chunk files currently on disk -- see `kblockdblib`'s "Layout on
@@ -237,6 +240,35 @@ curl -u admin:change-me -X DELETE localhost:8080/rest/regions/0,0,0/8,8,8/materi
 curl -u admin:change-me localhost:8080/rest/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
+
+### Columns
+
+`/rest/columns` is the world's schema: every key it has ever stored, each
+fixed to one of the four value types. Most columns get created
+implicitly -- the first `PUT` of a cell value interns its key and pins its
+type -- so `GET /rest/columns` lists those alongside any declared with
+`PUT /rest/columns/{key}`, sorted by key.
+
+```sh
+curl -u admin:change-me http://127.0.0.1:8080/rest/columns
+# {"columns":[{"key":"hardness","type":"f64"},{"key":"material","type":"str"}]}
+
+curl -u admin:change-me -X PUT http://127.0.0.1:8080/rest/columns/hardness \
+     -H 'content-type: application/json' -d '{"type": "f64"}'
+
+curl -u admin:change-me -X DELETE http://127.0.0.1:8080/rest/columns/hardness
+```
+
+`PUT` only ever *creates*: a key that already has a column gets `409`,
+never a silent type change. To change a column's type, `DELETE` it and
+`PUT` it back -- the key gets a fresh id, so it's free to come back as a
+different type.
+
+`DELETE` drops the column and **every value ever written for it**, across
+the whole world, and is not reversible. It's a write, so a `read_only`
+account gets `403`; `GET /rest/columns` is readable by any account. See
+the [storage engine's notes](kblockdblib.md#columns) for how removal
+interacts with the append-only `schema.txt`.
 
 ## Query language
 
@@ -381,7 +413,8 @@ annotation and doesn't appear in `/rest/api-docs/openapi.json`.
 ## Binary protocol
 
 A binary protocol covering the full REST API surface above -- health,
-stats, single-cell and region operations, and queries -- as a *peer* to
+stats, single-cell and region operations, schema columns, and queries --
+as a *peer* to
 that API, not a replacement for it. It uses the same `World`, accounts,
 and semantics, just without HTTP/JSON's per-call overhead (see the
 [storage engine's cache measurements](kblockdblib.md#concurrency) for why
@@ -406,8 +439,8 @@ API.
 Every message, either direction, is a length-prefixed frame
 (`[u32 LE payload_len][payload_len bytes]`) -- see
 `kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
-of every request (`Hello`, health/stats, cell/region operations, and
-queries) and response kind. A
+of every request (`Hello`, health/stats, cell/region operations, column
+add/remove/list, and queries) and response kind. A
 successful `Get`'s `Value` response carries the cell's metadata alongside
 its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
 fields the REST API's single-cell `GET` reports (see "Cells and regions"

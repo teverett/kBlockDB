@@ -3,6 +3,7 @@
 from .client import KBlockDBClient
 from .exceptions import (
     BadRequestError,
+    ConflictError,
     ForbiddenError,
     InternalServerError,
     KBlockDBError,
@@ -13,6 +14,7 @@ from .models import (
     Affected,
     Bool,
     CellMeta,
+    Column,
     F64,
     Health,
     I64,
@@ -23,6 +25,7 @@ from .models import (
     Stats,
     Str,
     Value,
+    ValueType,
     ValueWithMeta,
 )
 
@@ -31,6 +34,8 @@ __all__ = [
     "BadRequestError",
     "Bool",
     "CellMeta",
+    "Column",
+    "ConflictError",
     "F64",
     "ForbiddenError",
     "Health",
@@ -47,5 +52,6 @@ __all__ = [
     "Str",
     "UnauthorizedError",
     "Value",
+    "ValueType",
     "ValueWithMeta",
 ]

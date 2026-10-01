@@ -11,6 +11,11 @@ mod tests;
 use serde_json::{json, Value as Json};
 use std::process::ExitCode;
 
+/// Every command name `parse_args` accepts, for the two "expected one of"
+/// messages -- kept in one place so adding a command can't leave one of
+/// them listing a stale set.
+const COMMAND_LIST: &str = "get, set, remove, query, columns, add-column, remove-column";
+
 struct Args {
     url: String,
     user: String,
@@ -36,6 +41,14 @@ enum Command {
     Query {
         query: String,
     },
+    Columns,
+    AddColumn {
+        key: String,
+        value_type: String,
+    },
+    RemoveColumn {
+        key: String,
+    },
 }
 
 fn main() -> ExitCode {
@@ -52,6 +65,9 @@ fn main() -> ExitCode {
         } => run_set(&client, &args, coords, key, value_type, value),
         Command::Remove { coords, key } => run_remove(&client, &args, coords, key),
         Command::Query { query } => run_query(&client, &args, query),
+        Command::Columns => run_columns(&client, &args),
+        Command::AddColumn { key, value_type } => run_add_column(&client, &args, key, value_type),
+        Command::RemoveColumn { key } => run_remove_column(&client, &args, key),
     };
 
     match result {
@@ -86,7 +102,7 @@ fn parse_args() -> Args {
     }
 
     let command_name = command_name.unwrap_or_else(|| {
-        eprintln!("missing command -- expected one of: get, set, remove, query\n");
+        eprintln!("missing command -- expected one of: {COMMAND_LIST}\n");
         print_help();
         std::process::exit(1);
     });
@@ -124,8 +140,23 @@ fn parse_args() -> Args {
                 }
             }
         }
+        "columns" => match positional.as_slice() {
+            [] => Command::Columns,
+            _ => usage_error("columns", &positional),
+        },
+        "add-column" => match positional.as_slice() {
+            [key, value_type] => Command::AddColumn {
+                key: key.clone(),
+                value_type: value_type.clone(),
+            },
+            _ => usage_error("add-column <key> <type>", &positional),
+        },
+        "remove-column" => match positional.as_slice() {
+            [key] => Command::RemoveColumn { key: key.clone() },
+            _ => usage_error("remove-column <key>", &positional),
+        },
         other => {
-            eprintln!("unknown command '{other}' -- expected one of: get, set, remove, query\n");
+            eprintln!("unknown command '{other}' -- expected one of: {COMMAND_LIST}\n");
             print_help();
             std::process::exit(1);
         }
@@ -170,7 +201,10 @@ fn print_help() {
          `<type> <value> (created=<ms> modified=<ms> version=<n>)`\n    \
          set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, i64, or bool)\n    \
          remove <coords> <key>               Clear a cell's value\n    \
-         query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)\n\n\
+         query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)\n    \
+         columns                             List the world's schema, one `<key> <type>` per line\n    \
+         add-column <key> <type>             Create a column (type: str, f64, i64, or bool)\n    \
+         remove-column <key>                 Drop a column and every value ever written for it\n\n\
          OPTIONS:\n    \
          --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)\n    \
          --user <name>      Username (default: admin)\n    \
@@ -188,7 +222,10 @@ fn print_help() {
          kblockdbcli --password change-me query \"SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'\"\n    \
          kblockdbcli --password change-me query \"SET (material='stone') IN (0,0,0) TO (9,9,9)\"\n    \
          kblockdbcli --password change-me query \"UPDATE (material='dirt') WHERE material = 'stone'\"\n    \
-         kblockdbcli --password change-me query \"DELETE WHERE material = 'air'\"\n\n\
+         kblockdbcli --password change-me query \"DELETE WHERE material = 'air'\"\n    \
+         kblockdbcli --password change-me columns\n    \
+         kblockdbcli --password change-me add-column hardness f64\n    \
+         kblockdbcli --password change-me remove-column hardness\n\n\
          Wrap the whole query in one shell-quoted argument -- it may contain\n\
          spaces and single-quoted string literals of its own. SET is an\n\
          upsert and requires IN <range> (it can create cells; UPDATE only\n\
@@ -258,6 +295,88 @@ fn run_remove(
         .send()
         .map_err(|e| format!("request failed: {e}"))?;
     check_success(resp)
+}
+
+fn columns_url(args: &Args) -> String {
+    format!("{}/rest/columns", args.url.trim_end_matches('/'))
+}
+
+fn run_columns(client: &reqwest::blocking::Client, args: &Args) -> Result<(), String> {
+    let resp = client
+        .get(columns_url(args))
+        .basic_auth(&args.user, Some(&args.password))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let body: Json = resp
+        .json()
+        .map_err(|e| format!("couldn't parse the server's response: {e}"))?;
+    if !status.is_success() {
+        return Err(server_error_message(status, &body));
+    }
+    print_columns_response(&body)
+}
+
+/// Renders a `GET /rest/columns` response (kblockdbserver's
+/// `ColumnsResponse`) as one `<key> <type>` line per column, then a count
+/// -- same shape as `query`'s row listing, so the two read alike.
+fn print_columns_response(body: &Json) -> Result<(), String> {
+    let columns = body
+        .get("columns")
+        .and_then(Json::as_array)
+        .ok_or("response is missing 'columns'")?;
+    for column in columns {
+        let key = column["key"]
+            .as_str()
+            .ok_or("column entry is missing 'key'")?;
+        let value_type = column["type"]
+            .as_str()
+            .ok_or("column entry is missing 'type'")?;
+        println!("{key} {value_type}");
+    }
+    println!("{} column(s)", columns.len());
+    Ok(())
+}
+
+fn run_add_column(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    key: &str,
+    value_type: &str,
+) -> Result<(), String> {
+    let body = build_column_json(value_type)?;
+    let resp = client
+        .put(format!("{}/{key}", columns_url(args)))
+        .basic_auth(&args.user, Some(&args.password))
+        .json(&body)
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_success(resp)
+}
+
+fn run_remove_column(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    key: &str,
+) -> Result<(), String> {
+    let resp = client
+        .delete(format!("{}/{key}", columns_url(args)))
+        .basic_auth(&args.user, Some(&args.password))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_success(resp)
+}
+
+/// The body of `PUT /rest/columns/{key}` (kblockdbserver's
+/// `AddColumnBody`), validating the type name up front so a typo is a
+/// local error rather than a round trip ending in a 400.
+fn build_column_json(value_type: &str) -> Result<Json, String> {
+    match value_type {
+        "str" | "f64" | "i64" | "bool" => Ok(json!({"type": value_type})),
+        other => Err(format!(
+            "unknown type '{other}' -- expected one of: str, f64, i64, bool"
+        )),
+    }
 }
 
 fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Result<(), String> {
@@ -556,5 +675,42 @@ mod unit_tests {
     #[test]
     fn print_query_response_rejects_an_unrecognized_shape() {
         assert!(print_query_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn build_column_json_accepts_every_value_type() {
+        for value_type in ["str", "f64", "i64", "bool"] {
+            assert_eq!(
+                build_column_json(value_type).unwrap(),
+                json!({ "type": value_type })
+            );
+        }
+    }
+
+    #[test]
+    fn build_column_json_rejects_an_unknown_type() {
+        let err = build_column_json("complex").unwrap_err();
+        assert!(err.contains("complex"));
+    }
+
+    #[test]
+    fn print_columns_response_accepts_a_list_of_columns() {
+        let body = json!({"columns": [
+            {"key": "hardness", "type": "f64"},
+            {"key": "material", "type": "str"},
+        ]});
+        assert!(print_columns_response(&body).is_ok());
+    }
+
+    #[test]
+    fn print_columns_response_accepts_an_empty_schema() {
+        assert!(print_columns_response(&json!({"columns": []})).is_ok());
+    }
+
+    #[test]
+    fn print_columns_response_rejects_an_unrecognized_shape() {
+        assert!(print_columns_response(&json!({})).is_err());
+        assert!(print_columns_response(&json!({"columns": [{"key": "material"}]})).is_err());
+        assert!(print_columns_response(&json!({"columns": [{"type": "str"}]})).is_err());
     }
 }

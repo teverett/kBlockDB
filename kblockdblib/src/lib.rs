@@ -21,6 +21,7 @@ pub mod world;
 pub use chunk::CellMeta;
 pub use coord::Coord;
 pub use params::WorldParams;
+pub use schema::ColumnInfo;
 pub use value::{Value, ValueType};
 pub use world::{
     CellEntry, Region, Stats, World, AXES, DEFAULT_CHUNK_DIM, DEFAULT_MAX_CACHED_CHUNKS,

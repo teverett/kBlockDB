@@ -17,6 +17,12 @@ cargo build --release
     "SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'"
 # (1,2,3) material=stone (str) (created=1735689600000 modified=1735689600000 version=0)
 # 1 row(s)
+./target/release/kblockdbcli --password change-me add-column hardness f64
+./target/release/kblockdbcli --password change-me columns
+# hardness f64
+# material str
+# 2 column(s)
+./target/release/kblockdbcli --password change-me remove-column hardness
 ```
 
 ```
@@ -29,6 +35,9 @@ COMMANDS:
     set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, i64, or bool)
     remove <coords> <key>               Clear a cell's value
     query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)
+    columns                             List the world's schema, one `<key> <type>` per line
+    add-column <key> <type>             Create a column (type: str, f64, i64, or bool)
+    remove-column <key>                 Drop a column and every value ever written for it
 
 OPTIONS:
     --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)
@@ -60,6 +69,16 @@ and `DELETE` print `<n> cell(s) affected`. `SET` is an upsert and requires
 `IN <range>` (it can create cells; `UPDATE` only ever changes cells that
 already exist). All three writes need a non-read-only account, same as
 `set`/`remove`.
+
+`columns`/`add-column`/`remove-column` wrap the server's
+[`/rest/columns`](kblockdbserver.md#columns) resource. `columns` prints
+one `<key> <type>` line per column -- the same `<type> <value>` ordering
+`get`/`set` use, so a column line's second field is directly usable as a
+`set` type argument -- then a `<n> column(s)` summary. `add-column` only
+ever creates: a key that already has a column is an error, not a silent
+type change. `remove-column` drops the column *and every value ever
+written for it*, across the whole world, and can't be undone. Both writes
+need a non-read-only account.
 
 ## Layout
 

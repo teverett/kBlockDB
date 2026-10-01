@@ -231,6 +231,33 @@ class WireTest {
                 Wire.encodeQuery("SELECT *"));
     }
 
+    @Test
+    void encodesColumnRequests() throws IOException {
+        assertArrayEquals(new byte[] {0x0A}, Wire.encodeListColumns());
+        assertArrayEquals(
+                new byte[] {0x0B, 1, 0, 'k', 1},
+                Wire.encodeAddColumn("k", ValueType.F64));
+        assertArrayEquals(new byte[] {0x0C, 1, 0, 'k'}, Wire.encodeRemoveColumn("k"));
+    }
+
+    @Test
+    void encodesAddColumnWithEveryValueTypeTag() throws IOException {
+        for (ValueType valueType : ValueType.values()) {
+            byte[] encoded = Wire.encodeAddColumn("k", valueType);
+            assertEquals(valueType.tag(), encoded[encoded.length - 1]);
+        }
+    }
+
+    @Test
+    void valueTypeOfMatchesEachValuesWireTag() throws IOException {
+        for (Value value : List.of(
+                new Value.Str("stone"), new Value.F64(2.6), new Value.I64(7), new Value.Bool(true))) {
+            ByteArrayOutputStream buf = new ByteArrayOutputStream();
+            Wire.writeValue(buf, value);
+            assertEquals(ValueType.of(value).tag(), buf.toByteArray()[0]);
+        }
+    }
+
     // --- Response decoding ---
 
     @Test
@@ -403,5 +430,69 @@ class WireTest {
 
         byte[] queryRows = {0x0B, 0, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0x7F};
         assertThrows(ProtocolException.class, () -> Wire.decodeResponse(queryRows));
+    }
+
+    @Test
+    void decodesColumnsResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0C);
+        Wire.writeU32(buf, 2);
+        Wire.writeU16(buf, 8);
+        buf.write("hardness".getBytes(StandardCharsets.UTF_8));
+        buf.write(1); // f64
+        Wire.writeU16(buf, 8);
+        buf.write("material".getBytes(StandardCharsets.UTF_8));
+        buf.write(0); // str
+
+        Wire.Response response = Wire.decodeResponse(buf.toByteArray());
+        assertEquals(
+                new Wire.Columns(List.of(
+                        new Column("hardness", ValueType.F64), new Column("material", ValueType.STR))),
+                response);
+    }
+
+    @Test
+    void decodesAnEmptyColumnsResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0C);
+        Wire.writeU32(buf, 0);
+        assertEquals(new Wire.Columns(List.of()), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesConflictResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0D);
+        byte[] message = "already exists".getBytes(StandardCharsets.UTF_8);
+        Wire.writeU16(buf, message.length);
+        buf.write(message);
+        assertEquals(new Wire.Conflict("already exists"), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodingAColumnWithAnUnknownTypeTagIsAProtocolException() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0C);
+        Wire.writeU32(buf, 1);
+        Wire.writeU16(buf, 1);
+        buf.write('k');
+        buf.write(0xFE);
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodingATruncatedColumnsResponseIsAProtocolException() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0C);
+        Wire.writeU32(buf, 2); // claims two columns, carries none
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void valueTypeRoundTripsThroughItsTag() {
+        for (ValueType valueType : ValueType.values()) {
+            assertEquals(valueType, ValueType.fromTag(valueType.tag()));
+        }
+        assertNull(ValueType.fromTag(0xFE));
     }
 }

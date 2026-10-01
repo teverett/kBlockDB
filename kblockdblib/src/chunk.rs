@@ -298,6 +298,14 @@ impl Chunk {
         }
     }
 
+    /// Drops `key_id`'s entire column from this chunk -- every cell's
+    /// value and metadata for that key at once -- returning whether there
+    /// was one to drop. Unlike `remove`, which clears a single cell, this
+    /// is what `World::remove_column` uses to erase a key world-wide.
+    pub fn remove_column(&mut self, key_id: u32) -> bool {
+        self.columns.remove(&key_id).is_some()
+    }
+
     /// True if no cell in this chunk has any value set -- such chunks aren't
     /// written to disk at all (see `World::flush_one`), which is how a mostly
     /// empty 10,000^3 world avoids allocating 30 million chunk files.

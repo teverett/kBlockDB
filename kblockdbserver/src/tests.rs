@@ -1336,3 +1336,208 @@ async fn query_is_documented_in_the_openapi_spec() {
         "spec is missing /rest/query"
     );
 }
+
+// --- Columns (the schema API) ---
+
+#[tokio::test]
+async fn columns_of_a_fresh_world_are_empty() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, get("/rest/columns")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["columns"], json!([]));
+}
+
+#[tokio::test]
+async fn add_column_then_list_reports_it() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(
+        app.clone(),
+        put("/rest/columns/hardness", json!({"type": "f64"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(app, get("/rest/columns")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["columns"], json!([{"key": "hardness", "type": "f64"}]));
+}
+
+/// Writing a cell interns its key, so the schema picks up columns nobody
+/// ever declared explicitly -- `/rest/columns` has to show those too, or
+/// it'd be describing only half the world's shape.
+#[tokio::test]
+async fn setting_a_cell_creates_a_column_implicitly() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = send(app, get("/rest/columns")).await;
+    assert_eq!(body["columns"], json!([{"key": "material", "type": "str"}]));
+}
+
+#[tokio::test]
+async fn columns_are_listed_sorted_by_key() {
+    let (app, _dir) = test_app();
+    for key in ["material", "hardness", "visible"] {
+        let (status, _) = send(
+            app.clone(),
+            put(&format!("/rest/columns/{key}"), json!({"type": "str"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NO_CONTENT);
+    }
+    let (_, body) = send(app, get("/rest/columns")).await;
+    let keys: Vec<&str> = body["columns"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["hardness", "material", "visible"]);
+}
+
+#[tokio::test]
+async fn adding_a_column_that_already_exists_is_409() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put("/rest/columns/material", json!({"type": "str"})),
+    )
+    .await;
+    let (status, body) = send(app, put("/rest/columns/material", json!({"type": "str"}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains("material"));
+}
+
+#[tokio::test]
+async fn adding_a_column_with_an_unknown_type_is_a_client_error() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, put("/rest/columns/material", json!({"type": "blob"}))).await;
+    // Axum's own `Json` extractor rejects this before the handler runs,
+    // same as any other unparseable body -- see
+    // `malformed_json_body_is_a_client_error`.
+    assert!(status.is_client_error(), "expected 4xx, got {status}");
+}
+
+#[tokio::test]
+async fn adding_a_column_whose_key_the_schema_cant_store_is_400() {
+    let (app, _dir) = test_app();
+    // A tab would split the key across `schema.txt`'s own field
+    // separator, so the schema rejects it rather than writing a line it
+    // couldn't read back.
+    let (status, _) = send(app, put("/rest/columns/bad%09key", json!({"type": "str"}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn removing_a_column_drops_its_values_too() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, _) = send(app.clone(), delete("/rest/columns/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, _) = send(app.clone(), get("/rest/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (_, body) = send(app, get("/rest/columns")).await;
+    assert_eq!(body["columns"], json!([]));
+}
+
+/// A removed column's type isn't sticky: the key gets a fresh id when it
+/// comes back, so it can be re-created as something else entirely.
+#[tokio::test]
+async fn a_removed_column_can_be_re_added_with_a_different_type() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put("/rest/columns/material", json!({"type": "str"})),
+    )
+    .await;
+    send(app.clone(), delete("/rest/columns/material")).await;
+
+    let (status, _) = send(
+        app.clone(),
+        put("/rest/columns/material", json!({"type": "i64"})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = send(app, get("/rest/columns")).await;
+    assert_eq!(body["columns"], json!([{"key": "material", "type": "i64"}]));
+}
+
+#[tokio::test]
+async fn removing_a_column_that_doesnt_exist_is_404() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, delete("/rest/columns/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("nope"));
+}
+
+#[tokio::test]
+async fn listing_columns_requires_auth() {
+    let (app, _dir) = test_app();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/columns")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_read_only_user_can_list_but_not_change_columns() {
+    let (app, _dir) = test_app();
+    let list = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rest/columns")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), list).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let add = with_auth(
+        Request::builder()
+            .method("PUT")
+            .uri("/rest/columns/material")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"type": "str"}).to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), add).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let remove = with_auth(
+        Request::builder()
+            .method("DELETE")
+            .uri("/rest/columns/material")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, remove).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}

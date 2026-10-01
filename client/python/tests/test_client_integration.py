@@ -10,6 +10,8 @@ from kblockdb import (
     Affected,
     BadRequestError,
     Bool,
+    Column,
+    ConflictError,
     F64,
     ForbiddenError,
     I64,
@@ -18,6 +20,7 @@ from kblockdb import (
     Rows,
     Str,
     UnauthorizedError,
+    ValueType,
 )
 
 
@@ -211,6 +214,57 @@ class ClientIntegrationTest(unittest.TestCase):
         client.close()
         with self.assertRaises(ProtocolError):
             client.health()
+
+
+    def test_add_list_and_remove_columns_round_trip(self) -> None:
+        with self.connect() as client:
+            client.add_column("py-client-column", ValueType.I64)
+            self.assertIn(Column("py-client-column", ValueType.I64), client.columns())
+
+            # Re-adding the same key conflicts rather than silently
+            # changing (or re-confirming) its type.
+            with self.assertRaises(ConflictError):
+                client.add_column("py-client-column", ValueType.STR)
+
+            self.assertTrue(client.remove_column("py-client-column"))
+            self.assertNotIn(
+                Column("py-client-column", ValueType.I64), client.columns()
+            )
+
+    def test_removing_a_column_that_does_not_exist_returns_false(self) -> None:
+        with self.connect() as client:
+            self.assertFalse(client.remove_column("py-client-no-such-column"))
+
+    def test_writing_a_cell_creates_its_column_and_removal_drops_its_values(
+        self,
+    ) -> None:
+        with self.connect() as client:
+            client.set((7, 7, 7), "py-client-implicit", Str("stone"))
+            self.assertIn(
+                Column("py-client-implicit", ValueType.STR), client.columns()
+            )
+
+            self.assertTrue(client.remove_column("py-client-implicit"))
+            self.assertIsNone(client.get((7, 7, 7), "py-client-implicit"))
+
+    def test_a_removed_column_can_come_back_with_a_different_type(self) -> None:
+        with self.connect() as client:
+            client.add_column("py-client-retyped", ValueType.STR)
+            self.assertTrue(client.remove_column("py-client-retyped"))
+
+            client.add_column("py-client-retyped", ValueType.BOOL)
+            self.assertIn(
+                Column("py-client-retyped", ValueType.BOOL), client.columns()
+            )
+            self.assertTrue(client.remove_column("py-client-retyped"))
+
+    def test_a_conflict_does_not_close_the_connection(self) -> None:
+        with self.connect() as client:
+            client.add_column("py-client-conflict", ValueType.STR)
+            with self.assertRaises(ConflictError):
+                client.add_column("py-client-conflict", ValueType.STR)
+            self.assertIsNotNone(client.health())
+            self.assertTrue(client.remove_column("py-client-conflict"))
 
 
 if __name__ == "__main__":

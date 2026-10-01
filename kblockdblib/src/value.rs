@@ -51,6 +51,30 @@ impl ValueType {
         }
     }
 
+    /// The one-byte tag a `Value` of this type carries on the wire and in
+    /// a chunk file -- the same `Value::TAG_*` constants, so a type can be
+    /// sent on its own (a column declaration, say) without a value
+    /// attached and still agree with every encoded value of that type.
+    pub const fn tag(self) -> u8 {
+        match self {
+            ValueType::Str => Value::TAG_STR,
+            ValueType::F64 => Value::TAG_F64,
+            ValueType::I64 => Value::TAG_I64,
+            ValueType::Bool => Value::TAG_BOOL,
+        }
+    }
+
+    /// The inverse of `tag`. `None` for an unrecognized tag byte.
+    pub fn from_tag(tag: u8) -> Option<ValueType> {
+        match tag {
+            Value::TAG_STR => Some(ValueType::Str),
+            Value::TAG_F64 => Some(ValueType::F64),
+            Value::TAG_I64 => Some(ValueType::I64),
+            Value::TAG_BOOL => Some(ValueType::Bool),
+            _ => None,
+        }
+    }
+
     /// The inverse of `as_str`, for reading `schema.txt` back. `None` for
     /// anything else -- a corrupt or (from a newer version) unrecognized
     /// type tag.

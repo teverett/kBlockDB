@@ -16,7 +16,7 @@
 
 use crate::error::ApiError;
 use crate::state::{Account, AppState};
-use kblockdbserver::wire::{self, QueryResult, QueryRow, QueryValue, Request, Response};
+use kblockdbserver::wire::{self, Column, QueryResult, QueryRow, QueryValue, Request, Response};
 use tokio::net::{TcpListener, TcpStream};
 
 /// `wire::Response` is defined in the published `wire` module and
@@ -34,6 +34,7 @@ fn response_from_error(e: ApiError) -> Response {
         // in a log line, say) isn't pulling its weight here.
         ApiError::NotFound(_) => Response::NotFound,
         ApiError::BadRequest(m) => Response::BadRequest(m),
+        ApiError::Conflict(m) => Response::Conflict(m),
         ApiError::Internal(m) => Response::Internal(m),
         ApiError::Unauthorized(m) => Response::Unauthorized(m),
         ApiError::Forbidden(m) => Response::Forbidden(m),
@@ -240,6 +241,45 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
                 .await
             {
                 Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::ListColumns => {
+            if let Err(response) = require_authenticated(account) {
+                return response;
+            }
+            match state.with_world(|w| Ok(w.columns())).await {
+                Ok(columns) => Response::Columns(
+                    columns
+                        .into_iter()
+                        .map(|c| Column {
+                            key: c.key,
+                            value_type: c.value_type,
+                        })
+                        .collect(),
+                ),
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::AddColumn { key, value_type } => {
+            if let Err(response) = require_write(account) {
+                return response;
+            }
+            match state
+                .with_world(move |w| w.add_column(&key, value_type))
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::RemoveColumn { key } => {
+            if let Err(response) = require_write(account) {
+                return response;
+            }
+            match state.with_world(move |w| w.remove_column(&key)).await {
+                Ok(true) => Response::Ok,
+                Ok(false) => Response::NotFound,
                 Err(e) => response_from_error(e),
             }
         }
@@ -782,5 +822,181 @@ mod tests {
         let mut stream2 = connect(&server).await;
         let response = hello(&mut stream2, "admin", ADMIN_PASSWORD).await;
         assert!(matches!(response, Response::HelloOk { .. }));
+    }
+
+    // --- Columns (the schema API) ---
+
+    /// Unwraps a `Response::Columns` into `(key, type)` pairs.
+    fn expect_columns(response: Response) -> Vec<(String, kblockdblib::ValueType)> {
+        match response {
+            Response::Columns(columns) => {
+                columns.into_iter().map(|c| (c.key, c.value_type)).collect()
+            }
+            other => panic!("expected Response::Columns, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_columns_on_a_fresh_world_is_empty() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let response = roundtrip(&mut stream, &Request::ListColumns).await;
+        assert_eq!(expect_columns(response), vec![]);
+    }
+
+    #[tokio::test]
+    async fn add_column_then_list_reports_it_sorted_by_key() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        for (key, value_type) in [
+            ("material", kblockdblib::ValueType::Str),
+            ("hardness", kblockdblib::ValueType::F64),
+        ] {
+            let response = roundtrip(
+                &mut stream,
+                &Request::AddColumn {
+                    key: key.to_string(),
+                    value_type,
+                },
+            )
+            .await;
+            assert_eq!(response, Response::Ok);
+        }
+
+        let response = roundtrip(&mut stream, &Request::ListColumns).await;
+        assert_eq!(
+            expect_columns(response),
+            vec![
+                ("hardness".to_string(), kblockdblib::ValueType::F64),
+                ("material".to_string(), kblockdblib::ValueType::Str),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn adding_a_column_that_already_exists_is_a_conflict() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let add = || Request::AddColumn {
+            key: "material".to_string(),
+            value_type: kblockdblib::ValueType::Str,
+        };
+        assert_eq!(roundtrip(&mut stream, &add()).await, Response::Ok);
+        let response = roundtrip(&mut stream, &add()).await;
+        assert!(
+            matches!(response, Response::Conflict(_)),
+            "got {response:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_column_drops_its_values_too() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        roundtrip(
+            &mut stream,
+            &Request::Set {
+                coord: vec![1, 2, 3],
+                key: "material".to_string(),
+                value: Value::Str("stone".to_string()),
+            },
+        )
+        .await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::RemoveColumn {
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response, Response::Ok);
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: vec![1, 2, 3],
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response, Response::NotFound);
+        assert_eq!(
+            expect_columns(roundtrip(&mut stream, &Request::ListColumns).await),
+            vec![]
+        );
+    }
+
+    #[tokio::test]
+    async fn removing_a_column_that_doesnt_exist_is_not_found() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::RemoveColumn {
+                key: "nope".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response, Response::NotFound);
+    }
+
+    #[tokio::test]
+    async fn column_requests_require_hello_first() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        for request in [
+            Request::ListColumns,
+            Request::AddColumn {
+                key: "material".to_string(),
+                value_type: kblockdblib::ValueType::Str,
+            },
+            Request::RemoveColumn {
+                key: "material".to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(
+                matches!(response, Response::Unauthorized(_)),
+                "got {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_only_account_can_list_but_not_change_columns() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "viewer", VIEWER_PASSWORD).await;
+
+        let response = roundtrip(&mut stream, &Request::ListColumns).await;
+        assert_eq!(expect_columns(response), vec![]);
+
+        for request in [
+            Request::AddColumn {
+                key: "material".to_string(),
+                value_type: kblockdblib::ValueType::Str,
+            },
+            Request::RemoveColumn {
+                key: "material".to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(
+                matches!(response, Response::Forbidden(_)),
+                "got {response:?}"
+            );
+        }
     }
 }

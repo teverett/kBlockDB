@@ -28,11 +28,13 @@ The server's binary listener must be enabled with `--binary-addr` or the
 ## Usage
 
 ```java
+import com.kblockdb.client.Column;
 import com.kblockdb.client.Health;
 import com.kblockdb.client.KBlockDBClient;
 import com.kblockdb.client.QueryResult;
 import com.kblockdb.client.Stats;
 import com.kblockdb.client.Value;
+import com.kblockdb.client.ValueType;
 import com.kblockdb.client.ValueWithMeta;
 
 import java.util.List;
@@ -61,6 +63,10 @@ try (KBlockDBClient db =
 
     QueryResult result =
         db.query("SELECT material WHERE material = 'stone'");
+
+    db.addColumn("hardness", ValueType.F64);
+    List<Column> columns = db.columns();
+    db.removeColumn("hardness");
 }
 ```
 
@@ -80,6 +86,16 @@ try (KBlockDBClient db =
 | `setRegion(origin, extent, key, values)` | `void` | Writes a region in axis-0-fastest order. |
 | `removeRegion(origin, extent, key)` | `void` | Clears a key throughout a region. |
 | `query(query)` | `QueryResult` | Executes any query-language statement. |
+| `columns()` | `List<Column>` | Lists the world's schema, sorted by key. |
+| `addColumn(key, valueType)` | `void` | Creates a column, fixing its type. |
+| `removeColumn(key)` | `boolean` | Drops a column and all its values; false if it didn't exist. |
+
+`ValueType` names those same four types without a value attached, and is
+what a `Column` carries. `addColumn` only ever creates -- re-adding an
+existing key throws `ConflictException` rather than changing its type --
+and `removeColumn` drops every value ever written for the key, across the
+whole world. See the [server's notes](kblockdbserver.md#columns) for the
+details.
 
 `Value` has `Str`, `F64`, `I64`, and `Bool` variants. A `SELECT` returns
 `QueryResult.Rows`; mutating statements return `QueryResult.Affected`.
@@ -95,6 +111,8 @@ All server and protocol errors extend `IOException`:
 - `UnauthorizedException` reports rejected credentials.
 - `ForbiddenException` reports a write attempted through a read-only
   account.
+- `ConflictException` reports an `addColumn` for a key that already has a
+  column.
 - `InternalErrorException` reports a server-side storage failure.
 - `ProtocolException` reports malformed or incompatible wire data.
 
@@ -106,6 +124,8 @@ All server and protocol errors extend `IOException`:
   request encoding, response decoding, and frame I/O.
 - `client/java/src/main/java/com/kblockdb/client/Value.java` -- typed
   values.
+- `client/java/src/main/java/com/kblockdb/client/ValueType.java` and
+  `Column.java` -- schema models.
 - `client/java/src/main/java/com/kblockdb/client/Query*.java` -- query
   result models.
 - `client/java/src/test/java/com/kblockdb/client/WireTest.java` -- pinned

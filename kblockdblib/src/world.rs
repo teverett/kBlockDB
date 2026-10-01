@@ -2,9 +2,9 @@ use crate::chunk::{self, CellMeta, Chunk};
 use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
 use crate::params::WorldParams;
-use crate::schema::Schema;
+use crate::schema::{ColumnInfo, Schema};
 use crate::semaphore::Semaphore;
-use crate::value::Value;
+use crate::value::{Value, ValueType};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -624,6 +624,81 @@ impl World {
         self.schema().len()
     }
 
+    /// Every column in this world's schema -- each live key and the value
+    /// type fixed for it -- sorted by key.
+    pub fn columns(&self) -> Vec<ColumnInfo> {
+        self.schema().columns()
+    }
+
+    /// Adds `key` as a new column of type `value_type`, fixing its type
+    /// before any cell has ever been written to it. Fails with
+    /// `AlreadyExists` if the column already exists, and with
+    /// `InvalidInput` if `key` isn't a name the schema can store.
+    ///
+    /// Columns are also created implicitly by `set`/`set_region` (which
+    /// take their type from the value being written), so this isn't
+    /// required before writing -- it's for declaring a world's shape up
+    /// front, and for pinning a key's type without having to write a
+    /// throwaway value to do it.
+    pub fn add_column(&self, key: &str, value_type: ValueType) -> io::Result<()> {
+        self.schema().add(key, value_type)?;
+        crate::logger::info(format!(
+            "added column '{key}' ({}) to {}",
+            value_type.as_str(),
+            self.root.display()
+        ));
+        Ok(())
+    }
+
+    /// Drops `key` from the schema *and* erases every value ever written
+    /// for it, from every chunk in the world. Returns false, having
+    /// changed nothing, if `key` isn't a column.
+    ///
+    /// This is irreversible and proportional in cost to how many chunk
+    /// files exist: it walks all of them, rewriting each one that held the
+    /// column (and deleting any left with nothing in it). The schema
+    /// tombstone is written first, so the column stops being readable
+    /// immediately and a crash partway through the walk can never leave
+    /// the key partly alive -- at worst it leaves some unreachable bytes
+    /// in chunks the walk hadn't reached, which the next
+    /// `remove_column` of that same key can no longer clean up, since the
+    /// id is gone from the schema by then.
+    ///
+    /// A later `add_column`/`set` of the same key starts over: it gets a
+    /// brand new id, with no connection to the removed column's data, and
+    /// so may use a different type than the old one did.
+    pub fn remove_column(&self, key: &str) -> io::Result<bool> {
+        // The tombstone goes down under the same lock that `set`'s
+        // `intern` takes, so no write can start using this id afterward
+        // -- a concurrent `set` of this key either already has the old id
+        // (and may leave bytes the walk below misses, unreachable by
+        // name), or interns a brand new id that the walk won't touch.
+        let Some(key_id) = self.schema().remove(key)? else {
+            return Ok(false);
+        };
+
+        let mut chunk_keys = Vec::new();
+        collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
+        let mut purged = 0u64;
+        for ckey in &chunk_keys {
+            // `with_chunk_write` is what makes this safe against
+            // concurrent single-cell writes: it takes the same per-chunk
+            // lock they do, and writes the chunk back out (or deletes it,
+            // if this emptied it) exactly as they would.
+            if self.with_chunk_maybe_write(ckey, |chunk| {
+                let removed = chunk.remove_column(key_id);
+                (removed, removed)
+            })? {
+                purged += 1;
+            }
+        }
+        crate::logger::info(format!(
+            "removed column '{key}' from {} ({purged} chunk(s) rewritten)",
+            self.root.display()
+        ));
+        Ok(true)
+    }
+
     /// Walks every chunk file on disk under `root` and totals their count,
     /// size, and disk-block usage into a [`Stats`]. A live filesystem walk,
     /// not a running total -- proportional in cost to how many chunks
@@ -661,10 +736,10 @@ impl World {
         // cell, see `Schema`'s doc comment), so this costs little and lets
         // concurrent `set`s of a brand new key proceed without waiting on
         // this call.
-        let key_names: Vec<String> = {
+        let key_names: Vec<Option<String>> = {
             let schema = self.schema();
-            (0..schema.len() as u32)
-                .map(|id| schema.key_for_id(id).unwrap_or("?").to_string())
+            (0..schema.id_space() as u32)
+                .map(|id| schema.key_for_id(id).map(str::to_string))
                 .collect()
         };
 
@@ -675,14 +750,18 @@ impl World {
                 let coord = self.unsplit(ckey, local_idx);
                 let mut values: Vec<(String, Value, CellMeta)> = entries
                     .into_iter()
-                    .map(|(key_id, value, meta)| {
-                        let name = key_names
-                            .get(key_id as usize)
-                            .cloned()
-                            .unwrap_or_else(|| "?".to_string());
-                        (name, value, meta)
+                    // Anything under an id with no live key is skipped,
+                    // not reported under a placeholder name: that's either
+                    // a removed column whose purge didn't reach this chunk
+                    // (see `remove_column`) or an id from another world.
+                    .filter_map(|(key_id, value, meta)| {
+                        let name = key_names.get(key_id as usize)?.clone()?;
+                        Some((name, value, meta))
                     })
                     .collect();
+                if values.is_empty() {
+                    continue;
+                }
                 values.sort_by(|a, b| a.0.cmp(&b.0));
                 cells.push(CellEntry { coord, values });
             }
@@ -796,6 +875,21 @@ impl World {
         ckey: &ChunkKey,
         f: impl FnOnce(&mut Chunk) -> T,
     ) -> io::Result<T> {
+        self.with_chunk_maybe_write(ckey, |chunk| (f(chunk), true))
+    }
+
+    /// `with_chunk_write`, but `f` also says whether it actually changed
+    /// anything: when it returns `false` the chunk's file is left exactly
+    /// as it was, untouched and uncounted. For `remove_column`, which
+    /// visits *every* chunk in the world but typically only finds the
+    /// column in some of them -- rewriting byte-identical files for all
+    /// the rest would make dropping a rare column as expensive as
+    /// rewriting the entire world.
+    fn with_chunk_maybe_write<T>(
+        &self,
+        ckey: &ChunkKey,
+        f: impl FnOnce(&mut Chunk) -> (T, bool),
+    ) -> io::Result<T> {
         // Held for the rest of this function -- see `disk_io`'s field doc
         // comment and `DEFAULT_MAX_CONCURRENT_DISK_OPS`. Acquired before
         // any filesystem call at all, including `create_dir_all`: that one
@@ -811,7 +905,10 @@ impl World {
         }
         let chunk = guard.as_mut().unwrap();
 
-        let result = f(chunk);
+        let (result, changed) = f(chunk);
+        if !changed {
+            return Ok(result);
+        }
 
         let chunk_path = self.chunk_path(ckey);
         if chunk.is_empty() {
@@ -3110,5 +3207,318 @@ mod tests {
         assert_eq!(read.len(), 160);
         assert_eq!(read[0], Some(Value::I64(0)));
         assert_eq!(read[159], Some(Value::I64(159)));
+    }
+
+    // --- Columns: add and remove ---
+
+    #[test]
+    fn add_column_declares_a_column_with_no_data() {
+        let dir = TempDir::new("add-column");
+        let w = create(&dir);
+        w.add_column("material", ValueType::Str).unwrap();
+
+        assert_eq!(
+            w.columns(),
+            vec![ColumnInfo {
+                key: "material".to_string(),
+                value_type: ValueType::Str,
+            }]
+        );
+        // Declared, but with nothing written anywhere.
+        assert_eq!(w.get(&coord3(1, 2, 3), "material").unwrap(), None);
+        assert_eq!(w.stats().unwrap().total_chunks, 0);
+    }
+
+    #[test]
+    fn add_column_fixes_the_type_for_later_sets() {
+        let dir = TempDir::new("add-column-type");
+        let w = create(&dir);
+        w.add_column("hardness", ValueType::I64).unwrap();
+        let c = coord3(1, 2, 3);
+
+        let err = w
+            .set(&c, "hardness", Value::Str("soft".into()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        w.set(&c, "hardness", Value::I64(7)).unwrap();
+        assert_eq!(w.get(&c, "hardness").unwrap(), Some(Value::I64(7)));
+    }
+
+    #[test]
+    fn add_column_rejects_a_duplicate() {
+        let dir = TempDir::new("add-column-duplicate");
+        let w = create(&dir);
+        w.add_column("material", ValueType::Str).unwrap();
+
+        let err = w.add_column("material", ValueType::Str).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn add_column_conflicts_with_a_column_created_by_set() {
+        let dir = TempDir::new("add-column-after-set");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+            .unwrap();
+
+        let err = w.add_column("material", ValueType::Str).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+    }
+
+    #[test]
+    fn columns_reports_every_key_whatever_created_it() {
+        let dir = TempDir::new("columns-list");
+        let w = create(&dir);
+        w.add_column("density", ValueType::F64).unwrap();
+        w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+            .unwrap();
+
+        let columns = w.columns();
+        assert_eq!(columns.len(), 2);
+        assert_eq!(columns[0].key, "density");
+        assert_eq!(columns[1].key, "material");
+        assert_eq!(columns[1].value_type, ValueType::Str);
+    }
+
+    #[test]
+    fn a_column_added_without_data_survives_a_reopen() {
+        let dir = TempDir::new("add-column-persists");
+        {
+            let w = create(&dir);
+            w.add_column("material", ValueType::Str).unwrap();
+        }
+
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.columns().len(), 1);
+        assert_eq!(w.columns()[0].value_type, ValueType::Str);
+    }
+
+    #[test]
+    fn remove_column_erases_its_data_everywhere() {
+        let dir = TempDir::new("remove-column");
+        let w = create(&dir);
+        // Spread across several distinct chunks.
+        let coords = [coord3(1, 2, 3), coord3(500, 500, 500), coord3(9, 9, 9)];
+        for c in &coords {
+            w.set(c, "material", Value::Str("stone".into())).unwrap();
+            w.set(c, "keep", Value::I64(1)).unwrap();
+        }
+
+        assert!(w.remove_column("material").unwrap());
+
+        for c in &coords {
+            assert_eq!(w.get(c, "material").unwrap(), None, "at {c:?}");
+            // The other column in the very same cells is untouched.
+            assert_eq!(w.get(c, "keep").unwrap(), Some(Value::I64(1)), "at {c:?}");
+        }
+        assert_eq!(
+            w.columns(),
+            vec![ColumnInfo {
+                key: "keep".to_string(),
+                value_type: ValueType::I64,
+            }]
+        );
+    }
+
+    #[test]
+    fn remove_column_erases_data_on_disk_not_just_in_the_cache() {
+        let dir = TempDir::new("remove-column-on-disk");
+        let c = coord3(1, 2, 3);
+        {
+            let w = create(&dir);
+            w.set(&c, "material", Value::Str("stone".into())).unwrap();
+            w.set(&c, "keep", Value::I64(1)).unwrap();
+            assert!(w.remove_column("material").unwrap());
+        }
+
+        // A brand new handle, with an empty cache, reading the rewritten
+        // chunk file back off disk.
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+        assert_eq!(w.get(&c, "keep").unwrap(), Some(Value::I64(1)));
+        assert!(w.columns().iter().all(|col| col.key != "material"));
+    }
+
+    #[test]
+    fn remove_column_deletes_a_chunk_file_it_empties() {
+        let dir = TempDir::new("remove-column-empties-chunk");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+
+        let (ckey, _) = w.split(&c).unwrap();
+        let path = w.chunk_path(&ckey);
+        assert!(path.exists());
+
+        assert!(w.remove_column("material").unwrap());
+        assert!(
+            !path.exists(),
+            "a chunk with nothing left in it shouldn't stay on disk"
+        );
+        assert_eq!(w.stats().unwrap().total_chunks, 0);
+    }
+
+    #[test]
+    fn remove_column_leaves_untouched_chunks_unwritten() {
+        // The walk visits every chunk, but must only rewrite the ones that
+        // actually held the column -- otherwise dropping a rare key costs
+        // a rewrite of the whole world.
+        let dir = TempDir::new("remove-column-no-pointless-writes");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "doomed", Value::I64(1)).unwrap();
+        for i in 0..4 {
+            w.set(&coord3(500 + i * 100, 0, 0), "keep", Value::I64(1))
+                .unwrap();
+        }
+        assert_eq!(w.stats().unwrap().total_chunks, 5);
+
+        let before = w.chunks_written_to_disk();
+        assert!(w.remove_column("doomed").unwrap());
+        assert_eq!(
+            w.chunks_written_to_disk() - before,
+            0,
+            "the only chunk holding the column was emptied, so it should \
+             have been deleted rather than rewritten, and no other chunk \
+             should have been written at all"
+        );
+        assert_eq!(w.stats().unwrap().total_chunks, 4);
+    }
+
+    #[test]
+    fn remove_column_rewrites_only_the_chunks_that_held_the_column() {
+        let dir = TempDir::new("remove-column-selective-writes");
+        let w = create(&dir);
+        // Two chunks hold both keys; two hold only `keep`.
+        for i in 0..2 {
+            let c = coord3(i * 100, 0, 0);
+            w.set(&c, "doomed", Value::I64(1)).unwrap();
+            w.set(&c, "keep", Value::I64(1)).unwrap();
+        }
+        for i in 2..4 {
+            w.set(&coord3(i * 100, 0, 0), "keep", Value::I64(1))
+                .unwrap();
+        }
+
+        let before = w.chunks_written_to_disk();
+        assert!(w.remove_column("doomed").unwrap());
+        assert_eq!(
+            w.chunks_written_to_disk() - before,
+            2,
+            "only the two chunks that actually held 'doomed' should be rewritten"
+        );
+        assert_eq!(w.stats().unwrap().total_chunks, 4);
+    }
+
+    #[test]
+    fn remove_column_of_an_unknown_key_is_false_and_changes_nothing() {
+        let dir = TempDir::new("remove-column-missing");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "keep", Value::I64(1)).unwrap();
+
+        let before = w.chunks_written_to_disk();
+        assert!(!w.remove_column("nonexistent").unwrap());
+        assert_eq!(w.chunks_written_to_disk(), before);
+        assert_eq!(w.columns().len(), 1);
+    }
+
+    #[test]
+    fn a_removed_column_is_gone_from_list_cells() {
+        let dir = TempDir::new("remove-column-list-cells");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.set(&c, "keep", Value::I64(1)).unwrap();
+
+        w.remove_column("material").unwrap();
+        let cells = w.list_cells().unwrap();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].values.len(), 1);
+        assert_eq!(cells[0].values[0].0, "keep");
+    }
+
+    #[test]
+    fn a_cell_left_with_nothing_disappears_from_list_cells() {
+        let dir = TempDir::new("remove-column-empties-cell");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+            .unwrap();
+
+        w.remove_column("material").unwrap();
+        assert!(w.list_cells().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_removed_column_can_come_back_with_a_different_type() {
+        let dir = TempDir::new("remove-column-readd");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.remove_column("material").unwrap();
+
+        // The old column was Str; this one is I64, which would be
+        // impossible if the id had been reused.
+        w.add_column("material", ValueType::I64).unwrap();
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+        w.set(&c, "material", Value::I64(9)).unwrap();
+        assert_eq!(w.get(&c, "material").unwrap(), Some(Value::I64(9)));
+    }
+
+    #[test]
+    fn setting_a_removed_column_recreates_it() {
+        let dir = TempDir::new("remove-column-then-set");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.remove_column("material").unwrap();
+        assert!(w.columns().is_empty());
+
+        w.set(&c, "material", Value::Str("dirt".into())).unwrap();
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("dirt".into()))
+        );
+        assert_eq!(w.columns().len(), 1);
+    }
+
+    #[test]
+    fn remove_column_clears_region_reads_too() {
+        let dir = TempDir::new("remove-column-region");
+        let w = create(&dir);
+        let region = Region::new([100, 100, 100], [40, 2, 2]); // spans chunks
+        let values: Vec<Value> = (0..160).map(Value::I64).collect();
+        w.set_region(&region, "n", &values).unwrap();
+
+        assert!(w.remove_column("n").unwrap());
+        let read = w.get_region(&region, "n").unwrap();
+        assert_eq!(read.len(), 160);
+        assert!(read.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn remove_column_works_on_compressed_chunks() {
+        let dir = TempDir::new("remove-column-compressed");
+        let w = create(&dir).with_compression(true);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.set(&c, "keep", Value::I64(1)).unwrap();
+
+        assert!(w.remove_column("material").unwrap());
+        assert!(
+            is_zstd(&chunk_bytes(&w, &c)),
+            "still compressed after the rewrite"
+        );
+
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(reopened.get(&c, "material").unwrap(), None);
+        assert_eq!(reopened.get(&c, "keep").unwrap(), Some(Value::I64(1)));
+    }
+
+    #[test]
+    fn add_column_rejects_a_key_the_schema_cannot_store() {
+        let dir = TempDir::new("add-column-invalid-key");
+        let w = create(&dir);
+        let err = w.add_column("has\ttab", ValueType::Str).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(w.columns().is_empty());
     }
 }

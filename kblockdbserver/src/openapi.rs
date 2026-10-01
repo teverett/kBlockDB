@@ -9,10 +9,11 @@
 
 use crate::error::ErrorBody;
 use crate::routes::{
-    self, CellResponse, HealthResponse, QueryKeyValue, QueryRequest, QueryResponse, QueryRow,
-    RegionValuesResponse, SetRegionBody, StatsResponse,
+    self, AddColumnBody, CellResponse, ColumnResponse, ColumnsResponse, HealthResponse,
+    QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody,
+    StatsResponse,
 };
-use crate::value_json::ValueJson;
+use crate::value_json::{ValueJson, ValueTypeJson};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
@@ -28,6 +29,9 @@ use utoipa::{Modify, OpenApi};
     paths(
         routes::health,
         routes::stats,
+        routes::list_columns,
+        routes::add_column,
+        routes::remove_column,
         routes::get_cell,
         routes::set_cell,
         routes::remove_cell,
@@ -39,6 +43,9 @@ use utoipa::{Modify, OpenApi};
     components(schemas(
         HealthResponse,
         StatsResponse,
+        ColumnResponse,
+        ColumnsResponse,
+        AddColumnBody,
         CellResponse,
         RegionValuesResponse,
         SetRegionBody,
@@ -47,11 +54,13 @@ use utoipa::{Modify, OpenApi};
         QueryRow,
         QueryKeyValue,
         ValueJson,
+        ValueTypeJson,
         ErrorBody,
     )),
     tags(
         (name = "health", description = "Liveness -- unauthenticated"),
         (name = "stats", description = "On-disk statistics for the world's data"),
+        (name = "columns", description = "The world's schema -- listing, adding and dropping columns"),
         (name = "cells", description = "Single-cell reads and writes"),
         (name = "regions", description = "Axis-aligned box-of-cells reads and writes"),
         (name = "query", description = "The SELECT/SET/UPDATE/DELETE query language -- see the README"),

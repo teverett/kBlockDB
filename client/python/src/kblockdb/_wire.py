@@ -10,6 +10,7 @@ from .models import (
     Affected,
     Bool,
     CellMeta,
+    Column,
     F64,
     Health,
     I64,
@@ -20,6 +21,7 @@ from .models import (
     Stats,
     Str,
     Value,
+    ValueType,
 )
 
 MAX_FRAME_LEN = 64 * 1024 * 1024
@@ -126,6 +128,18 @@ def encode_query(query: str) -> bytes:
     return b"\x09" + struct.pack("<I", len(encoded)) + encoded
 
 
+def encode_list_columns() -> bytes:
+    return b"\x0a"
+
+
+def encode_add_column(key: str, value_type: ValueType) -> bytes:
+    return b"\x0b" + _pack_key(key) + struct.pack("<B", value_type.value)
+
+
+def encode_remove_column(key: str) -> bytes:
+    return b"\x0c" + _pack_key(key)
+
+
 def _recv_exact(sock: socket.socket, length: int, context: str) -> bytes:
     chunks = bytearray()
     while len(chunks) < length:
@@ -209,6 +223,11 @@ class QueryResponse:
     result: QueryResult
 
 
+@dataclass(frozen=True, slots=True)
+class ColumnsResponse:
+    columns: tuple[Column, ...]
+
+
 Response: TypeAlias = (
     HelloOk
     | Ok
@@ -219,6 +238,7 @@ Response: TypeAlias = (
     | StatsResponse
     | RegionValues
     | QueryResponse
+    | ColumnsResponse
 )
 
 
@@ -307,6 +327,20 @@ class _Reader:
         return Rows(tuple(rows))
 
 
+def _read_columns(reader: "_Reader") -> tuple[Column, ...]:
+    return tuple(
+        Column(reader.key(), _read_value_type(reader)) for _ in range(reader.u32())
+    )
+
+
+def _read_value_type(reader: "_Reader") -> ValueType:
+    tag = reader.u8()
+    try:
+        return ValueType(tag)
+    except ValueError:
+        raise ProtocolError(f"unknown value type tag 0x{tag:x}") from None
+
+
 def decode_response(payload: bytes) -> Response:
     reader = _Reader(payload)
     status = reader.u8()
@@ -318,7 +352,7 @@ def decode_response(payload: bytes) -> Response:
         return ValueResponse(reader.value(), reader.meta())
     if status == 0x03:
         return NotFound()
-    if 0x04 <= status <= 0x07:
+    if 0x04 <= status <= 0x07 or status == 0x0D:
         return ErrorResponse(status, reader.string(reader.u16()))
     if status == 0x08:
         return HealthResponse(Health(reader.u8(), reader.u32(), reader.u64()))
@@ -328,4 +362,6 @@ def decode_response(payload: bytes) -> Response:
         return RegionValues(reader.region_values())
     if status == 0x0B:
         return QueryResponse(reader.query_result())
+    if status == 0x0C:
+        return ColumnsResponse(_read_columns(reader))
     raise ProtocolError(f"unknown status 0x{status:x}")

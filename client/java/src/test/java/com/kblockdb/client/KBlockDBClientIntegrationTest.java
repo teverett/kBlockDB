@@ -290,4 +290,51 @@ class KBlockDBClientIntegrationTest {
             }
         }
     }
+
+    @Test
+    void addListAndRemoveColumnsRoundTripThroughARealConnection() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            client.addColumn("java-client-column", ValueType.I64);
+            assertTrue(client.columns().contains(new Column("java-client-column", ValueType.I64)));
+
+            // Re-adding the same key conflicts rather than silently
+            // changing (or re-confirming) its type.
+            assertThrows(ConflictException.class,
+                    () -> client.addColumn("java-client-column", ValueType.STR));
+
+            assertTrue(client.removeColumn("java-client-column"));
+            assertFalse(client.columns().contains(new Column("java-client-column", ValueType.I64)));
+        }
+    }
+
+    @Test
+    void removingAColumnThatDoesntExistReturnsFalse() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            assertFalse(client.removeColumn("java-client-no-such-column"));
+        }
+    }
+
+    @Test
+    void writingACellCreatesItsColumnAndRemovingTheColumnDropsItsValues() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            int[] coord = {7, 7, 7};
+            client.set(coord, "java-client-implicit", new Value.Str("stone"));
+            assertTrue(client.columns().contains(new Column("java-client-implicit", ValueType.STR)));
+
+            assertTrue(client.removeColumn("java-client-implicit"));
+            assertEquals(Optional.empty(), client.get(coord, "java-client-implicit"));
+        }
+    }
+
+    @Test
+    void aRemovedColumnCanComeBackWithADifferentType() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            client.addColumn("java-client-retyped", ValueType.STR);
+            assertTrue(client.removeColumn("java-client-retyped"));
+
+            client.addColumn("java-client-retyped", ValueType.BOOL);
+            assertTrue(client.columns().contains(new Column("java-client-retyped", ValueType.BOOL)));
+            assertTrue(client.removeColumn("java-client-retyped"));
+        }
+    }
 }
