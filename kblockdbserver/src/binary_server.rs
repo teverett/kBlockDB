@@ -96,7 +96,10 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) {
                     .to_string(),
             ));
         }
-        if wire::write_frame(&mut stream, &response_payload).await.is_err() {
+        if wire::write_frame(&mut stream, &response_payload)
+            .await
+            .is_err()
+        {
             return; // peer gone -- nothing left to do
         }
     }
@@ -200,10 +203,7 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
                 return response;
             }
             let region = kblockdblib::Region::new(origin, extent);
-            match state
-                .with_world(move |w| w.get_region(&region, &key))
-                .await
-            {
+            match state.with_world(move |w| w.get_region(&region, &key)).await {
                 Ok(values) => Response::RegionValues(values),
                 Err(e) => response_from_error(e),
             }
