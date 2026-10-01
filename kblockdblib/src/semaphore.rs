@@ -34,6 +34,19 @@ impl Semaphore {
         self.capacity
     }
 
+    /// How many permits are free right now.
+    ///
+    /// Inherently a snapshot -- any other thread can acquire or release
+    /// between this returning and the caller looking at it -- so it's no
+    /// basis for deciding whether a subsequent `acquire` will block. It
+    /// exists for assertions made from *inside* a held permit, where the
+    /// caller knows what it is itself holding, which is why it's
+    /// test-only: `World`'s own code has no business branching on it.
+    #[cfg(test)]
+    pub fn available(&self) -> usize {
+        *self.permits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
     /// Blocks the calling thread until a permit is available, then holds
     /// it until the returned guard drops.
     pub fn acquire(&self) -> SemaphorePermit<'_> {
@@ -116,6 +129,20 @@ mod tests {
             let _permit = sem.acquire();
         } // dropped here
         let _permit = sem.acquire(); // would hang if the first didn't release
+    }
+
+    #[test]
+    fn available_tracks_permits_taken_and_returned() {
+        let sem = Semaphore::new(3);
+        assert_eq!(sem.available(), 3);
+        let a = sem.acquire();
+        assert_eq!(sem.available(), 2);
+        let b = sem.acquire();
+        assert_eq!(sem.available(), 1);
+        drop(b);
+        assert_eq!(sem.available(), 2);
+        drop(a);
+        assert_eq!(sem.available(), 3);
     }
 
     #[test]

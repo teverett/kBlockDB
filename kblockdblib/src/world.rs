@@ -1362,7 +1362,7 @@ fn disk_blocks(metadata: &std::fs::Metadata) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::thread;
 
     /// A scratch directory under the OS temp dir, unique per test, removed
@@ -2754,92 +2754,100 @@ mod tests {
     }
 
     #[test]
+    fn a_chunk_operation_holds_a_disk_io_permit_for_its_whole_duration() {
+        // The narrow wiring question -- does `with_chunk` actually go
+        // through `disk_io` at all? -- answered by looking from *inside*
+        // the operation, where this thread knows it holds exactly one
+        // permit itself. No threads and no clock involved, so this can't
+        // be flaky: if the permit were dropped early (or never taken),
+        // `available` would read back as the full capacity.
+        let dir = TempDir::new("cap-permit-held");
+        let w = World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
+            .unwrap()
+            .with_max_concurrent_disk_ops(4);
+        assert_eq!(w.disk_io.available(), 4, "a permit is held before the call");
+
+        let (ckey, _) = w.split(&coord3(1, 1, 1)).unwrap();
+        let seen = w
+            .with_chunk_maybe_write(&ckey, |_chunk| (w.disk_io.available(), false))
+            .unwrap();
+        assert_eq!(seen, 3, "the operation ran without holding a permit");
+        assert_eq!(w.disk_io.available(), 4, "the permit wasn't released");
+    }
+
+    #[test]
     fn max_concurrent_disk_ops_actually_limits_concurrency() {
-        // A tight cap forces what would otherwise be concurrent,
-        // disjoint-chunk writes to run effectively serially; a generous
-        // cap lets them overlap freely. If with_max_concurrent_disk_ops
-        // didn't actually gate with_chunk, these two would take about the
-        // same wall-clock time -- they shouldn't.
-        //
-        // Each of `workers` threads does `ops_per_worker` real,
-        // disjoint-chunk writes (not just `workers` total): a handful of
-        // threads doing one op each makes this a wall-clock comparison
-        // between real (small, sub-millisecond-scale) filesystem work and
-        // one-time OS-thread-spawn overhead, which is noisy enough to make
-        // the test flaky (confirmed while writing it). Enough aggregate
-        // work per worker makes the real per-op I/O time dominate that
-        // fixed overhead instead.
-        fn time_writes(
-            w: &std::sync::Arc<World>,
-            workers: u32,
-            ops_per_worker: u32,
-        ) -> std::time::Duration {
-            let t0 = std::time::Instant::now();
+        // Observes real occupancy -- how many threads are inside a chunk
+        // operation at the same moment -- rather than comparing wall-clock
+        // times between a tight and a generous cap. The timing version of
+        // this was genuinely flaky: on a fast filesystem the per-op work
+        // is small enough that scheduling noise swamps the difference, and
+        // it failed on FreeBSD with the two runs 2% apart. Occupancy is
+        // the property actually being claimed, and counting it is exact.
+        fn max_occupancy(cap: usize, workers: usize) -> usize {
+            let dir = TempDir::new(&format!("cap-occupancy-{cap}"));
+            let w = std::sync::Arc::new(
+                World::create(&dir, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
+                    .unwrap()
+                    .with_max_concurrent_disk_ops(cap),
+            );
+            let occupancy = std::sync::Arc::new(AtomicUsize::new(0));
+            let max_seen = std::sync::Arc::new(AtomicUsize::new(0));
+            // Released only once every worker has spawned, so they all
+            // contend at once. It has to be waited on *outside* the chunk
+            // operation: waiting inside would deadlock at `cap` < workers,
+            // where some threads can't get in until others leave.
+            let start = std::sync::Arc::new(std::sync::Barrier::new(workers));
+
             let handles: Vec<_> = (0..workers)
-                .map(|worker| {
-                    let w = std::sync::Arc::clone(w);
+                .map(|i| {
+                    let w = std::sync::Arc::clone(&w);
+                    let occupancy = std::sync::Arc::clone(&occupancy);
+                    let max_seen = std::sync::Arc::clone(&max_seen);
+                    let start = std::sync::Arc::clone(&start);
                     thread::spawn(move || {
-                        for op in 0..ops_per_worker {
-                            let seed = worker * ops_per_worker + op;
-                            w.set(
-                                &coord3(seed as i32, seed as i32, seed as i32),
-                                "bench",
-                                Value::I64(seed as i64),
-                            )
-                            .unwrap();
-                        }
+                        // Disjoint chunks, so nothing but `disk_io` can
+                        // serialize these -- a shared chunk's own lock
+                        // would otherwise be the thing under test.
+                        let far = (i as i32 + 1) * DEFAULT_CHUNK_DIM as i32;
+                        let (ckey, _) = w.split(&coord3(far, far, far)).unwrap();
+                        start.wait();
+                        w.with_chunk_maybe_write(&ckey, |_chunk| {
+                            let now = occupancy.fetch_add(1, Ordering::SeqCst) + 1;
+                            max_seen.fetch_max(now, Ordering::SeqCst);
+                            // Long enough that every thread the cap allows
+                            // in is still inside when the others arrive --
+                            // without this, threads could file through one
+                            // at a time and show an occupancy of 1 even
+                            // uncapped.
+                            thread::sleep(std::time::Duration::from_millis(20));
+                            occupancy.fetch_sub(1, Ordering::SeqCst);
+                            ((), false)
+                        })
+                        .unwrap();
                     })
                 })
                 .collect();
             for h in handles {
                 h.join().unwrap();
             }
-            t0.elapsed()
+            max_seen.load(Ordering::SeqCst)
         }
 
         let workers = 8;
-        let ops_per_worker = 30;
-        // Best-of-`RUNS`, not a single timing: one-off scheduler noise (a
-        // background process stealing CPU mid-run, ...) only ever makes a
-        // run *slower* than what the cap truly allows, never faster --
-        // taking the minimum across repeats cancels that out, since a
-        // transient spike would have to hit *every* repeat on one side to
-        // still flip the comparison. Confirmed flaky often enough at
-        // `RUNS = 1` (a single noisy run on a busy machine) to be worth
-        // this rather than just padding the work size further.
-        const RUNS: u32 = 5;
-        fn min_time_writes(
-            w: &std::sync::Arc<World>,
-            workers: u32,
-            ops_per_worker: u32,
-        ) -> std::time::Duration {
-            (0..RUNS)
-                .map(|_| time_writes(w, workers, ops_per_worker))
-                .min()
-                .unwrap()
-        }
-
-        let dir_serial = TempDir::new("cap-timing-serial");
-        let w_serial = std::sync::Arc::new(
-            World::create(&dir_serial, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
-                .unwrap()
-                .with_max_concurrent_disk_ops(1),
+        assert_eq!(
+            max_occupancy(1, workers),
+            1,
+            "cap=1 let more than one chunk operation run at once"
         );
-        let serial = min_time_writes(&w_serial, workers, ops_per_worker);
-
-        let dir_parallel = TempDir::new("cap-timing-parallel");
-        let w_parallel = std::sync::Arc::new(
-            World::create(&dir_parallel, AXES, WORLD_DIM, DEFAULT_CHUNK_DIM)
-                .unwrap()
-                .with_max_concurrent_disk_ops(workers as usize),
-        );
-        let parallel = min_time_writes(&w_parallel, workers, ops_per_worker);
-
+        // The other direction, so this can't pass by the cap simply
+        // blocking everything: a generous cap has to actually let work
+        // overlap. Asserts >1 rather than exactly `workers` -- the OS owes
+        // no guarantee that all 8 are scheduled simultaneously, but any
+        // overlap at all is impossible if the cap were stuck at 1.
         assert!(
-            serial > parallel,
-            "serial (cap=1, best of {RUNS}: {serial:?}) should be slower than parallel \
-             (cap={workers}, best of {RUNS}: {parallel:?}) -- the cap doesn't seem to be \
-             limiting anything"
+            max_occupancy(workers, workers) > 1,
+            "cap={workers} never ran two chunk operations at once"
         );
     }
 
