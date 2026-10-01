@@ -51,7 +51,7 @@ jobs:
         run: python -m unittest discover -s client/python/tests -v
 
       - name: Upload Python client wheel
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: python-client-${{ matrix.os }}-${{ matrix.python }}
           path: client/python/dist/*.whl
