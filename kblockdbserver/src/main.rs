@@ -14,7 +14,7 @@ mod value_json;
 
 use config::Config;
 use state::AppState;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 /// The REST API's port when neither `--http-port` nor the config file
@@ -366,27 +366,47 @@ async fn main() {
         });
 }
 
+/// This host's primary IP -- the source address the kernel would use to
+/// reach the wider network.
+///
+/// Found by asking the routing table, not by resolving the hostname:
+/// hostname lookups routinely answer `127.0.0.1` (that's what
+/// `/etc/hosts` usually says) which is exactly the useless answer this
+/// exists to avoid, and they can block on DNS. Connecting a UDP socket
+/// sends no packets at all -- it only makes the kernel pick a route and
+/// bind a local address, which is then read back. The destination is a
+/// well-known public address used purely as a routing hint; it is never
+/// contacted and need not be reachable.
+///
+/// Returns `None` when there's no route to the outside world at all (an
+/// isolated container, a laptop with every interface down), where there
+/// genuinely is no better answer than loopback.
+fn primary_local_ip() -> Option<IpAddr> {
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).ok()?;
+    socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
+    let ip = socket.local_addr().ok()?.ip();
+    (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
 /// An address a listener is bound to, rewritten into one a client can
 /// actually connect to.
 ///
 /// A wildcard bind (`0.0.0.0` / `[::]`) means "every interface on this
 /// host", which is not itself a connectable address -- pasting
-/// `http://0.0.0.0:8080` into a browser works on some platforms and not
-/// others. Report loopback instead, which is always one of the
-/// interfaces a wildcard bind just claimed, so what's printed is both
-/// accurate and directly usable. Concrete addresses pass through
-/// untouched.
+/// `http://0.0.0.0:8080` into a browser does nothing useful. Report this
+/// host's primary IP instead, so what's printed is an address other
+/// machines can actually reach, which is the point of binding every
+/// interface in the first place. Loopback only as a last resort, when
+/// the host has no route out. Concrete addresses pass through untouched.
 fn reachable_addr(addr: SocketAddr) -> SocketAddr {
-    use std::net::{IpAddr, Ipv6Addr};
-
     if !addr.ip().is_unspecified() {
         return addr;
     }
-    let loopback = match addr.ip() {
+    let ip = primary_local_ip().unwrap_or_else(|| match addr.ip() {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
-    };
-    SocketAddr::new(loopback, addr.port())
+    });
+    SocketAddr::new(ip, addr.port())
 }
 
 /// The browsable base URL for an address the server is listening on.

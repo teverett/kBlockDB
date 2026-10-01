@@ -1614,17 +1614,46 @@ fn base_url_keeps_a_concrete_bind_address_as_is() {
 }
 
 #[test]
-fn base_url_prints_loopback_for_a_wildcard_bind() {
-    // `http://0.0.0.0:8080` isn't reliably connectable; loopback is one
-    // of the interfaces the wildcard bind covers, so it always is.
-    assert_eq!(
-        crate::base_url("0.0.0.0:8080".parse().unwrap()),
-        "http://127.0.0.1:8080"
-    );
-    assert_eq!(
-        crate::base_url("[::]:8080".parse().unwrap()),
-        "http://[::1]:8080"
-    );
+fn base_url_resolves_a_wildcard_bind_to_a_connectable_address() {
+    // `http://0.0.0.0:8080` is not something a client can connect to,
+    // so the banner must never print the wildcard back. Which concrete
+    // address is right depends on the host's routing (this test machine
+    // may or may not have a route out), so assert the property that
+    // actually matters rather than a specific IP.
+    for bind in ["0.0.0.0:8080", "[::]:8080"] {
+        let url = crate::base_url(bind.parse().unwrap());
+        assert!(
+            !url.contains("0.0.0.0") && !url.contains("[::]"),
+            "{bind} printed back a wildcard: {url}"
+        );
+        assert!(url.ends_with(":8080"), "{bind} lost its port: {url}");
+    }
+}
+
+#[test]
+fn a_wildcard_bind_prefers_the_host_ip_over_loopback() {
+    // The whole point of binding every interface is being reachable from
+    // other machines, so the banner should name an address that gets
+    // someone there -- loopback only when the host has no route out.
+    let shown = crate::reachable_addr("0.0.0.0:8080".parse().unwrap()).ip();
+    match crate::primary_local_ip() {
+        Some(ip) => assert_eq!(shown, ip, "a routable host IP exists but wasn't used"),
+        None => assert!(
+            shown.is_loopback(),
+            "no route out, so loopback was expected"
+        ),
+    }
+}
+
+#[test]
+fn primary_local_ip_is_never_a_useless_answer() {
+    // Loopback or `0.0.0.0` would both defeat the purpose -- the caller
+    // treats `None` as "fall back", so those must not come back as
+    // `Some`.
+    if let Some(ip) = crate::primary_local_ip() {
+        assert!(!ip.is_loopback(), "{ip} is loopback");
+        assert!(!ip.is_unspecified(), "{ip} is unspecified");
+    }
 }
 
 #[test]

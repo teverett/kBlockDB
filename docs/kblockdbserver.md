@@ -15,10 +15,10 @@ On boot it prints where to find its three entry points, so you don't have
 to go looking up paths and port numbers:
 
 ```
-kblockdbserver listening on http://127.0.0.1:8080
-  data browser  http://127.0.0.1:8080/
-  health API    http://127.0.0.1:8080/rest/health
-  stats API     http://127.0.0.1:8080/rest/stats
+kblockdbserver listening on http://10.0.0.7:8080
+  data browser  http://10.0.0.7:8080/
+  health API    http://10.0.0.7:8080/rest/health
+  stats API     http://10.0.0.7:8080/rest/stats
 ```
 
 Only a **port** is configurable, never a bind host: the server always
@@ -34,11 +34,16 @@ dual-stack on Linux and macOS: FreeBSD defaults `net.inet6.ip6.v6only=1`,
 where an IPv6 wildcard listener accepts no IPv4 connections at all.
 Binding IPv4 behaves identically everywhere.
 
-The banner prints loopback rather than `0.0.0.0`, since the wildcard
-address isn't itself reliably connectable while loopback is always one
-of the interfaces it just claimed. It's built from the port the listener
-*actually* bound, so `--http-port 0` -- which asks the OS to pick a free
-one -- reports the real port rather than a useless `:0`.
+The banner prints this host's primary IP rather than `0.0.0.0`, which
+isn't itself a connectable address -- so the URLs are ones another
+machine can use, which is the point of binding every interface. That IP
+comes from the routing table (a connected UDP socket, which sends no
+packets, read back for its local address) rather than from resolving the
+hostname, since hostname lookups usually answer `127.0.0.1` and can
+block on DNS. On a host with no route out at all it falls back to
+loopback. The port comes from what the listener *actually* bound, so
+`--http-port 0` -- which asks the OS to pick a free one -- reports the
+real port rather than a useless `:0`.
 
 ```
 USAGE:
