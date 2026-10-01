@@ -646,8 +646,10 @@ curl -u admin:change-me -X POST localhost:8080/rest/query \
   -H 'content-type: application/json' \
   -d '{"query": "SELECT material, density WHERE x0 >= 10 AND x0 < 20 AND material = '"'"'stone'"'"'"}'
 # {"total_rows":1,"rows":[{"coord":[15,3,7],"values":[
-#   {"key":"density","value":{"type":"f64","value":2.6}},
-#   {"key":"material","value":{"type":"str","value":"stone"}}]}]}
+#   {"key":"density","value":{"type":"f64","value":2.6},
+#    "created_at_ms":1735689600000,"modified_at_ms":1735689600000,"version":0},
+#   {"key":"material","value":{"type":"str","value":"stone"},
+#    "created_at_ms":1735689600000,"modified_at_ms":1735689650000,"version":2}]}]}
 
 # upsert: fills every cell in the box with material='stone', creating any
 # that don't already exist.
@@ -671,8 +673,11 @@ curl -u admin:change-me -X POST localhost:8080/rest/query \
 
 `SELECT`'s response has `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE`'s has
 `affected_cells` instead (the fields the statement kind doesn't produce
-are omitted, not null). `DELETE` clears *every* key set at each matching
-cell -- there's no column list to delete only some of them.
+are omitted, not null). Each row's `values` entries carry the same
+`created_at_ms`/`modified_at_ms`/`version` metadata the single-cell `GET`
+reports (see "Cells and regions" above), not just the value. `DELETE`
+clears *every* key set at each matching cell -- there's no column list to
+delete only some of them.
 
 `SELECT`/`UPDATE`/`DELETE` run on `kblockdblib::World::list_cells` under
 the hood (the same full-chunk-decode walk the `/` data browser below uses)
@@ -928,7 +933,7 @@ cargo build --release
 ./target/release/kblockdbcli --password change-me remove 1,2,3 material
 ./target/release/kblockdbcli --password change-me query \
     "SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'"
-# (1,2,3) material=stone (str)
+# (1,2,3) material=stone (str) (created=1735689600000 modified=1735689600000 version=0)
 # 1 row(s)
 ```
 
@@ -967,7 +972,8 @@ retried silently.
 `query` takes the entire query text as one shell-quoted argument (see the
 "Query language" section above for the grammar) and posts it to
 `/rest/query`. A `SELECT` prints one line per matching cell, as `(coords)
-key=value (type), ...`, followed by a `<n> row(s)` summary; `SET`, `UPDATE`,
+key=value (type) (created=<ms> modified=<ms> version=<n>), ...` -- the same
+per-key metadata `get` reports -- followed by a `<n> row(s)` summary; `SET`, `UPDATE`,
 and `DELETE` print `<n> cell(s) affected`. `SET` is an upsert and requires
 `IN <range>` (it can create cells; `UPDATE` only ever changes cells that
 already exist). All three writes need a non-read-only account, same as

@@ -915,6 +915,38 @@ async fn select_star_returns_every_cell_with_every_key() {
 }
 
 #[tokio::test]
+async fn select_rows_report_each_keys_metadata() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    // Overwritten once, so version=1 and modified_at_ms should have moved
+    // past created_at_ms -- distinct from a fresh set's version=0 (already
+    // covered elsewhere), so this specifically exercises a non-zero value.
+    send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/material",
+            json!({"type": "str", "value": "granite"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(app, post("/rest/query", query("SELECT *"))).await;
+    assert_eq!(status, StatusCode::OK);
+    let value = &body["rows"][0]["values"][0];
+    assert_eq!(value["key"], "material");
+    assert_eq!(value["version"], 1);
+    assert!(value["created_at_ms"].as_u64().unwrap() > 0);
+    assert!(value["modified_at_ms"].as_u64().unwrap() >= value["created_at_ms"].as_u64().unwrap());
+}
+
+#[tokio::test]
 async fn select_named_columns_omits_the_rest() {
     let (app, _dir) = test_app();
     send(

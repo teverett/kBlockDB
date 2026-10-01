@@ -313,7 +313,12 @@ fn describe_query_row(row: &Json) -> Result<String, String> {
             .as_str()
             .ok_or("query row entry is missing 'key'")?;
         let (value_type, rendered) = describe_value(&kv["value"])?;
-        parts.push(format!("{key}={rendered} ({value_type})"));
+        // Each `values` entry carries the same created_at_ms/modified_at_ms/
+        // version fields as a `get` response, as siblings of "key"/"value"
+        // rather than nested under it -- describe_meta reads them straight
+        // off `kv` the same way it reads them off a `get` response body.
+        let meta = describe_meta(kv)?;
+        parts.push(format!("{key}={rendered} ({value_type}) {meta}"));
     }
     Ok(format!("({coord}) {}", parts.join(", ")))
 }
@@ -476,17 +481,24 @@ mod unit_tests {
     }
 
     #[test]
-    fn describe_query_row_renders_coord_and_values() {
+    fn describe_query_row_renders_coord_values_and_metadata() {
         let row = json!({
             "coord": [1, 2, 3],
             "values": [
-                {"key": "material", "value": {"type": "str", "value": "stone"}},
-                {"key": "hardness", "value": {"type": "f64", "value": 2.6}},
+                {
+                    "key": "material", "value": {"type": "str", "value": "stone"},
+                    "created_at_ms": 1000, "modified_at_ms": 2000, "version": 1,
+                },
+                {
+                    "key": "hardness", "value": {"type": "f64", "value": 2.6},
+                    "created_at_ms": 1000, "modified_at_ms": 1000, "version": 0,
+                },
             ],
         });
         assert_eq!(
             describe_query_row(&row).unwrap(),
-            "(1,2,3) material=stone (str), hardness=2.6 (f64)"
+            "(1,2,3) material=stone (str) (created=1000 modified=2000 version=1), \
+             hardness=2.6 (f64) (created=1000 modified=1000 version=0)"
         );
     }
 
@@ -494,6 +506,15 @@ mod unit_tests {
     fn describe_query_row_rejects_a_row_missing_coord_or_values() {
         assert!(describe_query_row(&json!({"values": []})).is_err());
         assert!(describe_query_row(&json!({"coord": [0]})).is_err());
+    }
+
+    #[test]
+    fn describe_query_row_rejects_a_value_entry_missing_metadata() {
+        let row = json!({
+            "coord": [0, 0, 0],
+            "values": [{"key": "material", "value": {"type": "str", "value": "stone"}}],
+        });
+        assert!(describe_query_row(&row).is_err());
     }
 
     #[test]
