@@ -1583,3 +1583,37 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
     let (status, _) = send(app, remove).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
+
+#[test]
+fn base_url_keeps_a_concrete_bind_address_as_is() {
+    assert_eq!(
+        crate::base_url("127.0.0.1:8080".parse().unwrap()),
+        "http://127.0.0.1:8080"
+    );
+    assert_eq!(
+        crate::base_url("192.168.1.5:9000".parse().unwrap()),
+        "http://192.168.1.5:9000"
+    );
+}
+
+#[test]
+fn base_url_prints_loopback_for_a_wildcard_bind() {
+    // `http://0.0.0.0:8080` isn't reliably connectable; loopback is one
+    // of the interfaces the wildcard bind covers, so it always is.
+    assert_eq!(
+        crate::base_url("0.0.0.0:8080".parse().unwrap()),
+        "http://127.0.0.1:8080"
+    );
+    assert_eq!(
+        crate::base_url("[::]:8080".parse().unwrap()),
+        "http://[::1]:8080"
+    );
+}
+
+#[test]
+fn base_url_brackets_ipv6_so_the_port_is_unambiguous() {
+    assert_eq!(
+        crate::base_url("[::1]:8080".parse().unwrap()),
+        "http://[::1]:8080"
+    );
+}

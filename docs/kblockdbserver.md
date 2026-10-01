@@ -11,6 +11,23 @@ A default `kblockdbserver.toml` (admin/`changeme`, see below) is checked in at
 the repo root so this works out of the box -- **change `admin_password`
 before running this anywhere reachable by anyone you don't trust.**
 
+On boot it prints where to find its three entry points, so you don't have
+to go looking up paths and port numbers:
+
+```
+kblockdbserver listening on http://127.0.0.1:8080
+  data browser  http://127.0.0.1:8080/
+  health API    http://127.0.0.1:8080/rest/health
+  stats API     http://127.0.0.1:8080/rest/stats
+```
+
+These are built from the address the listener *actually* bound, not the
+one requested, so `--http-addr 127.0.0.1:0` prints the real port the OS
+picked rather than a useless `:0`. A wildcard bind (`0.0.0.0` or `[::]`)
+prints loopback instead, since the wildcard address isn't itself
+reliably connectable while loopback is always one of the interfaces it
+just claimed.
+
 ```
 USAGE:
     kblockdbserver [OPTIONS]

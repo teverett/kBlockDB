@@ -299,7 +299,17 @@ async fn main() {
             eprintln!("failed to bind {http_addr}: {e}");
             std::process::exit(1);
         });
-    println!("kblockdbserver listening on http://{http_addr}");
+    // Prefer the address the listener actually bound over the one asked
+    // for: `--http-addr host:0` picks a real port only at bind time, so
+    // the requested string would print a useless `:0`.
+    let base = listener
+        .local_addr()
+        .map(base_url)
+        .unwrap_or_else(|_| format!("http://{http_addr}"));
+    println!("kblockdbserver listening on {base}");
+    println!("  data browser  {base}/");
+    println!("  health API    {base}/rest/health");
+    println!("  stats API     {base}/rest/stats");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
@@ -308,6 +318,29 @@ async fn main() {
             eprintln!("server error: {e}");
             std::process::exit(1);
         });
+}
+
+/// The browsable base URL for an address the server is listening on.
+///
+/// A wildcard bind (`0.0.0.0` / `[::]`) means "every interface on this
+/// host", which is not itself an address anything can connect to --
+/// pasting `http://0.0.0.0:8080` into a browser works on some platforms
+/// and not others. Print loopback instead, which is always one of the
+/// interfaces a wildcard bind just claimed, so the URL is accurate and
+/// actually clickable.
+fn base_url(addr: std::net::SocketAddr) -> String {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let ip = addr.ip();
+    if !ip.is_unspecified() {
+        // `SocketAddr`'s Display already brackets IPv6 for URLs.
+        return format!("http://{addr}");
+    }
+    let loopback = match ip {
+        IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
+    };
+    format!("http://{}", SocketAddr::new(loopback, addr.port()))
 }
 
 async fn shutdown_signal() {
