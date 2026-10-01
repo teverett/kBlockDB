@@ -1,3 +1,8 @@
+
+[![CI](https://github.com/teverett/kBlockDB/actions/workflows/ci.yml/badge.svg)](https://github.com/teverett/kBlockDB/actions/workflows/ci.yml)
+[![Java client](https://github.com/teverett/kBlockDB/actions/workflows/java-client.yml/badge.svg)](https://github.com/teverett/kBlockDB/actions/workflows/java-client.yml)
+[![Python client](https://github.com/teverett/kBlockDB/actions/workflows/python-client.yml/badge.svg)](https://github.com/teverett/kBlockDB/actions/workflows/python-client.yml)
+
 # kBlockDB
 
 A Cargo workspace with four crates:
