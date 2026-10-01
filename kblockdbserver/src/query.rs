@@ -89,6 +89,7 @@ pub enum Literal {
     Str(String),
     Int(i64),
     Float(f64),
+    Bool(bool),
 }
 
 impl Literal {
@@ -99,6 +100,7 @@ impl Literal {
             Literal::Str(s) => Value::Str(s.clone()),
             Literal::Int(n) => Value::I64(*n),
             Literal::Float(f) => Value::F64(*f),
+            Literal::Bool(b) => Value::Bool(*b),
         }
     }
 }
@@ -459,7 +461,8 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal, ParseError> {
             .parse()
             .map(Literal::Int)
             .map_err(|_| ParseError(format!("'{}' is not a valid integer", inner.as_str()))),
-        other => unreachable!("literal can only contain string/float/int, got {other:?}"),
+        Rule::bool_lit => Ok(Literal::Bool(inner.as_str().eq_ignore_ascii_case("true"))),
+        other => unreachable!("literal can only contain string/float/int/bool_lit, got {other:?}"),
     }
 }
 
@@ -521,6 +524,7 @@ fn eval_compare(operand: &Operand, op: CompareOp, literal: &Literal, cell: &Cell
                 (Value::I64(n), Literal::Float(lit)) => compare_f64(*n as f64, op, *lit),
                 (Value::F64(n), Literal::Float(lit)) => compare_f64(*n, op, *lit),
                 (Value::F64(n), Literal::Int(lit)) => compare_f64(*n, op, *lit as f64),
+                (Value::Bool(b), Literal::Bool(lit)) => compare_bool(*b, op, *lit),
                 // A string compared against a number, or vice versa: not
                 // an error, just never matches -- same "total, never
                 // panics" philosophy as a missing key above.
@@ -542,6 +546,23 @@ fn compare_f64(a: f64, op: CompareOp, b: f64) -> bool {
 }
 
 fn compare_str(a: &str, op: CompareOp, b: &str) -> bool {
+    match op {
+        CompareOp::Eq => a == b,
+        CompareOp::Ne => a != b,
+        CompareOp::Lt => a < b,
+        CompareOp::Le => a <= b,
+        CompareOp::Gt => a > b,
+        CompareOp::Ge => a >= b,
+    }
+}
+
+/// `bool` is `Ord` in Rust (`false < true`), so `<`/`<=`/`>`/`>=` are
+/// well-defined here too, same as `compare_str`/`compare_f64` -- not just
+/// `=`/`!=`. Kept as plain `<`/`>` (clippy's suggested `!a & b`/`a & !b`
+/// rewrite is less readable than what it's "simplifying") for symmetry with
+/// every other `compare_*` function's identical match arms.
+#[allow(clippy::bool_comparison)]
+fn compare_bool(a: bool, op: CompareOp, b: bool) -> bool {
     match op {
         CompareOp::Eq => a == b,
         CompareOp::Ne => a != b,
@@ -687,6 +708,27 @@ mod tests {
                     to: vec![10, 10, 10],
                 },
             }
+        );
+    }
+
+    #[test]
+    fn parses_a_bool_literal_assignment_and_is_case_insensitive() {
+        let stmt = parse("SET (flammable = TRUE) IN (0,0,0) TO (1,1,1)").unwrap();
+        let Statement::Set { assignments, .. } = stmt else {
+            panic!("expected Set");
+        };
+        assert_eq!(
+            assignments,
+            vec![("flammable".to_string(), Literal::Bool(true))]
+        );
+
+        let stmt = parse("SET (flammable = false) IN (0,0,0) TO (1,1,1)").unwrap();
+        let Statement::Set { assignments, .. } = stmt else {
+            panic!("expected Set");
+        };
+        assert_eq!(
+            assignments,
+            vec![("flammable".to_string(), Literal::Bool(false))]
         );
     }
 
@@ -937,6 +979,15 @@ mod tests {
     }
 
     #[test]
+    fn eval_compares_bool_values() {
+        let c = cell(&[0, 0, 0], vec![("flammable", Value::Bool(true))]);
+        assert!(eval(&parse_expr("flammable = true"), &c));
+        assert!(!eval(&parse_expr("flammable = false"), &c));
+        assert!(eval(&parse_expr("flammable != FALSE"), &c)); // case-insensitive
+        assert!(eval(&parse_expr("flammable = True"), &c));
+    }
+
+    #[test]
     fn eval_compares_numeric_values_across_int_and_float_literals() {
         let c = cell(&[0, 0, 0], vec![("hardness", Value::I64(7))]);
         assert!(eval(&parse_expr("hardness > 5"), &c));
@@ -957,6 +1008,9 @@ mod tests {
         assert!(!eval(&parse_expr("material = 7"), &c));
         let n = cell(&[0, 0, 0], vec![("hardness", Value::I64(7))]);
         assert!(!eval(&parse_expr("hardness = 'seven'"), &n));
+        let b = cell(&[0, 0, 0], vec![("flammable", Value::Bool(true))]);
+        assert!(!eval(&parse_expr("flammable = 1"), &b));
+        assert!(!eval(&parse_expr("flammable = 'true'"), &b));
     }
 
     #[test]

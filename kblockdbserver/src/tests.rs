@@ -271,6 +271,37 @@ async fn set_then_get_a_cell_roundtrips() {
 }
 
 #[tokio::test]
+async fn a_bool_cell_roundtrips_through_set_get_and_select() {
+    let (app, _dir) = test_app();
+
+    let (status, _) = send(
+        app.clone(),
+        put(
+            "/rest/cells/1,2,3/flammable",
+            json!({"type": "bool", "value": true}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (status, body) = send(app.clone(), get("/rest/cells/1,2,3/flammable")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["value"], json!({"type": "bool", "value": true}));
+
+    let (status, body) = send(
+        app,
+        post("/rest/query", query("SELECT * WHERE flammable = true")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(
+        body["rows"][0]["values"][0]["value"],
+        json!({"type": "bool", "value": true})
+    );
+}
+
+#[tokio::test]
 async fn get_cell_reports_incrementing_version_and_stable_created_at() {
     let (app, _dir) = test_app();
 

@@ -131,10 +131,12 @@ class KBlockDBClientIntegrationTest {
             client.set(new int[] {5, 5, 5}, "str-key", new Value.Str("air"));
             client.set(new int[] {5, 5, 6}, "i64-key", new Value.I64(-42));
             client.set(new int[] {5, 5, 7}, "f64-key", new Value.F64(2.5));
+            client.set(new int[] {5, 5, 8}, "bool-key", new Value.Bool(true));
 
             assertEquals(Optional.of(new Value.Str("air")), client.get(new int[] {5, 5, 5}, "str-key"));
             assertEquals(Optional.of(new Value.I64(-42)), client.get(new int[] {5, 5, 6}, "i64-key"));
             assertEquals(Optional.of(new Value.F64(2.5)), client.get(new int[] {5, 5, 7}, "f64-key"));
+            assertEquals(Optional.of(new Value.Bool(true)), client.get(new int[] {5, 5, 8}, "bool-key"));
         }
     }
 

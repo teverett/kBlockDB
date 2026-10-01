@@ -167,6 +167,7 @@ fn value_text(value: &Value) -> String {
         Value::Str(s) => s.clone(),
         Value::F64(x) => x.to_string(),
         Value::I64(x) => x.to_string(),
+        Value::Bool(b) => b.to_string(),
     }
 }
 
@@ -249,6 +250,10 @@ mod tests {
 
         let n = cell(&[0, 0, 0], vec![("hardness", Value::I64(42))]);
         assert!(cell_matches(&n, "42"));
+
+        let b = cell(&[0, 0, 0], vec![("flammable", Value::Bool(true))]);
+        assert!(cell_matches(&b, "true"));
+        assert!(!cell_matches(&b, "false"));
     }
 
     #[test]

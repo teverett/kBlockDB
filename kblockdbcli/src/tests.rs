@@ -297,7 +297,7 @@ fn set_then_get_round_trip_numeric_types() {
     // type the first time it's set (see kblockdblib/src/chunk.rs), so reusing one
     // key across incompatible types isn't a case these commands can
     // legitimately round-trip.
-    for (value_type, value) in [("i64", "42"), ("f64", "2.6")] {
+    for (value_type, value) in [("i64", "42"), ("f64", "2.6"), ("bool", "true")] {
         let key = format!("n_{value_type}");
         let set = run_kblockdbcli(
             &kblockdbcli_bin,
@@ -504,10 +504,10 @@ fn an_invalid_value_type_is_rejected_before_any_request_is_sent() {
     let output = run_kblockdbcli(
         &kblockdbcli_bin,
         &server,
-        &["set", "1,2,3", "material", "bool", "true"],
+        &["set", "1,2,3", "material", "complex", "true"],
     );
     assert!(!output.status.success());
-    assert!(stderr(&output).contains("bool"));
+    assert!(stderr(&output).contains("complex"));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

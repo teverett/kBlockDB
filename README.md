@@ -3,8 +3,8 @@
 A Cargo workspace with four crates:
 
 - **`kblockdblib`** -- a prototype storage engine for a huge simulation grid where
-  every cell is its own key/value store (string keys; string, f64, or i64
-  values), sized for something like 10,000 x 10,000 x 10,000 cells (1
+  every cell is its own key/value store (string keys; string, f64, i64, or
+  bool values), sized for something like 10,000 x 10,000 x 10,000 cells (1
   trillion cells) -- too big for one-file-per-cell or an RDBMS row-per-cell.
   Zero external dependencies -- pure `std`. A library first, with a small
   demo/benchmark binary (`kblockdblib`) built on top of it.
@@ -74,7 +74,7 @@ client/java/      the Java client (KBlockDBClient, speaks the binary protocol; M
 - **Global key interning, type fixed on first use.** Key strings
   ("temperature", "material", ...) are interned once into small integer ids
   in `schema.txt` at the world root (append-only, so ids never change), and
-  the value type (`str`/`f64`/`i64`) `set` first used for that key is
+  the value type (`str`/`f64`/`i64`/`bool`) `set` first used for that key is
   recorded alongside the id and permanently fixed from then on, world-wide
   -- a later `set` for the same key with a different type fails with a
   normal `InvalidInput` error rather than writing anything. Chunks store
@@ -318,7 +318,7 @@ packed value array. That costs two different things:
 
 - `kblockdblib/src/lib.rs`    -- the library crate root; re-exports `World`,
   `Value`, `Region`, `Coord`, `WorldParams`, `AXES`, `WORLD_DIM`.
-- `kblockdblib/src/value.rs`  -- the `Value` enum (Str/F64/I64), its on-disk type
+- `kblockdblib/src/value.rs`  -- the `Value` enum (Str/F64/I64/Bool), its on-disk type
   tags, and `ValueType` (a `Value` without the value itself -- what
   `Schema` records per key).
 - `kblockdblib/src/coord.rs`  -- `Coord`, a small-vec-style `i32` sequence (inline
@@ -508,6 +508,7 @@ A cell value on the wire is a small tagged JSON object:
 {"type": "str", "value": "stone"}
 {"type": "f64", "value": 2.6}
 {"type": "i64", "value": 7}
+{"type": "bool", "value": true}
 ```
 
 | Method | Path | Body | Response |
@@ -609,11 +610,11 @@ DELETE [WHERE <criteria>] [IN <range>]
   `>`, `>=`) combined with `AND`/`OR`/`NOT` and parentheses, standard
   precedence (`NOT` binds tightest, then `AND`, then `OR`). A comparison's
   left side is either `x<N>` (coordinate axis `N`, zero-indexed) or a key
-  name; its right side is a string (`'stone'`), integer, or float literal
-  (`x0 >= -10` works the same as any other comparison). Keywords are
-  case-insensitive; key/axis names are not. A key literally named e.g.
-  `x0` can't be addressed this way -- a known limitation of a generic
-  axis-count grammar.
+  name; its right side is a string (`'stone'`), integer, float, or boolean
+  (`true`/`false`, case-insensitive) literal (`x0 >= -10` works the same as
+  any other comparison). Keywords are case-insensitive; key/axis names are
+  not. A key literally named e.g. `x0` can't be addressed this way -- a
+  known limitation of a generic axis-count grammar.
 - A comparison against a key that isn't set at a given cell, or whose
   value's type doesn't match the literal's (a string literal against a
   numeric key, say), simply doesn't match that cell -- never an error, the
@@ -944,7 +945,7 @@ USAGE:
 COMMANDS:
     get <coords> <key>                  Print a cell's value and metadata, as
                                          `<type> <value> (created=<ms> modified=<ms> version=<n>)`
-    set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)
+    set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, i64, or bool)
     remove <coords> <key>               Clear a cell's value
     query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)
 

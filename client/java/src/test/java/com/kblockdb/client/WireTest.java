@@ -138,6 +138,29 @@ class WireTest {
     }
 
     @Test
+    void encodeSetProducesTheDocumentedByteLayoutForABoolValue() throws IOException {
+        byte[] payload = Wire.encodeSet(new int[] {1}, "k", new Value.Bool(true));
+        byte[] expected = {
+                0x02,
+                0x01, 1, 0, 0, 0,
+                1, 0, 'k',
+                3, // TAG_BOOL
+                1,
+        };
+        assertArrayEquals(expected, payload);
+
+        byte[] falsePayload = Wire.encodeSet(new int[] {1}, "k", new Value.Bool(false));
+        byte[] falseExpected = {
+                0x02,
+                0x01, 1, 0, 0, 0,
+                1, 0, 'k',
+                3,
+                0,
+        };
+        assertArrayEquals(falseExpected, falsePayload);
+    }
+
+    @Test
     void encodeRejectsAKeyOverTheLengthLimit() {
         String tooLong = "k".repeat(0x10000);
         assertThrows(IllegalArgumentException.class, () -> Wire.encodeGet(new int[] {1}, tooLong));
@@ -210,6 +233,8 @@ class WireTest {
         assertEquals(new Wire.ValueResp(new Value.Str("air"), meta), decodeValueResponse(new Value.Str("air"), meta));
         assertEquals(new Wire.ValueResp(new Value.F64(1.5), meta), decodeValueResponse(new Value.F64(1.5), meta));
         assertEquals(new Wire.ValueResp(new Value.I64(0), meta), decodeValueResponse(new Value.I64(0), meta));
+        assertEquals(
+                new Wire.ValueResp(new Value.Bool(true), meta), decodeValueResponse(new Value.Bool(true), meta));
     }
 
     private static Wire.Response decodeValueResponse(Value value, CellMeta meta) throws IOException {

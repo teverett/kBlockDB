@@ -69,9 +69,13 @@ operand    = { axis | ident }
 axis       = @{ "x" ~ ASCII_DIGIT+ }
 compare_op = { "!=" | "<=" | ">=" | "=" | "<" | ">" }
 
-literal = { string | float | int }
-string  = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
-float   = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
-int     = @{ "-"? ~ ASCII_DIGIT+ }
+literal  = { string | float | int | bool_lit }
+string   = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
+float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
+int      = @{ "-"? ~ ASCII_DIGIT+ }
+// Case-insensitive and word-bounded, same as the statement keywords above
+// (`^"TRUE"` alone would also match the first four letters of a key named
+// "truex").
+bool_lit = @{ (^"true" | ^"false") ~ !(ASCII_ALPHANUMERIC | "_") }
 
 ident = @{ (ASCII_ALPHA | "_") ~ (ASCII_ALPHANUMERIC | "_")* }

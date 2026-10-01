@@ -44,7 +44,8 @@
 //! space is zero-centered, see `kblockdblib::World`'s doc comment on its
 //! axis bounds); `<key>` is `[u16 LE key_len][key bytes]`; `<value>` is
 //! `[u8 type_tag]` (see [`kblockdblib::Value`]'s `TAG_*` constants) followed
-//! by `[8 bytes LE]` for F64/I64 or `[u32 LE len][len bytes]` for Str.
+//! by `[8 bytes LE]` for F64/I64, `[u32 LE len][len bytes]` for Str, or
+//! `[1 byte]` (0 or 1) for Bool.
 //!
 //! **Responses** (server -> client), as `payload`. Every status has one
 //! fixed shape regardless of which request it's answering -- the client
@@ -296,6 +297,10 @@ fn put_value(buf: &mut Vec<u8>, value: &Value) {
             buf.push(Value::TAG_I64);
             buf.extend_from_slice(&x.to_le_bytes());
         }
+        Value::Bool(b) => {
+            buf.push(Value::TAG_BOOL);
+            buf.push(u8::from(*b));
+        }
     }
 }
 
@@ -385,6 +390,7 @@ impl<'a> Reader<'a> {
             }
             t if t == Value::TAG_F64 => Ok(Value::F64(self.f64()?)),
             t if t == Value::TAG_I64 => Ok(Value::I64(self.i64()?)),
+            t if t == Value::TAG_BOOL => Ok(Value::Bool(self.u8()? != 0)),
             other => Err(DecodeError::UnknownValueTag(other)),
         }
     }
@@ -547,6 +553,8 @@ mod tests {
             Value::F64(2.5),
             Value::I64(-7),
             Value::Str(String::new()),
+            Value::Bool(true),
+            Value::Bool(false),
         ] {
             roundtrip_request(Request::Set {
                 coord: vec![9_999, 0, 42],
@@ -599,7 +607,12 @@ mod tests {
 
     #[test]
     fn value_response_round_trips_every_type() {
-        for value in [Value::Str("air".into()), Value::F64(1.5), Value::I64(0)] {
+        for value in [
+            Value::Str("air".into()),
+            Value::F64(1.5),
+            Value::I64(0),
+            Value::Bool(true),
+        ] {
             roundtrip_response(Response::Value {
                 value,
                 created_at_ms: 1000,

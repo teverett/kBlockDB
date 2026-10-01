@@ -168,7 +168,7 @@ fn print_help() {
          COMMANDS:\n    \
          get <coords> <key>                  Print a cell's value and metadata, as\n                                              \
          `<type> <value> (created=<ms> modified=<ms> version=<n>)`\n    \
-         set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, or i64)\n    \
+         set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, i64, or bool)\n    \
          remove <coords> <key>               Clear a cell's value\n    \
          query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)\n\n\
          OPTIONS:\n    \
@@ -346,8 +346,12 @@ fn build_value_json(value_type: &str, value: &str) -> Result<Json, String> {
             .parse::<i64>()
             .map(|v| json!({"type": "i64", "value": v}))
             .map_err(|_| format!("'{value}' is not a valid i64")),
+        "bool" => value
+            .parse::<bool>()
+            .map(|v| json!({"type": "bool", "value": v}))
+            .map_err(|_| format!("'{value}' is not a valid bool (expected 'true' or 'false')")),
         other => Err(format!(
-            "unknown type '{other}' -- expected one of: str, f64, i64"
+            "unknown type '{other}' -- expected one of: str, f64, i64, bool"
         )),
     }
 }
@@ -414,6 +418,14 @@ mod unit_tests {
             build_value_json("i64", "7").unwrap(),
             json!({"type": "i64", "value": 7})
         );
+        assert_eq!(
+            build_value_json("bool", "true").unwrap(),
+            json!({"type": "bool", "value": true})
+        );
+        assert_eq!(
+            build_value_json("bool", "false").unwrap(),
+            json!({"type": "bool", "value": false})
+        );
     }
 
     #[test]
@@ -423,14 +435,26 @@ mod unit_tests {
     }
 
     #[test]
+    fn build_value_json_rejects_an_unparseable_bool() {
+        let err = build_value_json("bool", "yes").unwrap_err();
+        assert!(err.contains("yes"));
+    }
+
+    #[test]
     fn build_value_json_rejects_an_unknown_type() {
-        let err = build_value_json("bool", "true").unwrap_err();
-        assert!(err.contains("bool"));
+        let err = build_value_json("complex", "true").unwrap_err();
+        assert!(err.contains("complex"));
     }
 
     #[test]
     fn describe_value_round_trips_build_value_json() {
-        for (value_type, value) in [("str", "stone"), ("f64", "2.6"), ("i64", "7")] {
+        for (value_type, value) in [
+            ("str", "stone"),
+            ("f64", "2.6"),
+            ("i64", "7"),
+            ("bool", "true"),
+            ("bool", "false"),
+        ] {
             let built = build_value_json(value_type, value).unwrap();
             let (described_type, rendered) = describe_value(&built).unwrap();
             assert_eq!(described_type, value_type);

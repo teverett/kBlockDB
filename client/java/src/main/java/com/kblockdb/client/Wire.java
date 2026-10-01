@@ -161,8 +161,9 @@ final class Wire {
 
     /**
      * {@code <value>}: {@code [u8 type_tag]} then {@code [8 bytes LE]}
-     * for F64/I64, or {@code [u32 LE len][len bytes]} for Str. Tags match
-     * {@code kblockdblib::Value::TAG_*} (0=Str, 1=F64, 2=I64).
+     * for F64/I64, {@code [u32 LE len][len bytes]} for Str, or
+     * {@code [1 byte]} (0 or 1) for Bool. Tags match
+     * {@code kblockdblib::Value::TAG_*} (0=Str, 1=F64, 2=I64, 3=Bool).
      */
     static void writeValue(OutputStream out, Value value) throws IOException {
         if (value instanceof Value.Str s) {
@@ -176,6 +177,9 @@ final class Wire {
         } else if (value instanceof Value.I64 i) {
             out.write(2);
             writeI64(out, i.value());
+        } else if (value instanceof Value.Bool b) {
+            out.write(3);
+            out.write(b.value() ? 1 : 0);
         } else {
             throw new IllegalArgumentException("unknown Value subtype: " + value.getClass());
         }
@@ -354,6 +358,8 @@ final class Wire {
                     return new Value.F64(f64());
                 case 2:
                     return new Value.I64(i64());
+                case 3:
+                    return new Value.Bool(u8() != 0);
                 default:
                     throw new ProtocolException("unknown value type tag 0x" + Integer.toHexString(tag));
             }

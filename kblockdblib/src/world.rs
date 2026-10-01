@@ -1479,6 +1479,7 @@ mod tests {
         w.set(&c, "material", Value::Str("stone".into())).unwrap();
         w.set(&c, "density", Value::F64(2.5)).unwrap();
         w.set(&c, "hardness", Value::I64(7)).unwrap();
+        w.set(&c, "flammable", Value::Bool(false)).unwrap();
 
         assert_eq!(
             w.get(&c, "material").unwrap(),
@@ -1486,6 +1487,7 @@ mod tests {
         );
         assert_eq!(w.get(&c, "density").unwrap(), Some(Value::F64(2.5)));
         assert_eq!(w.get(&c, "hardness").unwrap(), Some(Value::I64(7)));
+        assert_eq!(w.get(&c, "flammable").unwrap(), Some(Value::Bool(false)));
     }
 
     #[test]

@@ -134,6 +134,7 @@ enum ColumnData {
     F64(Vec<f64>),
     I64(Vec<i64>),
     Str(Vec<String>),
+    Bool(Vec<bool>),
 }
 
 /// Every set cell/key pair's bookkeeping, alongside its value: when it was
@@ -194,6 +195,7 @@ impl Chunk {
             ColumnData::F64(v) => Value::F64(v[rank]),
             ColumnData::I64(v) => Value::I64(v[rank]),
             ColumnData::Str(v) => Value::Str(v[rank].clone()),
+            ColumnData::Bool(v) => Value::Bool(v[rank]),
         })
     }
 
@@ -227,6 +229,7 @@ impl Chunk {
                 Value::F64(_) => ColumnData::F64(Vec::new()),
                 Value::I64(_) => ColumnData::I64(Vec::new()),
                 Value::Str(_) => ColumnData::Str(Vec::new()),
+                Value::Bool(_) => ColumnData::Bool(Vec::new()),
             },
             meta: Vec::new(),
         });
@@ -239,6 +242,7 @@ impl Chunk {
                 (ColumnData::F64(v), Value::F64(x)) => v[rank] = x,
                 (ColumnData::I64(v), Value::I64(x)) => v[rank] = x,
                 (ColumnData::Str(v), Value::Str(x)) => v[rank] = x,
+                (ColumnData::Bool(v), Value::Bool(x)) => v[rank] = x,
                 _ => panic!(
                     "key {key_id} already holds a different value type in this chunk -- \
                      caller should have checked this against Schema first"
@@ -253,6 +257,7 @@ impl Chunk {
                 (ColumnData::F64(v), Value::F64(x)) => v.insert(rank, x),
                 (ColumnData::I64(v), Value::I64(x)) => v.insert(rank, x),
                 (ColumnData::Str(v), Value::Str(x)) => v.insert(rank, x),
+                (ColumnData::Bool(v), Value::Bool(x)) => v.insert(rank, x),
                 _ => panic!(
                     "key {key_id} already holds a different value type in this chunk -- \
                      caller should have checked this against Schema first"
@@ -284,6 +289,9 @@ impl Chunk {
                     ColumnData::Str(v) => {
                         v.remove(rank);
                     }
+                    ColumnData::Bool(v) => {
+                        v.remove(rank);
+                    }
                 }
                 col.meta.remove(rank);
             }
@@ -312,6 +320,7 @@ impl Chunk {
                     ColumnData::F64(v) => Value::F64(v[rank]),
                     ColumnData::I64(v) => Value::I64(v[rank]),
                     ColumnData::Str(v) => Value::Str(v[rank].clone()),
+                    ColumnData::Bool(v) => Value::Bool(v[rank]),
                 };
                 out.entry(local_idx)
                     .or_default()
@@ -326,13 +335,14 @@ impl Chunk {
     //   [u32 num_columns]
     //   repeated num_columns times, sorted by key_id:
     //     [u32 key_id]
-    //     [u8  type_tag]              (0=Str, 1=F64, 2=I64)
+    //     [u8  type_tag]              (0=Str, 1=F64, 2=I64, 3=Bool)
     //     [4096 bytes presence bitmap]
     //     entries, one per set bit in the bitmap, in cell-index order:
     //       [u64 created_at_ms][u64 modified_at_ms][u64 version]  (CellMeta)
     //       then the value itself:
     //         F64/I64: 8 bytes little-endian
     //         Str:     [u32 len][len bytes, utf-8]
+    //         Bool:    1 byte (0 or 1)
     //
     // There is no per-cell overhead beyond 1 bit in the presence map plus
     // CellMeta's 24 bytes: a cell that doesn't use a key costs nothing but
@@ -372,6 +382,14 @@ impl Chunk {
                         let bytes = s.as_bytes();
                         w.write_all(&(bytes.len() as u32).to_le_bytes())?;
                         w.write_all(bytes)?;
+                    }
+                }
+                ColumnData::Bool(v) => {
+                    w.write_all(&[Value::TAG_BOOL])?;
+                    w.write_all(&col.presence.bits)?;
+                    for (b, m) in v.iter().zip(&col.meta) {
+                        write_meta(w, m)?;
+                        w.write_all(&[u8::from(*b)])?;
                     }
                 }
             }
@@ -431,6 +449,16 @@ impl Chunk {
                     }
                     ColumnData::Str(v)
                 }
+                t if t == Value::TAG_BOOL => {
+                    let mut v = Vec::with_capacity(count);
+                    for _ in 0..count {
+                        meta.push(read_meta(r)?);
+                        let mut b = [0u8; 1];
+                        r.read_exact(&mut b)?;
+                        v.push(b[0] != 0);
+                    }
+                    ColumnData::Bool(v)
+                }
                 other => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -466,6 +494,7 @@ impl Chunk {
                 ColumnData::F64(v) => v.len() * 8,
                 ColumnData::I64(v) => v.len() * 8,
                 ColumnData::Str(v) => v.iter().map(|s| 4 + s.len()).sum(),
+                ColumnData::Bool(v) => v.len(),
             };
         }
         n
@@ -546,6 +575,37 @@ mod tests {
         c.set(100, 1, Value::I64(1), 1000);
         c.set(100, 1, Value::I64(2), 2000); // overwrite same cell/key
         assert_eq!(c.get(100, 1), Some(Value::I64(2)));
+
+        c.remove(100, 1);
+        assert_eq!(c.get(100, 1), None);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn bool_values_round_trip_through_write_to_and_read_from() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 20, Value::Bool(true), 1000);
+        c.set(5, 20, Value::Bool(false), 1000);
+
+        assert_eq!(c.get(0, 20), Some(Value::Bool(true)));
+        assert_eq!(c.get(5, 20), Some(Value::Bool(false)));
+        assert_eq!(c.get(1, 20), None); // untouched cell, same column
+
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), c.byte_len());
+
+        let c2 = Chunk::read_from(&mut &buf[..], CELLS).unwrap();
+        assert_eq!(c2.get(0, 20), Some(Value::Bool(true)));
+        assert_eq!(c2.get(5, 20), Some(Value::Bool(false)));
+    }
+
+    #[test]
+    fn bool_overwrite_and_remove() {
+        let mut c = Chunk::new(CELLS);
+        c.set(100, 1, Value::Bool(false), 1000);
+        c.set(100, 1, Value::Bool(true), 2000); // overwrite same cell/key
+        assert_eq!(c.get(100, 1), Some(Value::Bool(true)));
 
         c.remove(100, 1);
         assert_eq!(c.get(100, 1), None);
@@ -660,6 +720,26 @@ mod tests {
                 modified_at_ms: 3000,
                 version: 0,
             })
+        );
+    }
+
+    #[test]
+    fn entries_by_local_idx_includes_bool_values() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::Bool(true), 1000);
+
+        let entries = c.entries_by_local_idx();
+        assert_eq!(
+            entries[&0],
+            vec![(
+                1,
+                Value::Bool(true),
+                CellMeta {
+                    created_at_ms: 1000,
+                    modified_at_ms: 1000,
+                    version: 0,
+                }
+            )]
         );
     }
 
