@@ -5,57 +5,121 @@
 
 # kBlockDB
 
-A Cargo workspace with four crates:
+A database for a huge simulation grid, where every cell of the grid is its
+own key/value store -- string keys, with string, f64, i64, or bool values.
+It's sized for worlds like 10,000 x 10,000 x 10,000 cells (a trillion
+cells), which is far too many for one file per cell or one RDBMS row per
+cell. The axis count, world size, and chunk size are all per-world
+settings, so a world can be 2-dimensional, 4-dimensional, or larger.
 
-- **`kblockdblib`** -- a prototype storage engine for a huge simulation grid where
-  every cell is its own key/value store (string keys; string, f64, i64, or
-  bool values), sized for something like 10,000 x 10,000 x 10,000 cells (1
-  trillion cells) -- too big for one-file-per-cell or an RDBMS row-per-cell.
-  Exactly one external dependency, `zstd`, used only by the optional
-  `compression` flag; everything else is pure `std`. A library first,
-  with a small demo/benchmark binary (`kblockdblib`) built on top of it.
-- **`kblockdbserver`** -- a server that embeds `kblockdblib` as a library and
-  exposes `get`/`set`/`remove` for individual cells and for axis-aligned
-  regions of cells, over a RESTful HTTP API and (optionally, as a peer to
-  it, not a replacement) a minimal binary protocol with less per-call
-  overhead. Also a small SQL-like query language (`SELECT`/`SET`/`UPDATE`/
-  `DELETE` over `POST /rest/query`) and a read-only web data browser at `/`. Unlike
-  `kblockdblib`, it takes on the standard modern Rust web stack (axum +
-  tokio + serde + pest) -- `kblockdblib`'s near-dependency-free constraint
-  was specific to its storage format, not to everything built on top of it.
-- **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
-  over real HTTP and measures it: single-cell and region throughput/latency,
-  concurrency scaling, and lock contention.
-- **`kblockdbcli`** -- a small command-line client for kblockdbserver's REST API:
-  `get`/`set`/`remove` a single cell's value, or run a
-  `SELECT`/`SET`/`UPDATE`/`DELETE` query, from a shell, authenticating like
-  `curl -u` would. A pure HTTP client, same as `kblockdbperf` -- it treats
-  kblockdbserver as a black box over its REST API, not `kblockdblib` directly.
+Storage is chunked: the world is divided into fixed-size blocks of cells,
+each at most one file, and chunks that hold no data are never written at
+all -- so a mostly-empty world costs disk proportional to what's actually
+in it. Every value carries metadata (creation time, modification time,
+and a version counter).
 
-Plus standalone, dependency-free Java and Python clients under `client/`.
-Both expose the complete binary API.
+## Quick start
+
+```sh
+cargo build --release
+cargo run -p kblockdbserver          # re ads ./kblockdbserver.toml
+```
+
+The checked-in `kblockdbserver.toml` is a local-development placeholder
+(admin / `changeme`) so this runs out of the box. **Change
+`admin_password` before exposing the server to anyone you don't trust.**
+
+```sh
+# a single cell, over REST
+curl -u admin:changeme -X PUT -H 'Content-Type: application/json' \
+    -d '{"type":"str","value":"stone"}' \
+    'http://127.0.0.1:8080/rest/cells/1,2,3,0/material'
+curl -u admin:changeme 'http://127.0.0.1:8080/rest/cells/1,2,3,0/material'
+
+# or a query, from the command line
+./target/release/kblockdbcli --password changeme query \
+    "SELECT * FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'"
+```
+
+A read-only web browser for the data is served at
+<http://127.0.0.1:8080/>; it prompts for the same credentials.
+
+## What's here
+
+A Cargo workspace of four Rust crates, plus two standalone clients:
+
+- **`kblockdblib`** -- the storage engine, as a library plus a small
+  demo/benchmark binary. Chunked on-disk format, a write-through LRU chunk
+  cache, a cap on concurrent disk operations, and optional zstd
+  compression of chunk files. `zstd` is its only external dependency, and
+  only the compression option uses it; everything else is `std`.
+- **`kblockdbserver`** -- embeds `kblockdblib` and serves it over a REST
+  HTTP API, a read-only web data browser, and (optionally, as a peer to
+  REST rather than a replacement) a compact binary protocol with less
+  per-call overhead. Supports single cells and axis-aligned regions, a
+  SQL-like query language (`SELECT`/`SET`/`UPDATE`/`DELETE`), and HTTP
+  Basic Auth with per-account read-only access. Unlike `kblockdblib` it
+  uses the usual modern Rust web stack (axum, tokio, serde, pest) --
+  the near-dependency-free constraint applies to the storage format, not
+  to everything built on top of it.
+- **`kblockdbperf`** -- drives a real server over real HTTP and measures
+  it: single-cell and region throughput and latency, concurrency scaling,
+  and lock contention.
+- **`kblockdbcli`** -- a command-line client for the REST API: get, set,
+  or remove one cell, or run a query, authenticating the way `curl -u`
+  would.
+- **Java and Python clients** (`client/java`, `client/python`) -- each
+  dependency-free, each covering the complete binary API: health, stats,
+  single cells, regions, and queries.
 
 ```
-kblockdblib/         the storage engine (library `kblockdblib` + demo binary `kblockdblib`)
-kblockdbserver/   the REST server (binary `kblockdbserver`, depends on kblockdblib)
-kblockdbperf/     the performance test suite (binary `kblockdbperf`, drives kblockdbserver over HTTP)
-kblockdbcli/      the command-line client (binary `kblockdbcli`, drives kblockdbserver over HTTP)
-client/java/      the Java client (KBlockDBClient, speaks the binary protocol; Maven, not Cargo)
-client/python/    the Python 3 client (KBlockDBClient, standard library only)
+kblockdblib/      the storage engine (library + demo binary `kblockdblib`)
+kblockdbserver/   the server (binary `kblockdbserver`, embeds kblockdblib)
+kblockdbperf/     the performance suite (binary `kblockdbperf`, over HTTP)
+kblockdbcli/      the command-line client (binary `kblockdbcli`, over HTTP)
+client/java/      the Java client (binary protocol; Maven, not Cargo)
+client/python/    the Python 3 client (binary protocol; standard library only)
+docs/             per-component documentation
 ```
 
 ## Documentation
 
-- [`kblockdblib`](docs/kblockdblib.md) -- storage engine design, concurrency, and layout.
-- [`kblockdbserver`](docs/kblockdbserver.md) -- server configuration, REST API, query language, browser, and binary protocol.
-- [`kblockdbperf`](docs/kblockdbperf.md) -- performance suite usage and scenarios.
+- [`kblockdblib`](docs/kblockdblib.md) -- storage engine design, chunk
+  format, caching, concurrency, and compression.
+- [`kblockdbserver`](docs/kblockdbserver.md) -- configuration, REST API,
+  query language, data browser, and binary protocol.
+- [`kblockdbperf`](docs/kblockdbperf.md) -- performance suite usage and
+  scenarios.
 - [`kblockdbcli`](docs/kblockdbcli.md) -- command-line client usage.
-- [Java client](docs/java-client.md) -- dependency-free Java binary-protocol client.
-- [Python client](docs/python-client.md) -- dependency-free Python binary-protocol client.
+- [Java client](docs/java-client.md) -- the Java binary-protocol client.
+- [Python client](docs/python-client.md) -- the Python binary-protocol
+  client.
 
-## Build & test everything
+## Build and test
+
+The Rust workspace:
 
 ```sh
 cargo build --workspace --release
 cargo test --workspace
 ```
+
+The clients build separately, and their tests run against a real server
+binary:
+
+```sh
+cargo build -p kblockdbserver
+
+mvn -f client/java/pom.xml package
+
+PYTHONPATH=client/python/src \
+    python3 -m unittest discover -s client/python/tests
+```
+
+`build.sh`, `run.sh`, `perf.sh`, and `load.sh` at the repository root are
+one-line shortcuts for building, running the server, running the
+performance suite, and loading some sample data.
+
+## License
+
+BSD 3-Clause. See [LICENSE](LICENSE).
