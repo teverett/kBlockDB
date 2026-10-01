@@ -6,6 +6,9 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 
 /**
  * The client-side half of kBlockDB's binary protocol wire format --
@@ -37,7 +40,7 @@ final class Wire {
     /** Writes one length-prefixed frame carrying {@code payload}. */
     static void writeFrame(OutputStream out, byte[] payload) throws IOException {
         if (payload.length > MAX_FRAME_LEN) {
-            throw new IllegalArgumentException(
+            throw new ProtocolException(
                     "payload of " + payload.length + " bytes exceeds the " + MAX_FRAME_LEN + "-byte frame limit");
         }
         writeU32(out, payload.length);
@@ -220,6 +223,55 @@ final class Wire {
         return buf.toByteArray();
     }
 
+    static byte[] encodeHealth() {
+        return new byte[] {0x04};
+    }
+
+    static byte[] encodeStats() {
+        return new byte[] {0x05};
+    }
+
+    static byte[] encodeGetRegion(int[] origin, int[] extent, String key) throws IOException {
+        return encodeRegionRequest(0x06, origin, extent, key);
+    }
+
+    static byte[] encodeSetRegion(int[] origin, int[] extent, String key, List<Value> values)
+            throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x07);
+        writeCoord(buf, origin);
+        writeCoord(buf, extent);
+        writeKey(buf, key);
+        writeU32(buf, values.size());
+        for (Value value : values) {
+            writeValue(buf, value);
+        }
+        return buf.toByteArray();
+    }
+
+    static byte[] encodeRemoveRegion(int[] origin, int[] extent, String key) throws IOException {
+        return encodeRegionRequest(0x08, origin, extent, key);
+    }
+
+    private static byte[] encodeRegionRequest(int opcode, int[] origin, int[] extent, String key)
+            throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(opcode);
+        writeCoord(buf, origin);
+        writeCoord(buf, extent);
+        writeKey(buf, key);
+        return buf.toByteArray();
+    }
+
+    static byte[] encodeQuery(String query) throws IOException {
+        byte[] bytes = query.getBytes(StandardCharsets.UTF_8);
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x09);
+        writeU32(buf, bytes.length);
+        buf.write(bytes);
+        return buf.toByteArray();
+    }
+
     // --- Responses (server -> client) ---
 
     sealed interface Response {
@@ -249,6 +301,21 @@ final class Wire {
     record Internal(String message) implements Response {
     }
 
+    record HealthResp(Health health) implements Response {
+    }
+
+    record StatsResp(Stats stats) implements Response {
+    }
+
+    record RegionValues(List<Optional<Value>> values) implements Response {
+        RegionValues {
+            values = List.copyOf(values);
+        }
+    }
+
+    record QueryResp(QueryResult result) implements Response {
+    }
+
     static Response decodeResponse(byte[] payload) throws ProtocolException {
         Reader r = new Reader(payload);
         int status = r.u8();
@@ -269,6 +336,14 @@ final class Wire {
                 return new Forbidden(r.message());
             case 0x07:
                 return new Internal(r.message());
+            case 0x08:
+                return new HealthResp(new Health(r.u8(), r.u32(), r.u64()));
+            case 0x09:
+                return new StatsResp(new Stats(r.u64(), r.u64(), r.u64()));
+            case 0x0A:
+                return new RegionValues(r.regionValues());
+            case 0x0B:
+                return new QueryResp(r.queryResult());
             default:
                 throw new ProtocolException("unknown status 0x" + Integer.toHexString(status));
         }
@@ -332,7 +407,7 @@ final class Wire {
         }
 
         byte[] bytes(int n) throws ProtocolException {
-            if (pos + n > buf.length) {
+            if (n < 0 || pos > buf.length - n) {
                 throw truncated();
             }
             byte[] out = new byte[n];
@@ -353,7 +428,7 @@ final class Wire {
             int tag = u8();
             switch (tag) {
                 case 0:
-                    return new Value.Str(string((int) u32()));
+                    return new Value.Str(string(count32()));
                 case 1:
                     return new Value.F64(f64());
                 case 2:
@@ -368,6 +443,58 @@ final class Wire {
         /** {@code <meta>}: {@code [u64 LE created_at_ms][u64 LE modified_at_ms][u64 LE version]}. */
         CellMeta meta() throws ProtocolException {
             return new CellMeta(u64(), u64(), u64());
+        }
+
+        int count32() throws ProtocolException {
+            long count = u32();
+            if (count > Integer.MAX_VALUE) {
+                throw new ProtocolException("count exceeds Java's supported collection size: " + count);
+            }
+            return (int) count;
+        }
+
+        List<Integer> coord() throws ProtocolException {
+            int axes = u8();
+            List<Integer> coord = new ArrayList<>(axes);
+            for (int i = 0; i < axes; i++) {
+                coord.add((int) u32());
+            }
+            return coord;
+        }
+
+        List<Optional<Value>> regionValues() throws ProtocolException {
+            int count = count32();
+            List<Optional<Value>> values = new ArrayList<>(Math.min(count, remaining()));
+            for (int i = 0; i < count; i++) {
+                values.add(u8() == 0 ? Optional.empty() : Optional.of(value()));
+            }
+            return values;
+        }
+
+        QueryResult queryResult() throws ProtocolException {
+            int kind = u8();
+            if (kind == 1) {
+                return new QueryResult.Affected(u64());
+            }
+            if (kind != 0) {
+                throw new ProtocolException("unknown query result kind 0x" + Integer.toHexString(kind));
+            }
+            int rowCount = count32();
+            List<QueryRow> rows = new ArrayList<>(Math.min(rowCount, remaining()));
+            for (int i = 0; i < rowCount; i++) {
+                List<Integer> coord = coord();
+                int valueCount = count32();
+                List<QueryValue> values = new ArrayList<>(Math.min(valueCount, remaining()));
+                for (int j = 0; j < valueCount; j++) {
+                    values.add(new QueryValue(string(u16()), value(), meta()));
+                }
+                rows.add(new QueryRow(coord, values));
+            }
+            return new QueryResult.Rows(rows);
+        }
+
+        int remaining() {
+            return buf.length - pos;
         }
 
         private ProtocolException truncated() {

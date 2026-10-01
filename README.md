@@ -727,9 +727,10 @@ annotation and doesn't appear in `/rest/api-docs/openapi.json`.
 
 ### Binary protocol
 
-A minimal binary protocol, as a *peer* to the REST API above, not a
-replacement for it -- same `World`, same accounts, same `get`/`set`/
-`remove` semantics, just without HTTP/JSON's per-call overhead (see the
+A binary protocol covering the full REST API surface above -- health,
+stats, single-cell and region operations, and queries -- as a *peer* to
+that API, not a replacement for it. It uses the same `World`, accounts,
+and semantics, just without HTTP/JSON's per-call overhead (see the
 "Measured effect of the cache" numbers earlier in this README for why
 that overhead is worth caring about in the first place: on a cache-hit
 `get`, roughly three-quarters of the total call time measured there was
@@ -752,7 +753,8 @@ API.
 Every message, either direction, is a length-prefixed frame
 (`[u32 LE payload_len][payload_len bytes]`) -- see
 `kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
-of every request (`Hello`/`Get`/`Set`/`Remove`) and response kind. A
+of every request (`Hello`, health/stats, cell/region operations, and
+queries) and response kind. A
 successful `Get`'s `Value` response carries the cell's metadata alongside
 its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
 fields the REST API's single-cell `GET` reports (see "Cells and regions"
@@ -768,6 +770,30 @@ module directly rather than reimplementing the format; and the standalone
 Java client at `client/java` (`KBlockDBClient`, packaged as a plain jar via
 Maven), which reimplements the format in Java (`Wire.java`) since a JVM
 client can't depend on a Rust crate. `kblockdbcli` still speaks REST only.
+
+The Java client exposes every API directly:
+
+```java
+try (KBlockDBClient db =
+        KBlockDBClient.connect("localhost", 8081, "admin", "change-me")) {
+    Health health = db.health();
+    Stats stats = db.stats();
+
+    db.set(new int[] {1, 2, 3}, "material", new Value.Str("stone"));
+    Optional<ValueWithMeta> cell =
+        db.getWithMeta(new int[] {1, 2, 3}, "material");
+
+    db.setRegion(
+        new int[] {0, 0, 0},
+        new int[] {2, 1, 1},
+        "material",
+        List.of(new Value.Str("stone"), new Value.Str("air")));
+    List<Optional<Value>> region =
+        db.getRegion(new int[] {0, 0, 0}, new int[] {2, 1, 1}, "material");
+
+    QueryResult result = db.query("SELECT material WHERE material = 'stone'");
+}
+```
 
 ### Layout
 

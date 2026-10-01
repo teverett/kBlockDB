@@ -188,6 +188,58 @@ class KBlockDBClientIntegrationTest {
         }
     }
 
+    @Test
+    void healthReportsTheWorldShapeAndServerTime() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            Health health = client.health();
+            assertEquals(3, health.axes());
+            assertEquals(10_000, health.worldDim());
+            assertTrue(health.timestamp() > 0);
+        }
+    }
+
+    @Test
+    void statsReportsPersistedData() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            client.set(new int[] {30, 30, 30}, "stats-key", new Value.I64(1));
+            Stats stats = client.stats();
+            assertTrue(stats.totalChunks() > 0);
+            assertTrue(stats.totalBytes() > 0);
+        }
+    }
+
+    @Test
+    void regionApisSetGetAndRemoveValues() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            int[] origin = {40, 40, 40};
+            int[] extent = {2, 1, 1};
+            client.setRegion(origin, extent, "region-key", List.of(new Value.I64(1), new Value.I64(2)));
+            assertEquals(
+                    List.of(Optional.of(new Value.I64(1)), Optional.of(new Value.I64(2))),
+                    client.getRegion(origin, extent, "region-key"));
+
+            client.removeRegion(origin, extent, "region-key");
+            assertEquals(
+                    List.of(Optional.empty(), Optional.empty()),
+                    client.getRegion(origin, extent, "region-key"));
+        }
+    }
+
+    @Test
+    void queryReturnsRowsAndAffectedCellCounts() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+            assertEquals(
+                    new QueryResult.Affected(2),
+                    client.query("SET (query_key = 7) IN (50,50,50) TO (52,51,51)"));
+
+            QueryResult.Rows rows = (QueryResult.Rows) client.query(
+                    "SELECT query_key FROM (50,50,50) TO (52,51,51)");
+            assertEquals(2, rows.totalRows());
+            assertEquals(List.of(50, 50, 50), rows.rows().get(0).coord());
+            assertEquals(new Value.I64(7), rows.rows().get(0).values().get(0).value());
+        }
+    }
+
     // --- Test server plumbing ---
 
     private static Path findKblockdbserverBinary() {

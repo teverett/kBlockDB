@@ -38,6 +38,13 @@
 //! 0x01 Get:    <coord> <key>
 //! 0x02 Set:    <coord> <key> <value>
 //! 0x03 Remove: <coord> <key>
+//! 0x04 Health: (no fields)
+//! 0x05 Stats:  (no fields)
+//! 0x06 GetRegion:    <coord origin> <coord extent> <key>
+//! 0x07 SetRegion:    <coord origin> <coord extent> <key>
+//!                    [u32 LE value_count][value_count * <value>]
+//! 0x08 RemoveRegion: <coord origin> <coord extent> <key>
+//! 0x09 Query:        [u32 LE query_len][query bytes]
 //! ```
 //!
 //! `<coord>` is `[u8 axes][axes * i32 LE]` (signed -- kBlockDB's coordinate
@@ -63,6 +70,10 @@
 //! 0x05 Unauthorized: <message>
 //! 0x06 Forbidden:    <message>
 //! 0x07 Internal:     <message>
+//! 0x08 Health:       [u8 axes][u32 LE world_dim][u64 LE timestamp_seconds]
+//! 0x09 Stats:        [u64 LE total_chunks][u64 LE total_bytes][u64 LE total_blocks]
+//! 0x0a RegionValues: [u32 LE count][count * ([u8 present] [<value> if present])]
+//! 0x0b Query:        [u8 kind] <query-specific fields>
 //! ```
 //!
 //! `<message>` is `[u16 LE len][len bytes utf8]`. `<meta>` is
@@ -107,6 +118,48 @@ pub enum Request {
         coord: Vec<i32>,
         key: String,
     },
+    Health,
+    Stats,
+    GetRegion {
+        origin: Vec<i32>,
+        extent: Vec<i32>,
+        key: String,
+    },
+    SetRegion {
+        origin: Vec<i32>,
+        extent: Vec<i32>,
+        key: String,
+        values: Vec<Value>,
+    },
+    RemoveRegion {
+        origin: Vec<i32>,
+        extent: Vec<i32>,
+        key: String,
+    },
+    Query {
+        query: String,
+    },
+}
+
+#[derive(Debug, PartialEq)]
+pub struct QueryValue {
+    pub key: String,
+    pub value: Value,
+    pub created_at_ms: u64,
+    pub modified_at_ms: u64,
+    pub version: u64,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct QueryRow {
+    pub coord: Vec<i32>,
+    pub values: Vec<QueryValue>,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum QueryResult {
+    Rows(Vec<QueryRow>),
+    Affected(u64),
 }
 
 #[derive(Debug, PartialEq)]
@@ -128,6 +181,18 @@ pub enum Response {
     Unauthorized(String),
     Forbidden(String),
     Internal(String),
+    Health {
+        axes: u8,
+        world_dim: u32,
+        timestamp: u64,
+    },
+    Stats {
+        total_chunks: u64,
+        total_bytes: u64,
+        total_blocks: u64,
+    },
+    RegionValues(Vec<Option<Value>>),
+    Query(QueryResult),
 }
 
 #[derive(Debug, PartialEq)]
@@ -201,6 +266,47 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             put_coord(&mut buf, coord);
             put_key(&mut buf, key);
         }
+        Request::Health => buf.push(0x04),
+        Request::Stats => buf.push(0x05),
+        Request::GetRegion {
+            origin,
+            extent,
+            key,
+        } => {
+            buf.push(0x06);
+            put_coord(&mut buf, origin);
+            put_coord(&mut buf, extent);
+            put_key(&mut buf, key);
+        }
+        Request::SetRegion {
+            origin,
+            extent,
+            key,
+            values,
+        } => {
+            buf.push(0x07);
+            put_coord(&mut buf, origin);
+            put_coord(&mut buf, extent);
+            put_key(&mut buf, key);
+            buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in values {
+                put_value(&mut buf, value);
+            }
+        }
+        Request::RemoveRegion {
+            origin,
+            extent,
+            key,
+        } => {
+            buf.push(0x08);
+            put_coord(&mut buf, origin);
+            put_coord(&mut buf, extent);
+            put_key(&mut buf, key);
+        }
+        Request::Query { query } => {
+            buf.push(0x09);
+            put_long_string(&mut buf, query);
+        }
     }
     buf
 }
@@ -246,6 +352,66 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             buf.push(0x07);
             put_message(&mut buf, m);
         }
+        Response::Health {
+            axes,
+            world_dim,
+            timestamp,
+        } => {
+            buf.push(0x08);
+            buf.push(*axes);
+            buf.extend_from_slice(&world_dim.to_le_bytes());
+            buf.extend_from_slice(&timestamp.to_le_bytes());
+        }
+        Response::Stats {
+            total_chunks,
+            total_bytes,
+            total_blocks,
+        } => {
+            buf.push(0x09);
+            buf.extend_from_slice(&total_chunks.to_le_bytes());
+            buf.extend_from_slice(&total_bytes.to_le_bytes());
+            buf.extend_from_slice(&total_blocks.to_le_bytes());
+        }
+        Response::RegionValues(values) => {
+            buf.push(0x0a);
+            buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+            for value in values {
+                match value {
+                    Some(value) => {
+                        buf.push(1);
+                        put_value(&mut buf, value);
+                    }
+                    None => buf.push(0),
+                }
+            }
+        }
+        Response::Query(result) => {
+            buf.push(0x0b);
+            match result {
+                QueryResult::Rows(rows) => {
+                    buf.push(0);
+                    buf.extend_from_slice(&(rows.len() as u32).to_le_bytes());
+                    for row in rows {
+                        put_coord(&mut buf, &row.coord);
+                        buf.extend_from_slice(&(row.values.len() as u32).to_le_bytes());
+                        for value in &row.values {
+                            put_key(&mut buf, &value.key);
+                            put_value(&mut buf, &value.value);
+                            put_meta(
+                                &mut buf,
+                                value.created_at_ms,
+                                value.modified_at_ms,
+                                value.version,
+                            );
+                        }
+                    }
+                }
+                QueryResult::Affected(count) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&count.to_le_bytes());
+                }
+            }
+        }
     }
     buf
 }
@@ -267,6 +433,12 @@ fn put_key(buf: &mut Vec<u8>, key: &str) {
 #[allow(dead_code)] // client-side only, see encode_request above
 fn put_short_string(buf: &mut Vec<u8>, s: &str) {
     buf.push(s.len() as u8);
+    buf.extend_from_slice(s.as_bytes());
+}
+
+#[allow(dead_code)] // client-side only, see encode_request above
+fn put_long_string(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
 }
 
@@ -372,6 +544,11 @@ impl<'a> Reader<'a> {
         self.string(len)
     }
 
+    fn long_string(&mut self) -> Result<String, DecodeError> {
+        let len = self.u32()? as usize;
+        self.string(len)
+    }
+
     #[allow(dead_code)] // only decode_response uses this -- client-side only, see below
     fn message(&mut self) -> Result<String, DecodeError> {
         self.key() // identical shape -- u16 len prefix, utf8 bytes
@@ -422,6 +599,36 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
             coord: r.coord()?,
             key: r.key()?,
         }),
+        0x04 => Ok(Request::Health),
+        0x05 => Ok(Request::Stats),
+        0x06 => Ok(Request::GetRegion {
+            origin: r.coord()?,
+            extent: r.coord()?,
+            key: r.key()?,
+        }),
+        0x07 => {
+            let origin = r.coord()?;
+            let extent = r.coord()?;
+            let key = r.key()?;
+            let count = r.u32()? as usize;
+            let values = (0..count)
+                .map(|_| r.value())
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(Request::SetRegion {
+                origin,
+                extent,
+                key,
+                values,
+            })
+        }
+        0x08 => Ok(Request::RemoveRegion {
+            origin: r.coord()?,
+            extent: r.coord()?,
+            key: r.key()?,
+        }),
+        0x09 => Ok(Request::Query {
+            query: r.long_string()?,
+        }),
         other => Err(DecodeError::UnknownOpcode(other)),
     }
 }
@@ -452,6 +659,55 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
         0x05 => Ok(Response::Unauthorized(r.message()?)),
         0x06 => Ok(Response::Forbidden(r.message()?)),
         0x07 => Ok(Response::Internal(r.message()?)),
+        0x08 => Ok(Response::Health {
+            axes: r.u8()?,
+            world_dim: r.u32()?,
+            timestamp: r.u64()?,
+        }),
+        0x09 => Ok(Response::Stats {
+            total_chunks: r.u64()?,
+            total_bytes: r.u64()?,
+            total_blocks: r.u64()?,
+        }),
+        0x0a => {
+            let count = r.u32()? as usize;
+            let values = (0..count)
+                .map(|_| match r.u8()? {
+                    0 => Ok(None),
+                    _ => Ok(Some(r.value()?)),
+                })
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(Response::RegionValues(values))
+        }
+        0x0b => match r.u8()? {
+            0 => {
+                let row_count = r.u32()? as usize;
+                let rows = (0..row_count)
+                    .map(|_| {
+                        let coord = r.coord()?;
+                        let value_count = r.u32()? as usize;
+                        let values = (0..value_count)
+                            .map(|_| {
+                                let key = r.key()?;
+                                let value = r.value()?;
+                                let (created_at_ms, modified_at_ms, version) = r.meta()?;
+                                Ok(QueryValue {
+                                    key,
+                                    value,
+                                    created_at_ms,
+                                    modified_at_ms,
+                                    version,
+                                })
+                            })
+                            .collect::<Result<Vec<_>, DecodeError>>()?;
+                        Ok(QueryRow { coord, values })
+                    })
+                    .collect::<Result<Vec<_>, DecodeError>>()?;
+                Ok(Response::Query(QueryResult::Rows(rows)))
+            }
+            1 => Ok(Response::Query(QueryResult::Affected(r.u64()?))),
+            other => Err(DecodeError::UnknownStatus(other)),
+        },
         other => Err(DecodeError::UnknownStatus(other)),
     }
 }
@@ -500,7 +756,15 @@ pub async fn read_frame<R: AsyncRead + Unpin>(r: &mut R) -> std::io::Result<Opti
 
 /// Writes one length-prefixed frame carrying `payload` to `w`.
 pub async fn write_frame<W: AsyncWrite + Unpin>(w: &mut W, payload: &[u8]) -> std::io::Result<()> {
-    debug_assert!(payload.len() as u64 <= MAX_FRAME_LEN as u64);
+    if payload.len() as u64 > MAX_FRAME_LEN as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "payload of {} bytes exceeds the {MAX_FRAME_LEN}-byte frame limit",
+                payload.len()
+            ),
+        ));
+    }
     w.write_all(&(payload.len() as u32).to_le_bytes()).await?;
     w.write_all(payload).await?;
     Ok(())
@@ -573,6 +837,35 @@ mod tests {
     }
 
     #[test]
+    fn every_extended_request_round_trips() {
+        for request in [
+            Request::Health,
+            Request::Stats,
+            Request::GetRegion {
+                origin: vec![0, 1],
+                extent: vec![2, 3],
+                key: "material".into(),
+            },
+            Request::SetRegion {
+                origin: vec![0, 1],
+                extent: vec![2, 1],
+                key: "material".into(),
+                values: vec![Value::Str("stone".into()), Value::Str("air".into())],
+            },
+            Request::RemoveRegion {
+                origin: vec![0, 1],
+                extent: vec![2, 3],
+                key: "material".into(),
+            },
+            Request::Query {
+                query: "SELECT *".into(),
+            },
+        ] {
+            roundtrip_request(request);
+        }
+    }
+
+    #[test]
     fn negative_coordinates_round_trip() {
         roundtrip_request(Request::Get {
             coord: vec![-1, -2, -3],
@@ -597,6 +890,36 @@ mod tests {
             world_dim: 1,
             read_only: true,
         });
+    }
+
+    #[test]
+    fn every_extended_response_round_trips() {
+        roundtrip_response(Response::Health {
+            axes: 3,
+            world_dim: 10_000,
+            timestamp: 123,
+        });
+        roundtrip_response(Response::Stats {
+            total_chunks: 2,
+            total_bytes: 3,
+            total_blocks: 4,
+        });
+        roundtrip_response(Response::RegionValues(vec![
+            Some(Value::I64(7)),
+            None,
+            Some(Value::Bool(true)),
+        ]));
+        roundtrip_response(Response::Query(QueryResult::Rows(vec![QueryRow {
+            coord: vec![1, 2, 3],
+            values: vec![QueryValue {
+                key: "material".into(),
+                value: Value::Str("stone".into()),
+                created_at_ms: 10,
+                modified_at_ms: 11,
+                version: 1,
+            }],
+        }])));
+        roundtrip_response(Response::Query(QueryResult::Affected(9)));
     }
 
     #[test]

@@ -16,7 +16,7 @@
 
 use crate::error::ApiError;
 use crate::state::{Account, AppState};
-use kblockdbserver::wire::{self, Request, Response};
+use kblockdbserver::wire::{self, QueryResult, QueryRow, QueryValue, Request, Response};
 use tokio::net::{TcpListener, TcpStream};
 
 /// `wire::Response` is defined in the published `wire` module and
@@ -89,10 +89,14 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) {
             Err(e) => Response::BadRequest(e.to_string()),
         };
 
-        if wire::write_frame(&mut stream, &wire::encode_response(&response))
-            .await
-            .is_err()
-        {
+        let mut response_payload = wire::encode_response(&response);
+        if response_payload.len() as u64 > wire::MAX_FRAME_LEN as u64 {
+            response_payload = wire::encode_response(&Response::BadRequest(
+                "result exceeds the binary protocol frame limit; narrow the region or query"
+                    .to_string(),
+            ));
+        }
+        if wire::write_frame(&mut stream, &response_payload).await.is_err() {
             return; // peer gone -- nothing left to do
         }
     }
@@ -166,6 +170,111 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             }
             match state.with_world(move |w| w.remove(&coord, &key)).await {
                 Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::Health => Response::Health {
+            axes: state.world.axes() as u8,
+            world_dim: state.world.world_dim(),
+            timestamp: crate::routes::unix_timestamp(),
+        },
+        Request::Stats => {
+            if let Err(response) = require_authenticated(account) {
+                return response;
+            }
+            match state.with_world(kblockdblib::World::stats).await {
+                Ok(stats) => Response::Stats {
+                    total_chunks: stats.total_chunks,
+                    total_bytes: stats.total_bytes,
+                    total_blocks: stats.total_blocks,
+                },
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::GetRegion {
+            origin,
+            extent,
+            key,
+        } => {
+            if let Err(response) = require_authenticated(account) {
+                return response;
+            }
+            let region = kblockdblib::Region::new(origin, extent);
+            match state
+                .with_world(move |w| w.get_region(&region, &key))
+                .await
+            {
+                Ok(values) => Response::RegionValues(values),
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::SetRegion {
+            origin,
+            extent,
+            key,
+            values,
+        } => {
+            if let Err(response) = require_write(account) {
+                return response;
+            }
+            let region = kblockdblib::Region::new(origin, extent);
+            match state
+                .with_world(move |w| w.set_region(&region, &key, &values))
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::RemoveRegion {
+            origin,
+            extent,
+            key,
+        } => {
+            if let Err(response) = require_write(account) {
+                return response;
+            }
+            let region = kblockdblib::Region::new(origin, extent);
+            match state
+                .with_world(move |w| w.remove_region(&region, &key))
+                .await
+            {
+                Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::Query { query } => {
+            let authenticated = match require_authenticated(account) {
+                Ok(account) => account,
+                Err(response) => return response,
+            };
+            match crate::routes::execute_query(state, authenticated, &query).await {
+                Ok(result) => {
+                    if let Some(rows) = result.rows {
+                        Response::Query(QueryResult::Rows(
+                            rows.into_iter()
+                                .map(|row| QueryRow {
+                                    coord: row.coord,
+                                    values: row
+                                        .values
+                                        .into_iter()
+                                        .map(|value| QueryValue {
+                                            key: value.key,
+                                            value: value.value.into(),
+                                            created_at_ms: value.created_at_ms,
+                                            modified_at_ms: value.modified_at_ms,
+                                            version: value.version,
+                                        })
+                                        .collect(),
+                                })
+                                .collect(),
+                        ))
+                    } else {
+                        Response::Query(QueryResult::Affected(
+                            result.affected_cells.unwrap_or_default() as u64,
+                        ))
+                    }
+                }
                 Err(e) => response_from_error(e),
             }
         }
@@ -322,6 +431,26 @@ mod tests {
         )
         .await;
         assert!(matches!(response, Response::Unauthorized(_)));
+
+        for request in [
+            Request::Stats,
+            Request::GetRegion {
+                origin: vec![0, 0, 0],
+                extent: vec![1, 1, 1],
+                key: "material".to_string(),
+            },
+            Request::Query {
+                query: "SELECT *".to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(matches!(response, Response::Unauthorized(_)));
+        }
+
+        assert!(matches!(
+            roundtrip(&mut stream, &Request::Health).await,
+            Response::Health { .. }
+        ));
     }
 
     #[tokio::test]
@@ -521,6 +650,38 @@ mod tests {
         )
         .await;
         assert!(matches!(remove, Response::Forbidden(_)));
+
+        let set_region = roundtrip(
+            &mut stream,
+            &Request::SetRegion {
+                origin: vec![0, 0, 0],
+                extent: vec![1, 1, 1],
+                key: "material".to_string(),
+                values: vec![Value::I64(2)],
+            },
+        )
+        .await;
+        assert!(matches!(set_region, Response::Forbidden(_)));
+
+        let remove_region = roundtrip(
+            &mut stream,
+            &Request::RemoveRegion {
+                origin: vec![0, 0, 0],
+                extent: vec![1, 1, 1],
+                key: "material".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(remove_region, Response::Forbidden(_)));
+
+        let query = roundtrip(
+            &mut stream,
+            &Request::Query {
+                query: "SET (material=2) IN (0,0,0) TO (1,1,1)".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(query, Response::Forbidden(_)));
     }
 
     #[tokio::test]

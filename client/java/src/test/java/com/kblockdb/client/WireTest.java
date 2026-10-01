@@ -6,6 +6,8 @@ import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
+import java.util.Optional;
 
 import static org.junit.jupiter.api.Assertions.assertArrayEquals;
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -195,6 +197,40 @@ class WireTest {
         assertThrows(IllegalArgumentException.class, () -> Wire.encodeHello(tooLong, "pw"));
     }
 
+    @Test
+    void encodesHealthAndStatsRequests() {
+        assertArrayEquals(new byte[] {0x04}, Wire.encodeHealth());
+        assertArrayEquals(new byte[] {0x05}, Wire.encodeStats());
+    }
+
+    @Test
+    void encodesRegionRequests() throws IOException {
+        assertArrayEquals(
+                new byte[] {0x06, 1, 1, 0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 'k'},
+                Wire.encodeGetRegion(new int[] {1}, new int[] {2}, "k"));
+        assertArrayEquals(
+                new byte[] {0x08, 1, 1, 0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 'k'},
+                Wire.encodeRemoveRegion(new int[] {1}, new int[] {2}, "k"));
+    }
+
+    @Test
+    void encodesSetRegionRequest() throws IOException {
+        assertArrayEquals(
+                new byte[] {
+                    0x07, 1, 1, 0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 'k',
+                    2, 0, 0, 0, 2, 7, 0, 0, 0, 0, 0, 0, 0, 3, 1
+                },
+                Wire.encodeSetRegion(
+                        new int[] {1}, new int[] {2}, "k", List.of(new Value.I64(7), new Value.Bool(true))));
+    }
+
+    @Test
+    void encodesQueryRequest() throws IOException {
+        assertArrayEquals(
+                new byte[] {0x09, 8, 0, 0, 0, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '*'},
+                Wire.encodeQuery("SELECT *"));
+    }
+
     // --- Response decoding ---
 
     @Test
@@ -262,6 +298,71 @@ class WireTest {
         assertEquals(new Wire.Internal("disk on fire"), decodeErrorResponse(0x07, "disk on fire"));
     }
 
+    @Test
+    void decodesHealthResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x08);
+        buf.write(3);
+        Wire.writeU32(buf, 10_000);
+        writeU64(buf, 123);
+        assertEquals(new Wire.HealthResp(new Health(3, 10_000, 123)), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesStatsResponse() throws ProtocolException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x09);
+        writeU64(buf, 2);
+        writeU64(buf, 3);
+        writeU64(buf, 4);
+        assertEquals(new Wire.StatsResp(new Stats(2, 3, 4)), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesRegionValuesResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0A);
+        Wire.writeU32(buf, 2);
+        buf.write(1);
+        Wire.writeValue(buf, new Value.Str("stone"));
+        buf.write(0);
+        assertEquals(
+                new Wire.RegionValues(List.of(Optional.of(new Value.Str("stone")), Optional.empty())),
+                Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesSelectQueryResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0B);
+        buf.write(0);
+        Wire.writeU32(buf, 1);
+        buf.write(1);
+        Wire.writeU32(buf, 7);
+        Wire.writeU32(buf, 1);
+        Wire.writeU16(buf, 1);
+        buf.write('k');
+        Wire.writeValue(buf, new Value.I64(9));
+        writeU64(buf, 10);
+        writeU64(buf, 11);
+        writeU64(buf, 1);
+        QueryResult expected = new QueryResult.Rows(List.of(
+                new QueryRow(List.of(7), List.of(
+                        new QueryValue("k", new Value.I64(9), new CellMeta(10, 11, 1))))));
+        assertEquals(new Wire.QueryResp(expected), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesMutatingQueryResponse() throws ProtocolException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0B);
+        buf.write(1);
+        writeU64(buf, 7);
+        assertEquals(
+                new Wire.QueryResp(new QueryResult.Affected(7)),
+                Wire.decodeResponse(buf.toByteArray()));
+    }
+
     private static Wire.Response decodeErrorResponse(int status, String message) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(status);
@@ -293,5 +394,14 @@ class WireTest {
     @Test
     void decodeResponseRejectsAnEmptyPayload() {
         assertThrows(ProtocolException.class, () -> Wire.decodeResponse(new byte[0]));
+    }
+
+    @Test
+    void collectionCountsCannotForceAllocationBeyondTheFrame() {
+        byte[] region = {0x0A, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0x7F};
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(region));
+
+        byte[] queryRows = {0x0B, 0, (byte) 0xFF, (byte) 0xFF, (byte) 0xFF, 0x7F};
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(queryRows));
     }
 }

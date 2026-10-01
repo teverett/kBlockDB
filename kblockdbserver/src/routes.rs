@@ -127,7 +127,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-fn unix_timestamp() -> u64 {
+pub(crate) fn unix_timestamp() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -394,25 +394,25 @@ pub struct QueryRequest {
 
 #[derive(Serialize, ToSchema)]
 pub struct QueryKeyValue {
-    key: String,
-    value: ValueJson,
+    pub(crate) key: String,
+    pub(crate) value: ValueJson,
     /// Milliseconds since the Unix epoch when this key was first set at
     /// this cell -- same field `CellResponse` (the single-cell `GET`)
     /// reports (see `kblockdblib::CellMeta`).
-    created_at_ms: u64,
+    pub(crate) created_at_ms: u64,
     /// Milliseconds since the Unix epoch when this key was last set at
     /// this cell -- equal to `created_at_ms` if it's never been
     /// overwritten.
-    modified_at_ms: u64,
+    pub(crate) modified_at_ms: u64,
     /// How many times this key has been overwritten at this cell since it
     /// was first set: 0 for a value that's never been overwritten.
-    version: u64,
+    pub(crate) version: u64,
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct QueryRow {
-    coord: Vec<i32>,
-    values: Vec<QueryKeyValue>,
+    pub(crate) coord: Vec<i32>,
+    pub(crate) values: Vec<QueryKeyValue>,
 }
 
 /// `SELECT` populates `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE` populate
@@ -422,11 +422,11 @@ pub struct QueryRow {
 #[derive(Serialize, ToSchema)]
 pub struct QueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
-    total_rows: Option<usize>,
+    pub(crate) total_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    rows: Option<Vec<QueryRow>>,
+    pub(crate) rows: Option<Vec<QueryRow>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    affected_cells: Option<usize>,
+    pub(crate) affected_cells: Option<usize>,
 }
 
 impl QueryResponse {
@@ -474,7 +474,7 @@ async fn run_query(
     }
 }
 
-async fn execute_query(
+pub(crate) async fn execute_query(
     state: &AppState,
     account: &crate::state::Account,
     query_text: &str,

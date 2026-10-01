@@ -10,6 +10,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.Objects;
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -212,6 +213,86 @@ public final class KBlockDBClient implements Closeable {
         Wire.Response response = Wire.decodeResponse(requireFrame(in));
         if (response instanceof Wire.Ok) {
             return;
+        }
+        throw toException(response);
+    }
+
+    /** Returns the server's current world shape and clock. */
+    public Health health() throws IOException {
+        Wire.writeFrame(out, Wire.encodeHealth());
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.HealthResp health) {
+            return health.health();
+        }
+        throw toException(response);
+    }
+
+    /** Returns live on-disk statistics for the world. */
+    public Stats stats() throws IOException {
+        Wire.writeFrame(out, Wire.encodeStats());
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.StatsResp stats) {
+            return stats.stats();
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Reads one value per cell in axis-0-fastest order. Empty entries are
+     * cells where {@code key} is unset.
+     */
+    public List<Optional<Value>> getRegion(int[] origin, int[] extent, String key) throws IOException {
+        Objects.requireNonNull(origin, "origin");
+        Objects.requireNonNull(extent, "extent");
+        Objects.requireNonNull(key, "key");
+        Wire.writeFrame(out, Wire.encodeGetRegion(origin, extent, key));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.RegionValues values) {
+            return values.values();
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Writes one value per cell in axis-0-fastest order. The value count
+     * must exactly equal the region volume.
+     */
+    public void setRegion(int[] origin, int[] extent, String key, List<Value> values) throws IOException {
+        Objects.requireNonNull(origin, "origin");
+        Objects.requireNonNull(extent, "extent");
+        Objects.requireNonNull(key, "key");
+        List<Value> checkedValues = List.copyOf(Objects.requireNonNull(values, "values"));
+        Wire.writeFrame(out, Wire.encodeSetRegion(origin, extent, key, checkedValues));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return;
+        }
+        throw toException(response);
+    }
+
+    /** Clears {@code key} from every cell in the region. */
+    public void removeRegion(int[] origin, int[] extent, String key) throws IOException {
+        Objects.requireNonNull(origin, "origin");
+        Objects.requireNonNull(extent, "extent");
+        Objects.requireNonNull(key, "key");
+        Wire.writeFrame(out, Wire.encodeRemoveRegion(origin, extent, key));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return;
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Executes a kBlockDB {@code SELECT}, {@code SET}, {@code UPDATE}, or
+     * {@code DELETE} statement.
+     */
+    public QueryResult query(String query) throws IOException {
+        Objects.requireNonNull(query, "query");
+        Wire.writeFrame(out, Wire.encodeQuery(query));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.QueryResp result) {
+            return result.result();
         }
         throw toException(response);
     }
