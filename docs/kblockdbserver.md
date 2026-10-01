@@ -19,9 +19,10 @@ OPTIONS:
     --config <path>                Config file (default: ./kblockdbserver.toml). Required --
                                     holds admin_password and, optionally, [[users]], plus
                                     optional http_addr/binary_addr/data_dir/
-                                    max_concurrent_disk_ops/max_cached_chunks and a
-                                    [worldparameters] table (each overridden by the
-                                    matching CLI flag below, if given)
+                                    max_concurrent_disk_ops/max_cached_chunks/compression
+                                    and a [worldparameters] table (each overridden by the
+                                    matching CLI flag below, if given; compression is
+                                    config-file-only)
     --data-dir <path>              World data directory (default: ./data)
     --axes <n>                     Axis count for a brand-new world (default: 3)
     --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
@@ -69,6 +70,7 @@ binary_addr = "127.0.0.1:8081" # optional; disabled unless given (see "Binary pr
 data_dir = "./data"          # optional
 max_concurrent_disk_ops = 32 # optional
 max_cached_chunks = 100000   # optional
+compression = false          # optional; zstd-compress every chunk file written
 admin_password = "change-me" # required
 
 # Only matters the first time a world is created at data_dir above --
@@ -96,6 +98,28 @@ read_only = true              # optional, defaults to false
 usernames must be unique, and no password may be empty. A `[[users]]`
 entry defaults to full read/write access, same as `admin`; set
 `read_only = true` to limit it to `GET` (see below).
+
+## Compression
+
+`compression` (config file only, default `false`) zstd-compresses every
+chunk file the server writes. It trades CPU on each write and each
+cache-missing read for a smaller world on disk; how much smaller depends
+entirely on the data, since the chunk format is already compact and
+sparse (see [kblockdblib](kblockdblib.md)).
+
+It is safe to turn on or off at any time, on an existing world as well
+as a new one:
+
+- The setting governs *writes* only. Reads detect each file's encoding
+  from its own leading bytes, so a world may hold a mix of compressed and
+  uncompressed chunks and stays fully readable either way.
+- Flipping it rewrites nothing by itself. An existing chunk file is
+  re-encoded the next time something writes to that chunk.
+- It is not recorded in `world.txt`: unlike `axes`/`world_dim`/
+  `chunk_dim`, it isn't part of a world's fixed shape.
+
+The library exposes the same switch as
+`kblockdblib::World::with_compression(bool)`.
 
 ## REST API
 
@@ -403,7 +427,8 @@ respective runtimes.
 - `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
-  (http_addr/binary_addr/data_dir/max_concurrent_disk_ops/max_cached_chunks,
+  (http_addr/binary_addr/data_dir/max_concurrent_disk_ops/max_cached_chunks/
+  compression,
   admin_password, `[[users]]`, and a `[worldparameters]` table for
   axes/world_dim/chunk_size) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied

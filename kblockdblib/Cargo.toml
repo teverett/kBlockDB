@@ -3,10 +3,11 @@ name = "kblockdblib"
 version = "0.1.0"
 edition = "2021"
 
-# Zero external dependencies on purpose: the whole point of this prototype is a
-# compact, hand-rolled binary chunk format. `cargo build --release` (or plain
-# `rustc`) needs nothing from crates.io. `kblockdbserver` (a separate crate in this
-# workspace) builds on top of this library and is free to take on its own
+# One external dependency, `zstd`, and only for the optional `compression`
+# flag (see `World::with_compression`): the chunk format itself is still a
+# compact, hand-rolled binary layout, and compression is a transparent
+# wrapper over it. `kblockdbserver` (a separate crate in this workspace)
+# builds on top of this library and is free to take on its own
 # dependencies -- that's a choice about the server, not about the storage
 # engine underneath it.
 
@@ -17,3 +18,6 @@ path = "src/lib.rs"
 [[bin]]
 name = "kblockdblib"
 path = "src/main.rs"
+
+[dependencies]
+zstd = "0.14.0"

@@ -59,6 +59,13 @@ pub struct Config {
     pub max_concurrent_disk_ops: Option<usize>,
     #[serde(default)]
     pub max_cached_chunks: Option<usize>,
+    /// If true, every chunk file this server writes is zstd-compressed
+    /// (see `kblockdblib::World::with_compression`). Defaults to false,
+    /// matching every world written before this flag existed. Safe to
+    /// flip either way on an existing world: reads detect each file's
+    /// encoding individually.
+    #[serde(default)]
+    pub compression: bool,
     pub admin_password: String,
     #[serde(default)]
     pub users: Vec<UserConfig>,
@@ -290,6 +297,36 @@ mod tests {
     fn admin_is_never_read_only() {
         let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
         assert!(!config.credentials().get("admin").unwrap().read_only);
+    }
+
+    #[test]
+    fn compression_defaults_to_off() {
+        let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
+        assert!(!config.compression);
+    }
+
+    #[test]
+    fn compression_can_be_turned_on() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            compression = true
+            "#,
+        )
+        .unwrap();
+        assert!(config.compression);
+    }
+
+    #[test]
+    fn compression_must_be_a_boolean() {
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            compression = "yes"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("compression"), "{err}");
     }
 
     #[test]

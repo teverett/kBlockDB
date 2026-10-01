@@ -7,7 +7,7 @@ use crate::semaphore::Semaphore;
 use crate::value::Value;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{self, BufReader, BufWriter};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -71,6 +71,20 @@ pub const DEFAULT_MAX_CONCURRENT_DISK_OPS: usize = 32;
 /// it.
 pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 100_000;
 
+/// zstd compression level used for chunk files when compression is on
+/// (see `World::with_compression`). 3 is zstd's own default: the level
+/// the format is tuned around, and the one that keeps compression cheap
+/// enough to sit on the write-through path of every `set`/`remove`.
+const ZSTD_LEVEL: i32 = 3;
+
+/// The four bytes every zstd frame starts with. Chunk files are sniffed
+/// for this on read so a world can be read back whether or not it was
+/// written with compression on -- see `World::with_compression`. The
+/// uncompressed chunk format can't collide with it: its first four bytes
+/// are a little-endian column count, and `0xFD2FB528` columns is far more
+/// than the `u32` key-id space could ever hold.
+const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
+
 const _: () = assert!(AXES >= 1, "AXES must be at least 1");
 const _: () = assert!(
     DEFAULT_CHUNK_DIM >= 1,
@@ -91,6 +105,23 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Fills `buf` from `r`, stopping early only at end of input -- unlike
+/// `read_exact`, a short file isn't an error, and unlike a single `read`,
+/// a short read isn't mistaken for one. Used to sniff a chunk file's
+/// leading bytes for `ZSTD_MAGIC`.
+fn read_up_to<R: Read>(r: &mut R, buf: &mut [u8]) -> io::Result<usize> {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match r.read(&mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
 }
 
 /// An axis-aligned box of cells: `origin` plus `extent`, i.e. the set of
@@ -333,6 +364,11 @@ pub struct World {
     /// eviction policy beyond that) -- see `with_chunk_read`/
     /// `with_chunk_write` and `crate::chunk_cache`.
     chunk_cache: ChunkCache<ChunkKey, Chunk>,
+    /// Whether newly written chunk files are zstd-compressed -- see
+    /// `with_compression`. Writes only: reads detect each file's encoding
+    /// from its own first bytes, so flipping this flag never strands data
+    /// written under the other setting.
+    compression: bool,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -432,6 +468,7 @@ impl World {
             chunks_written_to_disk: AtomicU64::new(0),
             disk_io: Semaphore::new(DEFAULT_MAX_CONCURRENT_DISK_OPS),
             chunk_cache: ChunkCache::new(DEFAULT_MAX_CACHED_CHUNKS),
+            compression: false,
         })
     }
 
@@ -476,6 +513,37 @@ impl World {
     pub fn with_max_cached_chunks(mut self, n: usize) -> Self {
         self.chunk_cache = ChunkCache::new(n);
         self
+    }
+
+    /// Turns zstd compression of chunk files on or off. Off by default,
+    /// matching every world written before this option existed.
+    ///
+    /// This setting applies to *writes* only, and is deliberately not
+    /// persisted in `world.txt`: reads sniff zstd's magic number off the
+    /// front of each file (see `load_chunk_unmetered`), so a single world
+    /// can hold a mix of compressed and uncompressed chunks and stays
+    /// fully readable whichever way the flag is set. Turning compression
+    /// on doesn't rewrite existing files -- each one is compressed the
+    /// next time its chunk is written.
+    ///
+    /// Chainable right after `create`/`open`, same as
+    /// `with_max_concurrent_disk_ops`:
+    /// ```no_run
+    /// # fn main() -> std::io::Result<()> {
+    /// let world = kblockdblib::World::create("./data", 3, 10_000, 32)?
+    ///     .with_compression(true);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub fn with_compression(mut self, compression: bool) -> Self {
+        self.compression = compression;
+        self
+    }
+
+    /// Whether this world zstd-compresses the chunk files it writes -- see
+    /// `with_compression`.
+    pub fn compression(&self) -> bool {
+        self.compression
     }
 
     /// Locks `schema` (recovering rather than panicking if a prior panic
@@ -754,7 +822,19 @@ impl World {
             fs::create_dir_all(chunk_path.parent().unwrap())?;
             let file = File::create(&chunk_path)?;
             let mut w = BufWriter::new(file);
-            chunk.write_to(&mut w)?;
+            if self.compression {
+                let mut encoder = zstd::stream::write::Encoder::new(&mut w, ZSTD_LEVEL)?;
+                chunk.write_to(&mut encoder)?;
+                // Writes zstd's frame epilogue; without it the file is a
+                // truncated frame that no reader can decode.
+                encoder.finish()?;
+            } else {
+                chunk.write_to(&mut w)?;
+            }
+            // `BufWriter` flushes on drop but swallows any error doing so,
+            // which would turn a failed write into a silently "successful"
+            // one -- flush explicitly so the caller sees it.
+            w.flush()?;
             self.chunks_written_to_disk.fetch_add(1, Ordering::Relaxed);
         }
 
@@ -779,7 +859,20 @@ impl World {
             let f = File::open(&chunk_path)?;
             let mut r = BufReader::new(f);
             self.chunks_read_from_disk.fetch_add(1, Ordering::Relaxed);
-            Chunk::read_from(&mut r, self.chunk_cells)
+            // Each file says for itself whether it's compressed, rather
+            // than the world's current `compression` setting deciding --
+            // that's what lets the flag be flipped on an existing world
+            // (see `with_compression`).
+            let mut head = [0u8; ZSTD_MAGIC.len()];
+            let head_len = read_up_to(&mut r, &mut head)?;
+            let compressed = head[..head_len] == ZSTD_MAGIC;
+            let mut r = io::Cursor::new(&head[..head_len]).chain(r);
+            if compressed {
+                let mut decoder = zstd::stream::read::Decoder::new(r)?;
+                Chunk::read_from(&mut decoder, self.chunk_cells)
+            } else {
+                Chunk::read_from(&mut r, self.chunk_cells)
+            }
         } else {
             Ok(Chunk::new(self.chunk_cells))
         }
@@ -2809,5 +2902,213 @@ mod tests {
         let cells = w.list_cells().unwrap();
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].coord, coord3(1, 2, 3));
+    }
+
+    // --- Compression ---
+
+    /// The on-disk bytes of the chunk file holding `c`, which must exist.
+    fn chunk_bytes(w: &World, c: &Coord) -> Vec<u8> {
+        let (ckey, _) = w.split(c).unwrap();
+        fs::read(w.chunk_path(&ckey)).unwrap()
+    }
+
+    fn is_zstd(bytes: &[u8]) -> bool {
+        bytes.starts_with(&ZSTD_MAGIC)
+    }
+
+    #[test]
+    fn compression_is_off_by_default() {
+        let dir = TempDir::new("compression-default-off");
+        let w = create(&dir);
+        assert!(!w.compression());
+
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        assert!(
+            !is_zstd(&chunk_bytes(&w, &c)),
+            "a default world must keep writing plain, uncompressed chunk files"
+        );
+    }
+
+    #[test]
+    fn with_compression_writes_zstd_chunk_files_that_read_back() {
+        let dir = TempDir::new("compression-roundtrip");
+        let w = create(&dir).with_compression(true);
+        assert!(w.compression());
+
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        w.set(&c, "n", Value::I64(42)).unwrap();
+        w.set(&c, "x", Value::F64(1.5)).unwrap();
+        w.set(&c, "flag", Value::Bool(true)).unwrap();
+
+        assert!(is_zstd(&chunk_bytes(&w, &c)));
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+
+        // Not just the in-memory cache answering: a fresh handle decodes
+        // the compressed file off disk.
+        let reopened = World::open(&dir).unwrap().with_compression(true);
+        assert_eq!(
+            reopened.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(reopened.get(&c, "n").unwrap(), Some(Value::I64(42)));
+        assert_eq!(reopened.get(&c, "x").unwrap(), Some(Value::F64(1.5)));
+        assert_eq!(reopened.get(&c, "flag").unwrap(), Some(Value::Bool(true)));
+        assert_eq!(reopened.chunks_read_from_disk(), 1);
+    }
+
+    #[test]
+    fn a_compressed_chunk_is_readable_with_compression_turned_back_off() {
+        // The flag governs writes only -- turning it off must never strand
+        // data already written compressed.
+        let dir = TempDir::new("compression-read-with-flag-off");
+        let c = coord3(5, 6, 7);
+        {
+            let w = create(&dir).with_compression(true);
+            w.set(&c, "material", Value::Str("dirt".into())).unwrap();
+            assert!(is_zstd(&chunk_bytes(&w, &c)));
+        }
+
+        let w = World::open(&dir).unwrap();
+        assert!(!w.compression());
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("dirt".into()))
+        );
+    }
+
+    #[test]
+    fn an_uncompressed_chunk_is_readable_with_compression_turned_on() {
+        let dir = TempDir::new("compression-read-legacy");
+        let c = coord3(8, 9, 10);
+        {
+            let w = create(&dir);
+            w.set(&c, "material", Value::Str("sand".into())).unwrap();
+            assert!(!is_zstd(&chunk_bytes(&w, &c)));
+        }
+
+        let w = World::open(&dir).unwrap().with_compression(true);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("sand".into()))
+        );
+    }
+
+    #[test]
+    fn one_world_can_hold_both_compressed_and_uncompressed_chunks() {
+        let dir = TempDir::new("compression-mixed");
+        let plain = coord3(0, 0, 0);
+        let packed = coord3(2_000, 2_000, 2_000); // a different chunk
+        {
+            let w = create(&dir);
+            w.set(&plain, "material", Value::Str("stone".into()))
+                .unwrap();
+        }
+        {
+            let w = World::open(&dir).unwrap().with_compression(true);
+            w.set(&packed, "material", Value::Str("water".into()))
+                .unwrap();
+            assert!(!is_zstd(&chunk_bytes(&w, &plain)));
+            assert!(is_zstd(&chunk_bytes(&w, &packed)));
+        }
+
+        let w = World::open(&dir).unwrap();
+        assert_eq!(
+            w.get(&plain, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(
+            w.get(&packed, "material").unwrap(),
+            Some(Value::Str("water".into()))
+        );
+    }
+
+    #[test]
+    fn rewriting_a_chunk_re_encodes_it_with_the_current_setting() {
+        // Flipping the flag doesn't rewrite anything on its own, but the
+        // next write to a chunk re-encodes that chunk either way.
+        let dir = TempDir::new("compression-re-encode");
+        let c = coord3(11, 12, 13);
+        {
+            let w = create(&dir).with_compression(true);
+            w.set(&c, "material", Value::Str("stone".into())).unwrap();
+            assert!(is_zstd(&chunk_bytes(&w, &c)));
+        }
+
+        let w = World::open(&dir).unwrap(); // compression off
+        w.set(&c, "n", Value::I64(7)).unwrap();
+        assert!(
+            !is_zstd(&chunk_bytes(&w, &c)),
+            "the rewrite should have produced a plain file"
+        );
+        // Both the pre-existing compressed value and the new one survived.
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(
+            reopened.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        assert_eq!(reopened.get(&c, "n").unwrap(), Some(Value::I64(7)));
+    }
+
+    #[test]
+    fn compression_shrinks_a_repetitive_chunk() {
+        let dir = TempDir::new("compression-smaller");
+        let c = coord3(14, 15, 16);
+        let value = || Value::Str("stone".repeat(200));
+
+        let plain_len = {
+            let w = create(&dir);
+            for i in 0..64 {
+                w.set(&c, &format!("k{i}"), value()).unwrap();
+            }
+            chunk_bytes(&w, &c).len()
+        };
+        let packed_len = {
+            let w = World::open(&dir).unwrap().with_compression(true);
+            w.set(&c, "k0", value()).unwrap(); // rewrites the whole chunk
+            chunk_bytes(&w, &c).len()
+        };
+        assert!(
+            packed_len < plain_len,
+            "compressed chunk ({packed_len} bytes) should be smaller than \
+             the plain one ({plain_len} bytes)"
+        );
+    }
+
+    #[test]
+    fn emptying_a_compressed_chunk_removes_its_file() {
+        let dir = TempDir::new("compression-remove");
+        let w = create(&dir).with_compression(true);
+        let c = coord3(17, 18, 19);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+
+        let (ckey, _) = w.split(&c).unwrap();
+        let path = w.chunk_path(&ckey);
+        assert!(path.exists());
+
+        w.remove(&c, "material").unwrap();
+        assert!(!path.exists());
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn regions_round_trip_through_compressed_chunks() {
+        let dir = TempDir::new("compression-region");
+        let region = Region::new([100, 100, 100], [40, 2, 2]); // spans chunks
+        {
+            let w = create(&dir).with_compression(true);
+            let values: Vec<Value> = (0..160).map(Value::I64).collect();
+            w.set_region(&region, "n", &values).unwrap();
+        }
+
+        let w = World::open(&dir).unwrap();
+        let read = w.get_region(&region, "n").unwrap();
+        assert_eq!(read.len(), 160);
+        assert_eq!(read[0], Some(Value::I64(0)));
+        assert_eq!(read[159], Some(Value::I64(159)));
     }
 }

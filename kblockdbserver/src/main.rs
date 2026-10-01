@@ -141,12 +141,14 @@ fn print_help() {
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
          holds admin_password and, optionally, [[users]], plus optional\n                          \
          http_addr/binary_addr/data_dir/max_concurrent_disk_ops/\n                          \
-         max_cached_chunks and a [worldparameters] table (each overridden\n                          \
-         by the matching CLI flag below, if given). Example:\n                          \
+         max_cached_chunks/compression and a [worldparameters] table (each\n                          \
+         overridden by the matching CLI flag below, if given; compression\n                          \
+         is config-file-only). Example:\n                          \
          \n                          \
          http_addr = \"127.0.0.1:8080\"\n                          \
          data_dir = \"./data\"\n                          \
          admin_password = \"change-me\"\n                          \
+         compression = false\n                          \
          \n                          \
          [worldparameters]\n                          \
          axes = 3\n                          \
@@ -182,6 +184,11 @@ fn print_help() {
          kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
          cache's benefit without disabling the server)\n    \
          -h, --help           Print this help\n\n\
+         compression (config file only, default false) zstd-compresses every chunk\n\
+         file the server writes. It can be turned on or off on an existing world at\n\
+         any time: each chunk file records its own encoding, so a world may hold a\n\
+         mix, and existing files are only re-encoded when their chunk is next\n\
+         written.\n\n\
          --axes/--world-dim/--chunk-size only matter the first time a world is\n\
          created at --data-dir; reopening an existing one reads its real shape\n\
          from its world.txt and ignores these flags (World::open does, not\n\
@@ -240,7 +247,8 @@ async fn main() {
         .unwrap_or_else(|e| {
             eprintln!("failed to open world at {data_dir}: {e}");
             std::process::exit(1);
-        });
+        })
+        .with_compression(config.compression);
     if let Some(n) = max_concurrent_disk_ops {
         world = world.with_max_concurrent_disk_ops(n);
     }
@@ -250,12 +258,14 @@ async fn main() {
     let credentials = config.credentials();
     println!(
         "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, chunk_size={}, \
-         max_concurrent_disk_ops={}, max_cached_chunks={}), {} account(s) configured",
+         max_concurrent_disk_ops={}, max_cached_chunks={}, compression={}), \
+         {} account(s) configured",
         world.axes(),
         world.world_dim(),
         world.chunk_dim(),
         world.max_concurrent_disk_ops(),
         world.max_cached_chunks(),
+        world.compression(),
         credentials.len()
     );
 

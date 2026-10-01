@@ -6,8 +6,9 @@ A Cargo workspace with four crates:
   every cell is its own key/value store (string keys; string, f64, i64, or
   bool values), sized for something like 10,000 x 10,000 x 10,000 cells (1
   trillion cells) -- too big for one-file-per-cell or an RDBMS row-per-cell.
-  Zero external dependencies -- pure `std`. A library first, with a small
-  demo/benchmark binary (`kblockdblib`) built on top of it.
+  Exactly one external dependency, `zstd`, used only by the optional
+  `compression` flag; everything else is pure `std`. A library first,
+  with a small demo/benchmark binary (`kblockdblib`) built on top of it.
 - **`kblockdbserver`** -- a server that embeds `kblockdblib` as a library and
   exposes `get`/`set`/`remove` for individual cells and for axis-aligned
   regions of cells, over a RESTful HTTP API and (optionally, as a peer to
@@ -15,8 +16,8 @@ A Cargo workspace with four crates:
   overhead. Also a small SQL-like query language (`SELECT`/`SET`/`UPDATE`/
   `DELETE` over `POST /rest/query`) and a read-only web data browser at `/`. Unlike
   `kblockdblib`, it takes on the standard modern Rust web stack (axum +
-  tokio + serde + pest) -- that dependency-free constraint was specific to
-  `kblockdblib`'s storage format, not to everything built on top of it.
+  tokio + serde + pest) -- `kblockdblib`'s near-dependency-free constraint
+  was specific to its storage format, not to everything built on top of it.
 - **`kblockdbperf`** -- a performance test suite that drives a real `kblockdbserver`
   over real HTTP and measures it: single-cell and region throughput/latency,
   concurrency scaling, and lock contention.

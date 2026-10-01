@@ -226,15 +226,47 @@ Two straightforward next steps if that trade-off matters for your actual
 access pattern:
 
 1. **Compress each chunk file** (e.g. zstd/gzip) before writing -- a bitmap
-   that's almost all zero bytes compresses extremely well, cheaply.
+   that's almost all zero bytes compresses extremely well, cheaply. This
+   one *is* implemented, as an opt-in: see "Compression" below.
 2. **Switch to a run-length or sparse-index presence encoding** (a list of
    set cell indices) instead of a flat bitmap when a chunk's occupancy is
    very low, and only use the flat bitmap once occupancy passes some
    threshold (this is basically what real sparse-array libraries like Zarr
    do internally).
 
-Neither is implemented here -- the prototype optimizes for showing the
-mechanism clearly, not for the last byte of density.
+The second isn't implemented here -- the prototype optimizes for showing
+the mechanism clearly, not for the last byte of density.
+
+## Compression
+
+`World::with_compression(bool)` -- off by default -- zstd-compresses
+every chunk file the world writes, at zstd level 3. This is the only
+thing the crate uses an external dependency for; the chunk format
+underneath is unchanged, with compression applied as a transparent
+wrapper around the same bytes.
+
+```rust
+let world = kblockdblib::World::create("./data", 3, 10_000, 32)?
+    .with_compression(true);
+```
+
+It can be turned on or off at any time, on an existing world as well as
+a new one:
+
+- It governs *writes* only. `load_chunk` sniffs zstd's magic number off
+  the front of each file, so a single world can hold a mix of compressed
+  and uncompressed chunks and reads correctly either way. (The two can't
+  be confused: an uncompressed chunk starts with a little-endian column
+  count, and zstd's magic would mean more columns than the `u32` key-id
+  space can hold.)
+- Flipping it rewrites nothing on its own -- each existing file is
+  re-encoded the next time its chunk is written.
+- It is deliberately *not* stored in `world.txt`. Unlike
+  `axes`/`world_dim`/`chunk_dim`, it isn't part of a world's fixed shape,
+  so nothing about it has to stay constant for a world's lifetime.
+
+`kblockdbserver` exposes it as the `compression` key in its config file
+-- see the [server documentation](kblockdbserver.md#compression).
 
 ## `Chunk`'s two per-cell costs, and which one is fixed
 

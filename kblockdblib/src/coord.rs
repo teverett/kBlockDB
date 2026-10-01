@@ -18,7 +18,7 @@ const INLINE_AXES: usize = 8;
 /// `get`/`set`/`remove` call, every step of a region iteration...), which
 /// measurably slowed things down. This is a small hand-rolled stand-in for
 /// what a `smallvec` crate would give you, consistent with the project's
-/// zero-dependency stance.
+/// preference for not taking on a dependency it doesn't have to.
 ///
 /// `Deref`/`DerefMut` to `[i32]` mean it behaves like a slice everywhere
 /// else in the crate: indexing, slicing, `.iter()`, `.len()`, and so on all

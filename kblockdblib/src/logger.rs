@@ -2,7 +2,9 @@
 //! `kblockdblib.log` in the current working directory.
 //!
 //! Kept hand-rolled (no `log`/`env_logger`/`chrono` crate) for the same
-//! reason the rest of this project is: zero external dependencies. It's a
+//! reason the rest of this project is: `kblockdblib` takes on no
+//! dependency it doesn't have to (`zstd`, for the optional `compression`
+//! flag, is the single exception). It's a
 //! single append-mode file handle behind a mutex, three severity levels,
 //! and a UTC timestamp computed from `SystemTime` with a small, well-known
 //! days-since-epoch -> calendar-date algorithm.

@@ -1,6 +1,7 @@
 //! A small hand-rolled counting semaphore (`std::sync::Mutex` +
 //! `Condvar` -- `std` never shipped a general-purpose one, and pulling in
-//! a crate just for this would break `kblockdblib`'s zero-dependency stance).
+//! a crate just for this would mean a dependency `kblockdblib` doesn't
+//! have to take on).
 //!
 //! `World` uses this to cap how much real concurrent filesystem work
 //! (`with_chunk`'s `create_dir_all`/file I/O) is in flight at once -- see
