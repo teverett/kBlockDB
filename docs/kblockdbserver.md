@@ -4,7 +4,7 @@
 
 ```sh
 cargo build --release
-cargo run -p kblockdbserver -- --data-dir ./data --http-addr 127.0.0.1:8080
+cargo run -p kblockdbserver -- --data-dir ./data --http-port 8080
 ```
 
 A default `kblockdbserver.toml` (admin/`changeme`, see below) is checked in at
@@ -21,12 +21,24 @@ kblockdbserver listening on http://127.0.0.1:8080
   stats API     http://127.0.0.1:8080/rest/stats
 ```
 
-These are built from the address the listener *actually* bound, not the
-one requested, so `--http-addr 127.0.0.1:0` prints the real port the OS
-picked rather than a useless `:0`. A wildcard bind (`0.0.0.0` or `[::]`)
-prints loopback instead, since the wildcard address isn't itself
-reliably connectable while loopback is always one of the interfaces it
-just claimed.
+Only a **port** is configurable, never a bind host: the server always
+listens on `0.0.0.0`, every interface, so it's reachable at whatever
+address this host happens to have without anyone having to name that
+address up front -- which often isn't knowable in advance anyway (DHCP,
+containers, moving between networks). **This means the server is exposed
+to the network by default, so set a real `admin_password` before running
+it anywhere untrusted.**
+
+IPv4's wildcard rather than IPv6's `[::]`, even though the latter is
+dual-stack on Linux and macOS: FreeBSD defaults `net.inet6.ip6.v6only=1`,
+where an IPv6 wildcard listener accepts no IPv4 connections at all.
+Binding IPv4 behaves identically everywhere.
+
+The banner prints loopback rather than `0.0.0.0`, since the wildcard
+address isn't itself reliably connectable while loopback is always one
+of the interfaces it just claimed. It's built from the port the listener
+*actually* bound, so `--http-port 0` -- which asks the OS to pick a free
+one -- reports the real port rather than a useless `:0`.
 
 ```
 USAGE:
@@ -35,7 +47,7 @@ USAGE:
 OPTIONS:
     --config <path>                Config file (default: ./kblockdbserver.toml). Required --
                                     holds admin_password and, optionally, [[users]], plus
-                                    optional http_addr/binary_addr/data_dir/
+                                    optional http_port/binary_port/data_dir/
                                     max_concurrent_disk_ops/max_cached_chunks/compression
                                     and a [worldparameters] table (each overridden by the
                                     matching CLI flag below, if given; compression is
@@ -47,8 +59,9 @@ OPTIONS:
                                     (default: 32 -- see kblockdblib's chunking design;
                                     bigger means fewer/larger chunk files, smaller
                                     means the opposite trade)
-    --http-addr <host:port>        Address to listen on for the REST API (default: 127.0.0.1:8080)
-    --binary-addr <host:port>      Also listen on this address for the binary protocol
+    --http-port <port>             Port to listen on for the REST API (default: 8080).
+                                    Binds every interface; 0 asks the OS for a free port
+    --binary-port <port>           Also listen on this port for the binary protocol
                                     (see "Binary protocol" below); disabled unless given
     --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
                                     (default: 32 -- see kblockdblib's "Concurrency"
@@ -82,8 +95,8 @@ the server -- it's the only place credentials can come from (never a CLI
 flag, so they don't end up in shell history or `ps` output):
 
 ```toml
-http_addr = "127.0.0.1:8080" # optional; same defaults/precedence as the CLI flags
-binary_addr = "127.0.0.1:8081" # optional; disabled unless given (see "Binary protocol" below)
+http_port = 8080             # optional; same defaults/precedence as the CLI flags
+binary_port = 8081           # optional; disabled unless given (see "Binary protocol" below)
 data_dir = "./data"          # optional
 max_concurrent_disk_ops = 32 # optional
 max_cached_chunks = 100000   # optional
@@ -452,8 +465,8 @@ and semantics, just without HTTP/JSON's per-call overhead (see the
 that overhead is worth caring about in the first place: on a cache-hit
 `get`, roughly three-quarters of the total call time measured there was
 HTTP/transport, not the actual work). Disabled by default -- enable it
-with `--binary-addr <host:port>` (or `binary_addr` in the config file)
-alongside the REST API's own `--http-addr`; both can run at once, against
+with `--binary-port <port>` (or `binary_port` in the config file)
+alongside the REST API's own `--http-port`; both can run at once, against
 the same `World`.
 
 Authentication here is per-*connection*, not per-request the way HTTP
@@ -494,7 +507,7 @@ respective runtimes.
 - `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
   opens the world, starts the server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
-  (http_addr/binary_addr/data_dir/max_concurrent_disk_ops/max_cached_chunks/
+  (http_port/binary_port/data_dir/max_concurrent_disk_ops/max_cached_chunks/
   compression, hostname,
   admin_password, `[[users]]`, and a `[worldparameters]` table for
   axes/world_dim/chunk_size) and its validation.

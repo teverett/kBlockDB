@@ -22,10 +22,9 @@ struct ManagedServer {
 }
 
 impl ManagedServer {
-    fn spawn(kblockdbserver_bin: &Path, data_dir: &Path, http_addr: &str) -> ManagedServer {
+    fn spawn(kblockdbserver_bin: &Path, data_dir: &Path, http_port: u16) -> ManagedServer {
         let config_path = std::env::temp_dir().join(format!(
-            "kblockdbcli-test-kblockdbserver-config-{}.toml",
-            http_addr.replace(':', "-")
+            "kblockdbcli-test-kblockdbserver-config-{http_port}.toml"
         ));
         std::fs::write(
             &config_path,
@@ -41,8 +40,8 @@ impl ManagedServer {
         let child = Command::new(kblockdbserver_bin)
             .arg("--data-dir")
             .arg(data_dir)
-            .arg("--http-addr")
-            .arg(http_addr)
+            .arg("--http-port")
+            .arg(http_port.to_string())
             .arg("--config")
             .arg(&config_path)
             .stdout(Stdio::null())
@@ -50,7 +49,8 @@ impl ManagedServer {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", kblockdbserver_bin.display()));
 
-        let url = format!("http://{http_addr}");
+        // The server binds every interface; connect over loopback.
+        let url = format!("http://127.0.0.1:{http_port}");
         wait_until_ready(&url);
         ManagedServer {
             child,
@@ -112,8 +112,8 @@ fn find_bin(name: &str) -> PathBuf {
 
 static NEXT_PORT: AtomicU64 = AtomicU64::new(19_180);
 
-fn next_port() -> u64 {
-    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+fn next_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed) as u16
 }
 
 fn temp_data_dir(tag: &str) -> PathBuf {
@@ -146,11 +146,7 @@ fn test_fixture(tag: &str) -> Option<(ManagedServer, PathBuf, PathBuf)> {
     }
 
     let dir = temp_data_dir(tag);
-    let server = ManagedServer::spawn(
-        &kblockdbserver_bin,
-        &dir,
-        &format!("127.0.0.1:{}", next_port()),
-    );
+    let server = ManagedServer::spawn(&kblockdbserver_bin, &dir, next_port());
     Some((server, dir, kblockdbcli_bin))
 }
 

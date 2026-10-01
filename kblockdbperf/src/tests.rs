@@ -15,8 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static NEXT_PORT: AtomicU64 = AtomicU64::new(19_080);
 
-fn next_port() -> u64 {
-    NEXT_PORT.fetch_add(1, Ordering::Relaxed)
+fn next_port() -> u16 {
+    NEXT_PORT.fetch_add(1, Ordering::Relaxed) as u16
 }
 
 const TEST_ADMIN_PASSWORD: &str = "kblockdbperf-test-admin-password";
@@ -45,13 +45,13 @@ async fn spawn_test_server(dir: &std::path::Path) -> Option<ManagedServer> {
         );
         return None;
     }
-    let binary_addr = format!("127.0.0.1:{}", next_port());
+    let binary_port = next_port();
     Some(
         ManagedServer::spawn(
             &bin,
             dir,
-            &format!("127.0.0.1:{}", next_port()),
-            Some(&binary_addr),
+            next_port(),
+            Some(binary_port),
             TEST_ADMIN_PASSWORD,
         )
         .await,

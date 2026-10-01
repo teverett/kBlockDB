@@ -17,8 +17,8 @@ Install the package from the repository:
 python3 -m pip install ./client/python
 ```
 
-The server's binary listener must be enabled with `--binary-addr` or the
-`binary_addr` configuration setting. See the
+The server's binary listener must be enabled with `--binary-port` or the
+`binary_port` configuration setting. See the
 [server documentation](kblockdbserver.md#binary-protocol).
 
 ## Usage

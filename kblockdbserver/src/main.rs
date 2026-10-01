@@ -14,7 +14,30 @@ mod value_json;
 
 use config::Config;
 use state::AppState;
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
+
+/// The REST API's port when neither `--http-port` nor the config file
+/// says otherwise.
+const DEFAULT_HTTP_PORT: u16 = 8080;
+
+/// Where to listen for a given port.
+///
+/// Only the port is configurable: the server always binds every
+/// interface, so it's reachable at whichever address this host happens
+/// to have without anyone naming that address up front -- which often
+/// isn't knowable in advance anyway (DHCP, containers, moving between
+/// networks).
+///
+/// `0.0.0.0` rather than the IPv6 `[::]`, even though the latter is
+/// dual-stack on Linux and macOS and would cover both families at once:
+/// FreeBSD ships `net.inet6.ip6.v6only=1` by default, where an IPv6
+/// wildcard listener accepts *no* IPv4 connections at all. Binding IPv4
+/// behaves the same everywhere, which matters more here than IPv6 reach
+/// does.
+fn bind_addr(port: u16) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::UNSPECIFIED, port))
+}
 
 /// Only the flags a caller explicitly passed are `Some` here -- final
 /// values are resolved in `main` as `args.field.or(config.field).unwrap_or(default)`,
@@ -27,8 +50,8 @@ struct Args {
     axes: Option<usize>,
     world_dim: Option<u32>,
     chunk_size: Option<u32>,
-    http_addr: Option<String>,
-    binary_addr: Option<String>,
+    http_port: Option<u16>,
+    binary_port: Option<u16>,
     max_concurrent_disk_ops: Option<usize>,
     max_cached_chunks: Option<usize>,
 }
@@ -39,8 +62,8 @@ fn parse_args() -> Args {
     let mut axes = None;
     let mut world_dim = None;
     let mut chunk_size = None;
-    let mut http_addr = None;
-    let mut binary_addr = None;
+    let mut http_port = None;
+    let mut binary_port = None;
     let mut max_concurrent_disk_ops = None;
     let mut max_cached_chunks = None;
 
@@ -79,8 +102,8 @@ fn parse_args() -> Args {
                         }),
                 )
             }
-            "--http-addr" => http_addr = Some(expect_value(&mut args, "--http-addr")),
-            "--binary-addr" => binary_addr = Some(expect_value(&mut args, "--binary-addr")),
+            "--http-port" => http_port = Some(expect_port(&mut args, "--http-port")),
+            "--binary-port" => binary_port = Some(expect_port(&mut args, "--binary-port")),
             "--max-concurrent-disk-ops" => {
                 max_concurrent_disk_ops = Some(
                     expect_value(&mut args, "--max-concurrent-disk-ops")
@@ -119,11 +142,23 @@ fn parse_args() -> Args {
         axes,
         world_dim,
         chunk_size,
-        http_addr,
-        binary_addr,
+        http_port,
+        binary_port,
         max_concurrent_disk_ops,
         max_cached_chunks,
     }
+}
+
+/// Like `expect_value`, but for a port number.
+///
+/// `0` is allowed and meaningful -- it asks the OS to pick a free port,
+/// which the startup banner then reports, so a throwaway instance doesn't
+/// have to guess at what's free.
+fn expect_port(args: &mut impl Iterator<Item = String>, flag: &str) -> u16 {
+    expect_value(args, flag).parse().unwrap_or_else(|_| {
+        eprintln!("{flag} must be a port number between 0 and 65535");
+        std::process::exit(1);
+    })
 }
 
 fn expect_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
@@ -140,12 +175,12 @@ fn print_help() {
          OPTIONS:\n    \
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
          holds admin_password and, optionally, [[users]], plus optional\n                          \
-         http_addr/binary_addr/data_dir/max_concurrent_disk_ops/\n                          \
+         http_port/binary_port/data_dir/max_concurrent_disk_ops/\n                          \
          max_cached_chunks/compression and a [worldparameters] table (each\n                          \
          overridden by the matching CLI flag below, if given; compression\n                          \
          is config-file-only). Example:\n                          \
          \n                          \
-         http_addr = \"127.0.0.1:8080\"\n                          \
+         http_port = 8080\n                          \
          data_dir = \"./data\"\n                          \
          admin_password = \"change-me\"\n                          \
          compression = false\n                          \
@@ -166,10 +201,12 @@ fn print_help() {
          bigger chunk means fewer, larger chunk files, so more\n                          \
          bytes rewritten per single-cell write but less filesystem\n                          \
          metadata overhead; measure the right value for yours)\n    \
-         --http-addr <host:port>\n                          \
-         Address to listen on for the REST API (default: 127.0.0.1:8080)\n    \
-         --binary-addr <host:port>\n                          \
-         Also listen on this address for the binary protocol (see\n                          \
+         --http-port <port>   Port to listen on for the REST API (default: {}).\n                          \
+         Binds every interface, so the server is reachable at any\n                          \
+         of this host's addresses -- set admin_password before\n                          \
+         running it somewhere untrusted. 0 asks the OS for a free\n                          \
+         port, which the startup banner then reports.\n    \
+         --binary-port <port> Also listen on this port for the binary protocol (see\n                          \
          wire.rs and the README's \"Binary protocol\" section) --\n                          \
          disabled unless given; same World, same accounts as the\n                          \
          REST API, just without HTTP/JSON overhead\n    \
@@ -202,6 +239,7 @@ fn print_help() {
         kblockdblib::AXES,
         kblockdblib::WORLD_DIM,
         kblockdblib::DEFAULT_CHUNK_DIM,
+        DEFAULT_HTTP_PORT,
         kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS,
         kblockdblib::DEFAULT_MAX_CACHED_CHUNKS
     );
@@ -235,11 +273,12 @@ async fn main() {
         .chunk_size
         .or(config.worldparameters.chunk_size)
         .unwrap_or(kblockdblib::DEFAULT_CHUNK_DIM);
-    let http_addr = args
-        .http_addr
-        .or_else(|| config.http_addr.clone())
-        .unwrap_or_else(|| "127.0.0.1:8080".to_string());
-    let binary_addr = args.binary_addr.or_else(|| config.binary_addr.clone());
+    let http_addr = bind_addr(
+        args.http_port
+            .or(config.http_port)
+            .unwrap_or(DEFAULT_HTTP_PORT),
+    );
+    let binary_addr = args.binary_port.or(config.binary_port).map(bind_addr);
     let max_concurrent_disk_ops = args
         .max_concurrent_disk_ops
         .or(config.max_concurrent_disk_ops);
@@ -284,7 +323,14 @@ async fn main() {
                 eprintln!("failed to bind binary protocol address {binary_addr}: {e}");
                 std::process::exit(1);
             });
-        println!("kblockdbserver binary protocol listening on {binary_addr}");
+        // Same bound-address-over-requested reasoning as the HTTP
+        // banner below, and the same wildcard-to-loopback rewrite -- the
+        // point of printing it is that it can be connected to.
+        let shown = binary_listener
+            .local_addr()
+            .map(reachable_addr)
+            .unwrap_or_else(|_| reachable_addr(binary_addr));
+        println!("kblockdbserver binary protocol listening on {shown}");
         let binary_state = state.clone();
         tokio::spawn(async move {
             binary_server::serve(binary_listener, binary_state).await;
@@ -300,12 +346,12 @@ async fn main() {
             std::process::exit(1);
         });
     // Prefer the address the listener actually bound over the one asked
-    // for: `--http-addr host:0` picks a real port only at bind time, so
-    // the requested string would print a useless `:0`.
+    // for: `--http-port 0` picks a real port only at bind time, so the
+    // requested one would print a useless `:0`.
     let base = listener
         .local_addr()
         .map(base_url)
-        .unwrap_or_else(|_| format!("http://{http_addr}"));
+        .unwrap_or_else(|_| base_url(http_addr));
     println!("kblockdbserver listening on {base}");
     println!("  data browser  {base}/");
     println!("  health API    {base}/rest/health");
@@ -320,27 +366,33 @@ async fn main() {
         });
 }
 
-/// The browsable base URL for an address the server is listening on.
+/// An address a listener is bound to, rewritten into one a client can
+/// actually connect to.
 ///
 /// A wildcard bind (`0.0.0.0` / `[::]`) means "every interface on this
-/// host", which is not itself an address anything can connect to --
-/// pasting `http://0.0.0.0:8080` into a browser works on some platforms
-/// and not others. Print loopback instead, which is always one of the
-/// interfaces a wildcard bind just claimed, so the URL is accurate and
-/// actually clickable.
-fn base_url(addr: std::net::SocketAddr) -> String {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+/// host", which is not itself a connectable address -- pasting
+/// `http://0.0.0.0:8080` into a browser works on some platforms and not
+/// others. Report loopback instead, which is always one of the
+/// interfaces a wildcard bind just claimed, so what's printed is both
+/// accurate and directly usable. Concrete addresses pass through
+/// untouched.
+fn reachable_addr(addr: SocketAddr) -> SocketAddr {
+    use std::net::{IpAddr, Ipv6Addr};
 
-    let ip = addr.ip();
-    if !ip.is_unspecified() {
-        // `SocketAddr`'s Display already brackets IPv6 for URLs.
-        return format!("http://{addr}");
+    if !addr.ip().is_unspecified() {
+        return addr;
     }
-    let loopback = match ip {
+    let loopback = match addr.ip() {
         IpAddr::V4(_) => IpAddr::V4(Ipv4Addr::LOCALHOST),
         IpAddr::V6(_) => IpAddr::V6(Ipv6Addr::LOCALHOST),
     };
-    format!("http://{}", SocketAddr::new(loopback, addr.port()))
+    SocketAddr::new(loopback, addr.port())
+}
+
+/// The browsable base URL for an address the server is listening on.
+fn base_url(addr: SocketAddr) -> String {
+    // `SocketAddr`'s Display already brackets IPv6 for URLs.
+    format!("http://{}", reachable_addr(addr))
 }
 
 async fn shutdown_signal() {

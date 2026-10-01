@@ -1585,6 +1585,23 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
 }
 
 #[test]
+fn bind_addr_listens_on_every_interface() {
+    // Only a port is configurable, so this is what makes the server
+    // reachable at whatever address the host happens to have.
+    let addr = crate::bind_addr(8080);
+    assert!(addr.ip().is_unspecified(), "{addr} isn't a wildcard bind");
+    assert_eq!(addr.port(), 8080);
+    // IPv4 specifically: an IPv6 wildcard doesn't accept IPv4 on
+    // FreeBSD, where net.inet6.ip6.v6only defaults to 1.
+    assert!(addr.is_ipv4(), "{addr} should be an IPv4 wildcard");
+}
+
+#[test]
+fn bind_addr_passes_port_zero_through_for_the_os_to_choose() {
+    assert_eq!(crate::bind_addr(0).port(), 0);
+}
+
+#[test]
 fn base_url_keeps_a_concrete_bind_address_as_is() {
     assert_eq!(
         crate::base_url("127.0.0.1:8080".parse().unwrap()),

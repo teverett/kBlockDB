@@ -19,27 +19,25 @@ pub struct ManagedServer {
 
 impl ManagedServer {
     /// Spawns `kblockdbserver_bin` against `data_dir`, listening on
-    /// `http_addr` (and, if `binary_addr` is given, also on that address
+    /// `http_port` (and, if `binary_port` is given, also on that port
     /// for the binary protocol -- see `binary_client.rs`), and waits
     /// (polling `/health`) for it to come up before returning.
     ///
     /// kblockdbserver requires a config file with an `admin_password` (its REST
     /// API needs HTTP Basic Auth on everything but `/health`), so this
-    /// writes a minimal one -- named after `http_addr` so two test runs'
+    /// writes a minimal one -- named after `http_port` so two test runs'
     /// concurrently spawned instances never collide on the same path --
     /// and points `--config` at it. Callers authenticate as
     /// `admin`/`admin_password` (see `Client`/`BinaryClient`).
     pub async fn spawn(
         kblockdbserver_bin: &Path,
         data_dir: &Path,
-        http_addr: &str,
-        binary_addr: Option<&str>,
+        http_port: u16,
+        binary_port: Option<u16>,
         admin_password: &str,
     ) -> ManagedServer {
-        let config_path = std::env::temp_dir().join(format!(
-            "kblockdbserver-config-{}.toml",
-            http_addr.replace(':', "-")
-        ));
+        let config_path =
+            std::env::temp_dir().join(format!("kblockdbserver-config-{http_port}.toml"));
         std::fs::write(
             &config_path,
             format!("admin_password = {admin_password:?}\n"),
@@ -55,12 +53,12 @@ impl ManagedServer {
         command
             .arg("--data-dir")
             .arg(data_dir)
-            .arg("--http-addr")
-            .arg(http_addr)
+            .arg("--http-port")
+            .arg(http_port.to_string())
             .arg("--config")
             .arg(&config_path);
-        if let Some(binary_addr) = binary_addr {
-            command.arg("--binary-addr").arg(binary_addr);
+        if let Some(binary_port) = binary_port {
+            command.arg("--binary-port").arg(binary_port.to_string());
         }
         let child = command
             .stdout(Stdio::null())
@@ -68,13 +66,14 @@ impl ManagedServer {
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", kblockdbserver_bin.display()));
 
-        let url = format!("http://{http_addr}");
+        // The server binds every interface; reach it over loopback.
+        let url = format!("http://127.0.0.1:{http_port}");
         wait_until_ready(&url).await;
         ManagedServer {
             child,
             config_path,
             url,
-            binary_addr: binary_addr.map(str::to_string),
+            binary_addr: binary_port.map(|p| format!("127.0.0.1:{p}")),
         }
     }
 }

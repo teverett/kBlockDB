@@ -16,7 +16,13 @@ struct Args {
     url: Option<String>,
     kblockdbserver_bin: Option<PathBuf>,
     port: u16,
+    /// Where to find an *existing* server's binary protocol -- only
+    /// meaningful with `--url`. The spawned-instance equivalent is
+    /// `binary_port`: a bind port and a connect address aren't the same
+    /// thing, and one flag serving both made it ambiguous which was
+    /// being given.
     binary_addr: Option<String>,
+    binary_port: Option<u16>,
     concurrency: Vec<usize>,
     ops_per_client: usize,
     cells: usize,
@@ -35,6 +41,7 @@ impl Default for Args {
             url: None,
             kblockdbserver_bin: None,
             port: 18_080,
+            binary_port: None,
             binary_addr: None,
             concurrency: vec![1, 8, 32, 128],
             ops_per_client: 50,
@@ -74,6 +81,7 @@ fn parse_args() -> Args {
             }
             "--port" => args.port = expect_parsed(&mut it, "--port"),
             "--binary-addr" => args.binary_addr = Some(expect_value(&mut it, "--binary-addr")),
+            "--binary-port" => args.binary_port = Some(expect_parsed(&mut it, "--binary-port")),
             "--concurrency" => args.concurrency = expect_list(&mut it, "--concurrency"),
             "--ops-per-client" => args.ops_per_client = expect_parsed(&mut it, "--ops-per-client"),
             "--cells" => args.cells = expect_parsed(&mut it, "--cells"),
@@ -153,9 +161,11 @@ fn print_help() {
          --port <n>               Port for the spawned instance (default: {})\n    \
          --binary-addr <host:port>\n                              \
          With --url, the target's binary protocol address -- binary_*\n                              \
-         scenarios are skipped if not given. Without --url, overrides\n                              \
-         the spawned instance's binary protocol address (default:\n                              \
-         127.0.0.1:<port + 1>) -- a spawned instance always has one.\n    \
+         scenarios are skipped if not given. Ignored when spawning an\n                              \
+         instance; use --binary-port for that.\n    \
+         --binary-port <n>        Binary protocol port for the spawned instance (default:\n                              \
+         <port + 1>) -- a spawned instance always has one. Ignored\n                              \
+         with --url.\n    \
          --concurrency <list>     Comma-separated concurrency levels (default: {})\n    \
          --ops-per-client <n>     Ops each concurrent client runs per level (default: {})\n    \
          --cells <n>              Cells for sequential single-cell scenarios (default: {})\n    \
@@ -270,16 +280,12 @@ async fn main() {
             .clone()
             .unwrap_or_else(|| format!("kblockdbperf-{}", rand_suffix()));
 
-        let http_addr = format!("127.0.0.1:{}", args.port);
-        let spawned_binary_addr = args
-            .binary_addr
-            .clone()
-            .unwrap_or_else(|| format!("127.0.0.1:{}", args.port + 1));
+        let binary_port = args.binary_port.unwrap_or(args.port + 1);
         let server = ManagedServer::spawn(
             &bin,
             &data_dir,
-            &http_addr,
-            Some(&spawned_binary_addr),
+            args.port,
+            Some(binary_port),
             &admin_password,
         )
         .await;
@@ -333,8 +339,8 @@ async fn main() {
                     // silently producing an incomplete report.
                     eprintln!(
                         "a binary_* scenario was requested, but there's no binary protocol \
-                         target -- pass --binary-addr (required alongside --url; optional, \
-                         to override the default, when spawning an instance)"
+                         target -- pass --binary-addr alongside --url (when spawning an \
+                         instance one always exists; --binary-port overrides its port)"
                     );
                     std::process::exit(1);
                 }

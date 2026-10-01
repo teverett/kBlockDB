@@ -27,10 +27,10 @@ pub struct UserConfig {
 /// world's shape (see `kblockdblib::params::WorldParams`) -- meaningless,
 /// and ignored, when reopening an existing one (`World::open` reads the
 /// real shape back from `world.txt` instead; see `main.rs`). Grouped under
-/// their own table, rather than flat keys on `Config` like `http_addr`/
+/// their own table, rather than flat keys on `Config` like `http_port`/
 /// `data_dir`, because the three only ever make sense together -- a config
 /// setting one without the others is a different kind of setting than one
-/// setting only `binary_addr`, say.
+/// setting only `binary_port`, say.
 ///
 /// The field name `worldparameters` (one word, not `world_parameters`) is
 /// deliberate: it's the literal TOML table name below, and `serde` matches
@@ -47,10 +47,17 @@ pub struct WorldParametersConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
+    /// The port the REST API listens on. There's deliberately no way to
+    /// configure the bind *host*: the server always binds every
+    /// interface (see `main.rs`), so the only question left is which
+    /// port.
     #[serde(default)]
-    pub http_addr: Option<String>,
+    pub http_port: Option<u16>,
+    /// The port the binary protocol listens on. Unlike `http_port` this
+    /// has no default -- the binary protocol stays off unless a port is
+    /// named.
     #[serde(default)]
-    pub binary_addr: Option<String>,
+    pub binary_port: Option<u16>,
     #[serde(default)]
     pub data_dir: Option<String>,
     #[serde(default)]
@@ -155,7 +162,8 @@ mod tests {
     fn parses_a_minimal_config() {
         let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
         assert_eq!(config.admin_password, "secret");
-        assert!(config.http_addr.is_none());
+        assert!(config.http_port.is_none());
+        assert!(config.binary_port.is_none());
         assert!(config.users.is_empty());
         assert!(config.worldparameters.axes.is_none());
         assert!(config.worldparameters.world_dim.is_none());
@@ -166,8 +174,8 @@ mod tests {
     fn parses_every_field() {
         let config = Config::from_toml_str(
             r#"
-            http_addr = "0.0.0.0:9090"
-            binary_addr = "0.0.0.0:9091"
+            http_port = 9090
+            binary_port = 9091
             data_dir = "/var/lib/kblockdblib"
             max_concurrent_disk_ops = 16
             max_cached_chunks = 5000
@@ -188,8 +196,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.http_addr.as_deref(), Some("0.0.0.0:9090"));
-        assert_eq!(config.binary_addr.as_deref(), Some("0.0.0.0:9091"));
+        assert_eq!(config.http_port, Some(9090));
+        assert_eq!(config.binary_port, Some(9091));
         assert_eq!(config.data_dir.as_deref(), Some("/var/lib/kblockdblib"));
         assert_eq!(config.worldparameters.axes, Some(4));
         assert_eq!(config.worldparameters.world_dim, Some(500));
@@ -336,6 +344,35 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("compression"), "{err}");
+    }
+
+    #[test]
+    fn a_port_above_the_u16_range_is_rejected() {
+        // Caught by the type, not by `validate` -- worth a test anyway so
+        // the error stays a config error rather than becoming a panic or
+        // a silently truncated port.
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            http_port = 70000
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("http_port"), "{err}");
+    }
+
+    #[test]
+    fn a_port_written_as_a_string_is_rejected() {
+        // `http_port = "8080"` is the shape someone migrating from the
+        // old `http_addr` string key would most likely write.
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            http_port = "8080"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("http_port"), "{err}");
     }
 
     #[test]

@@ -27,10 +27,11 @@ generated instance's password too (e.g. to `curl` it mid-run); otherwise
 it's a random one-off.
 
 A spawned instance always has its binary protocol enabled too (default
-`127.0.0.1:<port + 1>`, overridable with `--binary-addr`), so the
+port `<port + 1>`, overridable with `--binary-port`), so the
 `binary_*` scenarios always have something to run against. Against an
 existing instance (`--url`), pass `--binary-addr <host:port>` to point at
-its binary listener as well -- without it, `binary_*` scenarios are
+its binary listener as well -- a connect address, which is why it's
+separate from `--binary-port`'s bind port -- without it, `binary_*` scenarios are
 skipped (or, if explicitly requested with `--scenario`, kblockdbperf exits
 with an error rather than silently produce an incomplete report).
 

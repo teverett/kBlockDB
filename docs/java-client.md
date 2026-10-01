@@ -21,8 +21,8 @@ mvn -f client/java/pom.xml package
 The resulting dependency-free jar is written to
 `client/java/target/kblockdb-client-0.2.0.jar`.
 
-The server's binary listener must be enabled with `--binary-addr` or the
-`binary_addr` configuration setting. See the
+The server's binary listener must be enabled with `--binary-port` or the
+`binary_port` configuration setting. See the
 [server documentation](kblockdbserver.md#binary-protocol).
 
 ## Usage

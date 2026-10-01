@@ -53,7 +53,7 @@ jobs:
           cat > "$RUNNER_TEMP/kblockdbserver_ci_config.toml" <<'EOF'
           admin_password = "ci-smoke-test-password"
           EOF
-          ./target/debug/kblockdbserver --data-dir "$RUNNER_TEMP/kblockdbserver_ci_data" --http-addr 127.0.0.1:8099 \
+          ./target/debug/kblockdbserver --data-dir "$RUNNER_TEMP/kblockdbserver_ci_data" --http-port 8099 \
             --config "$RUNNER_TEMP/kblockdbserver_ci_config.toml" &
           server_pid=$!
 

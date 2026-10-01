@@ -3,9 +3,11 @@
 #
 # admin_password/the [[users]] entry are placeholders for local development
 # only. Change them (and don't commit your real ones) before running this
-# anywhere reachable by anyone you don't trust with access to the world.
-http_addr = "127.0.0.1:8080"
-binary_addr = "127.0.0.1:8081"
+# anywhere reachable by anyone you don't trust with access to the world --
+# the server listens on every interface, so that includes anyone who can
+# reach this host on the ports below.
+http_port = 8080
+binary_port = 8081
 data_dir = "data"
 max_concurrent_disk_ops = 32
 admin_password = "changeme"
