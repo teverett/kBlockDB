@@ -398,7 +398,9 @@ fn build_columns(pair: Pair<Rule>) -> Columns {
             Rule::aggregate_list => {
                 Columns::Aggregates(inner.into_inner().map(build_aggregate_call).collect())
             }
-            other => unreachable!("columns can only contain column_list/aggregate_list, got {other:?}"),
+            other => {
+                unreachable!("columns can only contain column_list/aggregate_list, got {other:?}")
+            }
         },
     }
 }
@@ -569,7 +571,9 @@ fn build_meta_field(pair: Pair<Rule>) -> MetaField {
         Rule::kw_created => MetaField::Created,
         Rule::kw_updated => MetaField::Updated,
         Rule::kw_version => MetaField::Version,
-        other => unreachable!("meta can only contain kw_created/kw_updated/kw_version, got {other:?}"),
+        other => {
+            unreachable!("meta can only contain kw_created/kw_updated/kw_version, got {other:?}")
+        }
     }
 }
 
@@ -744,12 +748,10 @@ pub fn aggregate(aggregates: &[Aggregate], cells: &[&CellEntry]) -> Vec<Aggregat
                         Some(values.iter().sum::<f64>() / values.len() as f64)
                     }
                 }
-                Aggregate::Max(key) => numeric_values(cells, key).fold(None, |max, n| {
-                    Some(max.map_or(n, |max: f64| max.max(n)))
-                }),
-                Aggregate::Min(key) => numeric_values(cells, key).fold(None, |min, n| {
-                    Some(min.map_or(n, |min: f64| min.min(n)))
-                }),
+                Aggregate::Max(key) => numeric_values(cells, key)
+                    .fold(None, |max, n| Some(max.map_or(n, |max: f64| max.max(n)))),
+                Aggregate::Min(key) => numeric_values(cells, key)
+                    .fold(None, |min, n| Some(min.map_or(n, |min: f64| min.min(n)))),
             },
         })
         .collect()
@@ -1493,10 +1495,8 @@ mod tests {
 
     #[test]
     fn parses_count_star_with_from_and_where() {
-        let stmt = parse(
-            "SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'",
-        )
-        .unwrap();
+        let stmt =
+            parse("SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'").unwrap();
         let Statement::Select {
             columns,
             range,
@@ -1545,10 +1545,22 @@ mod tests {
     #[test]
     fn aggregate_label_echoes_the_function_call() {
         assert_eq!(Aggregate::Count.label(), "count(*)");
-        assert_eq!(Aggregate::Sum("density".to_string()).label(), "sum(density)");
-        assert_eq!(Aggregate::Mean("density".to_string()).label(), "mean(density)");
-        assert_eq!(Aggregate::Max("density".to_string()).label(), "max(density)");
-        assert_eq!(Aggregate::Min("density".to_string()).label(), "min(density)");
+        assert_eq!(
+            Aggregate::Sum("density".to_string()).label(),
+            "sum(density)"
+        );
+        assert_eq!(
+            Aggregate::Mean("density".to_string()).label(),
+            "mean(density)"
+        );
+        assert_eq!(
+            Aggregate::Max("density".to_string()).label(),
+            "max(density)"
+        );
+        assert_eq!(
+            Aggregate::Min("density".to_string()).label(),
+            "min(density)"
+        );
     }
 
     #[test]
@@ -1643,13 +1655,17 @@ mod tests {
         let stmt = parse("SELECT * WHERE updated < now()").unwrap();
         let after = now_ms();
         let Statement::Select {
-            where_clause: Some(Expr::Compare(Operand::Meta(MetaField::Updated), CompareOp::Lt, Literal::Int(n))),
+            where_clause:
+                Some(Expr::Compare(Operand::Meta(MetaField::Updated), CompareOp::Lt, Literal::Int(n))),
             ..
         } = stmt
         else {
             panic!("expected Compare(Meta(Updated), Lt, Int), got something else");
         };
-        assert!((before..=after).contains(&n), "{n} not in [{before}, {after}]");
+        assert!(
+            (before..=after).contains(&n),
+            "{n} not in [{before}, {after}]"
+        );
     }
 
     #[test]
@@ -1696,7 +1712,10 @@ mod tests {
             panic!("expected a single int assignment, got {assignments:?}");
         };
         assert_eq!(key, "seen_at");
-        assert!((before..=after).contains(n), "{n} not in [{before}, {after}]");
+        assert!(
+            (before..=after).contains(n),
+            "{n} not in [{before}, {after}]"
+        );
     }
 
     #[test]

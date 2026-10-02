@@ -794,9 +794,9 @@ pub(crate) async fn execute_query(
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
                 .collect();
             match &columns {
-                query::Columns::Aggregates(aggregates) => {
-                    Ok(QueryResponse::aggregates(query::aggregate(aggregates, &matching)))
-                }
+                query::Columns::Aggregates(aggregates) => Ok(QueryResponse::aggregates(
+                    query::aggregate(aggregates, &matching),
+                )),
                 _ => {
                     let rows = matching.iter().map(|c| project_row(&columns, c)).collect();
                     Ok(QueryResponse::rows(rows))
