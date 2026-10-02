@@ -866,6 +866,36 @@ async fn the_root_data_browser_page_is_served_to_an_authenticated_user() {
 }
 
 #[tokio::test]
+async fn the_browser_stylesheet_requires_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/browser.css")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_browser_stylesheet_is_served_to_an_authenticated_user() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/browser.css")
+        .body(Body::empty())
+        .unwrap();
+    let resp = test_app()
+        .0
+        .oneshot(with_auth(req, TEST_ADMIN, TEST_ADMIN_PASSWORD))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.headers().get("content-type").unwrap(),
+        "text/css; charset=utf-8"
+    );
+}
+
+#[tokio::test]
 async fn rows_without_a_db_query_param_is_a_bad_request() {
     let req = with_auth(
         Request::builder()
@@ -1109,6 +1139,124 @@ async fn rows_reflects_a_removed_cell() {
 
     let (_, body) = send(app, get(&format!("/rows?db={DB}"))).await;
     assert_eq!(body["total_rows"], 0);
+}
+
+// --- /query (data browser) ---
+
+fn browser_query(db: &str, q: &str) -> Json {
+    json!({"db": db, "query": q})
+}
+
+#[tokio::test]
+async fn browser_query_requires_auth() {
+    let req = Request::builder()
+        .method("POST")
+        .uri("/query")
+        .header("content-type", "application/json")
+        .body(Body::from(browser_query(DB, "SELECT *").to_string()))
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn browser_query_runs_a_select() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app,
+        post(
+            "/query",
+            browser_query(DB, "SELECT * WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn browser_query_supports_aggregates() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(app, post("/query", browser_query(DB, "SELECT count(*)"))).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["aggregates"],
+        json!([{"label": "count(*)", "value": 1.0}])
+    );
+}
+
+#[tokio::test]
+async fn browser_query_rejects_a_set_even_for_a_full_access_account() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(
+        app,
+        post(
+            "/query",
+            browser_query(DB, "SET (material='stone') IN (0,0,0) TO (1,1,1)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body["error"].as_str().unwrap().contains("read-only"));
+}
+
+#[tokio::test]
+async fn browser_query_rejects_update_and_delete_too() {
+    let (app, _dir) = test_app();
+    for q in ["UPDATE (material='stone')", "DELETE"] {
+        let (status, _) = send(app.clone(), post("/query", browser_query(DB, q))).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "query was: {q}");
+    }
+}
+
+#[tokio::test]
+async fn browser_query_rejects_malformed_query_text() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, post("/query", browser_query(DB, "NOT VALID"))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn browser_query_404s_for_an_unknown_database() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, post("/query", browser_query("nope", "SELECT *"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_read_only_user_can_run_a_select_through_the_browser() {
+    let (app, _dir) = test_app();
+    let req = with_auth(
+        Request::builder()
+            .method("POST")
+            .uri("/query")
+            .header("content-type", "application/json")
+            .body(Body::from(browser_query(DB, "SELECT *").to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::OK);
 }
 
 // --- /rest/query ---

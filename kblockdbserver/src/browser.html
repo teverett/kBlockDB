@@ -4,107 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>kBlockDB browser</title>
-<style>
-  :root { color-scheme: light dark; }
-  body {
-    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-    margin: 2rem;
-    max-width: 60rem;
-  }
-  h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
-  p.sub { color: #666; margin-top: 0; }
-  .toolbar {
-    display: flex;
-    gap: 0.75rem;
-    align-items: center;
-    margin-bottom: 1rem;
-  }
-  #database {
-    padding: 0.5rem 0.6rem;
-    font-size: 1rem;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-    min-width: 10rem;
-  }
-  #search {
-    flex: 1;
-    box-sizing: border-box;
-    padding: 0.55rem 0.75rem;
-    font-size: 1rem;
-    border: 1px solid #ccc;
-    border-radius: 6px;
-  }
-  table { border-collapse: collapse; width: 100%; }
-  th, td {
-    border-bottom: 1px solid #ddd;
-    padding: 0.45rem 0.6rem;
-    text-align: left;
-    font-size: 0.9rem;
-  }
-  th { background: rgba(127, 127, 127, 0.08); }
-  tbody tr.row { cursor: pointer; }
-  tbody tr.row:hover { background: rgba(64, 128, 255, 0.08); }
-  td.coord { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  .pager {
-    display: flex;
-    align-items: center;
-    gap: 0.75rem;
-    margin-top: 1rem;
-  }
-  .pager button {
-    padding: 0.35rem 0.8rem;
-    cursor: pointer;
-  }
-  .pager button:disabled { cursor: default; opacity: 0.5; }
-  .muted { color: #666; font-size: 0.9rem; }
-  .empty { color: #666; padding: 1rem 0; }
-
-  #modal-backdrop {
-    display: none;
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.45);
-    align-items: flex-start;
-    justify-content: center;
-    padding-top: 4rem;
-  }
-  #modal-backdrop.open { display: flex; }
-  #modal {
-    background: Canvas;
-    color: CanvasText;
-    border-radius: 8px;
-    padding: 1.25rem 1.5rem 1.5rem;
-    width: 90%;
-    max-width: 42rem;
-    max-height: 75vh;
-    overflow: auto;
-    box-shadow: 0 10px 40px rgba(0, 0, 0, 0.3);
-  }
-  #modal-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-  }
-  #modal-title { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
-  #modal-close {
-    border: none;
-    background: none;
-    font-size: 1.4rem;
-    line-height: 1;
-    cursor: pointer;
-    color: inherit;
-  }
-  code {
-    background: rgba(127, 127, 127, 0.15);
-    padding: 0.05rem 0.35rem;
-    border-radius: 4px;
-    font-size: 0.85em;
-  }
-</style>
+<link rel="stylesheet" href="browser.css">
 </head>
 <body>
   <h1>kBlockDB</h1>
   <p class="sub">Every populated cell in the selected database, sorted ascending by coordinate. Click a row for its full keys and values.</p>
+
+  <div class="query-bar">
+    <input id="query" type="text" placeholder="SELECT * WHERE material = 'stone'  (read-only -- SELECT only)" autocomplete="off" spellcheck="false">
+    <button id="run-query" type="button">Run</button>
+  </div>
+  <div id="query-status" class="muted"></div>
 
   <div class="toolbar">
     <select id="database" aria-label="Database"></select>
@@ -155,13 +65,16 @@
 (function () {
   "use strict";
 
-  const state = { database: "", page: 1, pageSize: 50, search: "" };
+  const state = { database: "", page: 1, pageSize: 50, search: "", queryMode: false };
 
   const rowsBody = document.getElementById("rows");
   const emptyMsg = document.getElementById("empty");
   const pageInfo = document.getElementById("page-info");
   const databaseSelect = document.getElementById("database");
   const searchInput = document.getElementById("search");
+  const queryInput = document.getElementById("query");
+  const runQueryBtn = document.getElementById("run-query");
+  const queryStatus = document.getElementById("query-status");
   const prevBtn = document.getElementById("prev");
   const nextBtn = document.getElementById("next");
   const backdrop = document.getElementById("modal-backdrop");
@@ -224,12 +137,16 @@
       state.database = "";
       databaseSelect.disabled = true;
       searchInput.disabled = true;
+      queryInput.disabled = true;
+      runQueryBtn.disabled = true;
       renderError("No databases yet.");
       return;
     }
 
     databaseSelect.disabled = false;
     searchInput.disabled = false;
+    queryInput.disabled = false;
+    runQueryBtn.disabled = false;
     // Keep the previously selected database if it's still around (e.g.
     // after it's reloaded via the dropdown change handler below);
     // otherwise default to the first one.
@@ -239,6 +156,7 @@
   }
 
   async function load() {
+    state.queryMode = false;
     if (!state.database) {
       return;
     }
@@ -270,6 +188,95 @@
     }
     const data = await resp.json();
     renderRows(data);
+  }
+
+  function setQueryStatus(message, isError) {
+    queryStatus.textContent = message || "";
+    queryStatus.classList.toggle("error", !!isError);
+  }
+
+  // Runs whatever's in `#query` as a `SELECT` against `state.database` via
+  // `POST /query` (see `browser.rs`'s `run_select` -- SET/UPDATE/DELETE are
+  // refused server-side regardless of account, so this can never mutate
+  // anything). An empty box just exits query mode back to the normal
+  // paged/searchable listing.
+  async function runQuery() {
+    const text = queryInput.value.trim();
+    if (!text) {
+      state.queryMode = false;
+      setQueryStatus("");
+      load();
+      return;
+    }
+    if (!state.database) {
+      setQueryStatus("select a database first", true);
+      return;
+    }
+    setQueryStatus("running...");
+    let resp;
+    try {
+      resp = await fetch("query", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ db: state.database, query: text }),
+      });
+    } catch (e) {
+      setQueryStatus("request failed: " + e, true);
+      return;
+    }
+    let body = null;
+    try {
+      body = await resp.json();
+    } catch (e) {
+      // response wasn't JSON -- body stays null, resp.statusText below
+    }
+    if (!resp.ok) {
+      const detail = body && body.error ? body.error : resp.statusText;
+      setQueryStatus(resp.status + ": " + detail, true);
+      return;
+    }
+    state.queryMode = true;
+    renderQueryResult(body);
+  }
+
+  // `data` is a `kblockdbserver` `QueryResponse` -- `rows` for a plain
+  // `SELECT`, `aggregates` for `SELECT count(*)`/`sum(...)`/etc. Never
+  // `affected_cells`: that's only for SET/UPDATE/DELETE, which never reach
+  // this page at all (see `runQuery`).
+  function renderQueryResult(data) {
+    if (data.aggregates) {
+      renderAggregates(data.aggregates);
+      return;
+    }
+    const rows = (data.rows || []).map(function (row) {
+      const created = row.values.map(function (v) { return v.created_at_ms; });
+      const modified = row.values.map(function (v) { return v.modified_at_ms; });
+      return {
+        coord: row.coord,
+        key_count: row.values.length,
+        created_at_ms: created.length ? Math.min.apply(null, created) : 0,
+        modified_at_ms: modified.length ? Math.max.apply(null, modified) : 0,
+        keys: row.values,
+      };
+    });
+    renderRows({ rows: rows, total_rows: rows.length, page: 1, total_pages: 1 });
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+    setQueryStatus(rows.length + " row" + (rows.length === 1 ? "" : "s"));
+  }
+
+  function renderAggregates(aggregates) {
+    rowsBody.textContent = "";
+    emptyMsg.hidden = true;
+    pageInfo.textContent = "";
+    prevBtn.disabled = true;
+    nextBtn.disabled = true;
+    queryStatus.textContent = "";
+    queryStatus.classList.remove("error");
+    aggregates.forEach(function (a) {
+      const value = a.value === null || a.value === undefined ? "null" : String(a.value);
+      queryStatus.appendChild(cell("div", a.label + " = " + value));
+    });
   }
 
   function renderError(message) {
@@ -357,17 +364,29 @@
     state.page = 1;
     state.search = "";
     searchInput.value = "";
+    queryInput.value = "";
+    setQueryStatus("");
     load();
   });
 
   let searchTimer = null;
   searchInput.addEventListener("input", function () {
+    queryInput.value = "";
+    setQueryStatus("");
     clearTimeout(searchTimer);
     searchTimer = setTimeout(function () {
       state.search = searchInput.value;
       state.page = 1;
       load();
     }, 250);
+  });
+
+  runQueryBtn.addEventListener("click", runQuery);
+  queryInput.addEventListener("keydown", function (e) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      runQuery();
+    }
   });
 
   prevBtn.addEventListener("click", function () {

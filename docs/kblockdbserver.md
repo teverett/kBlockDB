@@ -447,8 +447,9 @@ curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
 ## Data browser
 
 `GET /` (note: *not* under `/rest`) serves one small self-contained
-HTML/JS page with a database dropdown (populated from `GET
-/rest/databases`, called directly by the page's own JS) and a table
+HTML/JS page (styled by `GET /browser.css`, its own file rather than
+inlined) with a query box, a database dropdown (populated from `GET
+/rest/databases`, called directly by the page's own JS), and a table
 listing every populated cell in whichever database is selected, one row
 per cell, sorted ascending by coordinate, with a search bar and paging
 controls. Switching the dropdown reloads the table against the newly
@@ -457,11 +458,26 @@ row opens a modal with that cell's full keys, values, and metadata
 (`created_at_ms`/`modified_at_ms`/`version` per key -- see "REST API"
 above). It's read-only (there's no way to edit anything from here) and
 requires the same HTTP Basic Auth as the REST API -- a `read_only` account
-can browse same as any other, since it's all `GET`. The browser's own
-credential prompt (triggered by a `401`) is what a plain HTML page gets
-for free from the browser itself; the page's own JS never handles a
-password. If no databases exist yet, the dropdown is empty and the page
-says so instead of trying to list rows for nothing.
+can browse same as any other, since it's all `GET` (the query box's own
+`POST /query`, below, is the one exception, and it's read-only by a
+different means). The browser's own credential prompt (triggered by a
+`401`) is what a plain HTML page gets for free from the browser itself;
+the page's own JS never handles a password. If no databases exist yet,
+the dropdown (and the query box) is disabled and the page says so instead
+of trying to list rows for nothing.
+
+The query box above the dropdown runs a real [`SELECT`](query-language.md)
+against the selected database via `POST /query` (body
+`{"db": "<name>", "query": "<text>"}`), replacing the table with its
+result -- a plain `SELECT`'s rows (reusing the same row/modal rendering
+as the normal listing) or an aggregate `SELECT`'s `count`/`sum`/`mean`/
+`max`/`min` results (shown as `label = value` lines instead). `SET`/
+`UPDATE`/`DELETE` are refused with a `403` here *unconditionally* --
+unlike `POST /rest/db/{db}/query`, a full-access account gets no
+exception, since this page's whole premise is that there's no way to
+edit anything from here. Clearing the box (or editing the search box,
+which implicitly cancels query mode) goes back to the normal paged
+listing.
 
 `GET /rows?db={name}&page=&page_size=&search=` is the JSON endpoint the
 page's JS calls (`db` is required -- no default, matching the rest of the
@@ -521,13 +537,19 @@ the frame/request/response byte layout.
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
   plus the `basic_auth` security scheme those annotations reference.
 - `kblockdbserver/src/browser.rs`    -- the data browser (see "Data
-  browser" above): `GET /` (the one page) and `GET /rows?db={name}` (its
-  JSON backend, built on `kblockdblib::World::list_cells`).
+  browser" above): `GET /` (the page), `GET /browser.css` (its
+  stylesheet), `GET /rows?db={name}` (the listing's JSON backend, built
+  on `kblockdblib::World::list_cells`), and `POST /query` (the query
+  box's JSON backend, reusing `routes::execute_query` but refusing
+  `SET`/`UPDATE`/`DELETE` unconditionally).
 - `kblockdbserver/src/browser.html`  -- the browser page's self-contained
-  HTML/CSS/JS, embedded into the binary via `include_str!` (no external
-  scripts/styles, no build step) -- its database dropdown calls `GET
-  /rest/databases` directly rather than this crate duplicating that
-  listing logic in a second place.
+  HTML/JS, embedded into the binary via `include_str!` (no build step) --
+  its database dropdown calls `GET /rest/databases` directly rather than
+  this crate duplicating that listing logic in a second place.
+- `kblockdbserver/src/browser.css`   -- the browser page's styling, also
+  `include_str!`-embedded and served at `GET /browser.css`, kept in its
+  own file rather than inlined so it reads and edits like an ordinary
+  stylesheet.
 - `kblockdbserver/src/state.rs`      -- `AppState` (the configured accounts)
   and `Databases` (every database this process manages, each an
   independent `kblockdblib::World` opened lazily on first touch and cached

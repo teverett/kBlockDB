@@ -21,33 +21,63 @@
 //! than cached. That's the right trade-off for a small-to-moderate database
 //! browsed occasionally, not for one with millions of populated cells
 //! polled repeatedly -- see `list_cells`'s own doc comment.
+//!
+//! `POST /query` backs the query box above the toolbar: it reuses
+//! `routes::execute_query` (the same evaluator `POST /rest/db/{db}/query`
+//! runs), but refuses `SET`/`UPDATE`/`DELETE` unconditionally -- even for a
+//! full-access account -- since this page's whole premise is that there's
+//! no way to edit anything from here (see `run_select`).
+//!
+//! `browser.css` (served at `GET /browser.css`) is this page's styling,
+//! kept in its own file rather than inlined in `browser.html` so it reads
+//! and edits like an ordinary stylesheet.
 
 use crate::auth::require_auth;
 use crate::error::ApiError;
-use crate::state::AppState;
+use crate::state::{Account, AppState};
 use crate::value_json::ValueJson;
 use axum::extract::{Query, State};
+use axum::http::header;
 use axum::middleware;
 use axum::response::Html;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use kblockdblib::{CellEntry, Value};
 use serde::{Deserialize, Serialize};
 
 const PAGE_HTML: &str = include_str!("browser.html");
+const PAGE_CSS: &str = include_str!("browser.css");
 
 /// A `Router<AppState>`, not yet given its state -- merged into
 /// `routes::router`'s own router before that calls `.with_state`, same
 /// pattern as `routes.rs`'s own `protected` sub-router.
 pub fn router(state: AppState) -> Router<AppState> {
-    Router::new()
+    let protected = Router::new()
         .route("/", get(page))
+        .route("/browser.css", get(css))
         .route("/rows", get(rows))
-        .route_layer(middleware::from_fn_with_state(state, require_auth))
+        .route_layer(middleware::from_fn_with_state(state, require_auth));
+
+    // Not under `protected`: `require_auth`'s read_only check is purely by
+    // HTTP method (any non-`GET` is a write), but this is a `POST` that's
+    // never a write -- `run_select` enforces its own "SELECT only, no
+    // exceptions" rule after parsing, the same reason `routes.rs`'s own
+    // `/db/{db}/query` needs its own auth check instead of `require_auth`'s
+    // (see that module's doc comment).
+    let query_route = Router::new().route("/query", post(run_select));
+
+    protected.merge(query_route)
 }
 
 async fn page() -> Html<&'static str> {
     Html(PAGE_HTML)
+}
+
+async fn css() -> impl axum::response::IntoResponse {
+    (
+        [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
+        PAGE_CSS,
+    )
 }
 
 fn default_page() -> usize {
@@ -157,6 +187,59 @@ async fn rows(
         total_pages,
         rows,
     }))
+}
+
+#[derive(Deserialize)]
+struct QueryBody {
+    db: String,
+    query: String,
+}
+
+/// Runs a `SELECT` from the browser's own query box, reusing
+/// `routes::execute_query` -- but unlike `POST /rest/db/{db}/query`,
+/// `SET`/`UPDATE`/`DELETE` are refused unconditionally here, regardless
+/// of the account's own `read_only` flag: this module's whole premise is
+/// "there's no way to edit anything from here" (see this module's doc
+/// comment), so a write must never reach `execute_query` through this
+/// path even for a full-access account. The `read_only: true` synthetic
+/// `Account` passed to `execute_query` is belt-and-suspenders -- its own
+/// `stmt.is_write() && account.read_only` check would also catch it if
+/// the `is_write` check just below this were ever accidentally removed.
+///
+/// Authenticates itself (`account_from_headers`, not the `require_auth`
+/// middleware `router`'s other routes use) for the same reason
+/// `routes.rs`'s own query handler does: `require_auth`'s read_only check
+/// is purely by HTTP method, and this is a `POST` that's never actually a
+/// write, so a read-only account must not be blocked from it by method
+/// alone (see `routes.rs`'s doc comment).
+async fn run_select(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<QueryBody>,
+) -> axum::response::Response {
+    use axum::response::IntoResponse;
+
+    if crate::auth::account_from_headers(&headers, &state).is_none() {
+        return crate::auth::unauthorized_response();
+    }
+    let stmt = match kblockdbquery::parse(&body.query) {
+        Ok(stmt) => stmt,
+        Err(e) => return ApiError::BadRequest(format!("invalid query: {e}")).into_response(),
+    };
+    if stmt.is_write() {
+        return ApiError::Forbidden(
+            "the data browser is read-only -- only SELECT is allowed here".to_string(),
+        )
+        .into_response();
+    }
+    let read_only_account = Account {
+        password: String::new(),
+        read_only: true,
+    };
+    match crate::routes::execute_query(&state, &body.db, &read_only_account, &body.query).await {
+        Ok(resp) => Json(resp).into_response(),
+        Err(e) => e.into_response(),
+    }
 }
 
 /// Whether `cell` matches `search` (already trimmed/lowercased) against its
