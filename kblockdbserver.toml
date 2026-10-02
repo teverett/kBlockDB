@@ -31,8 +31,8 @@ password = "changeme"
 # replicate this server's local writes to one or more peers. cluster_secret
 # must be set (and match every peer's own) for either direction of the peer
 # link to work; change it from this placeholder before using this for real.
-# peer_port = 8082
-# cluster_secret = "changeme"
+peer_port = 8082
+cluster_secret = "changeme"
 #
 # [[peers]]
 # address = "10.0.0.2:8082"
