@@ -1,0 +1,23 @@
+[package]
+name = "kblockdbcluster"
+version = "0.1.0"
+edition = "2021"
+
+# Server-to-server replication as a standalone crate: the peer wire
+# protocol, the in-process publish point every local write feeds, the
+# connecting side of a peer link, and the accepting side -- generic over
+# how an embedder actually applies a change (see `server::ReplicationSink`),
+# so this crate knows nothing about kblockdbserver's `AppState`/`World`/
+# accounts. kblockdbserver (a separate crate in this workspace) is the one
+# embedder today: it implements `ReplicationSink` for its own `AppState`
+# and wires this crate's `client::run`/`server::serve` into its own config
+# and startup. See docs/clustering.md at the repository root for the
+# feature as a whole.
+
+[lib]
+name = "kblockdbcluster"
+path = "src/lib.rs"
+
+[dependencies]
+kblockdblib = { path = "../kblockdblib" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

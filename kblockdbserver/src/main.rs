@@ -1,6 +1,7 @@
 mod auth;
 mod binary_server;
 mod browser;
+mod cluster;
 mod config;
 mod coords;
 mod error;
@@ -19,6 +20,14 @@ use std::path::PathBuf;
 /// The REST API's port when neither `--http-port` nor the config file
 /// says otherwise.
 const DEFAULT_HTTP_PORT: u16 = 8080;
+
+/// The peer-replication protocol's port when clustering is enabled (see
+/// `config::Config::cluster_secret`) but neither `--peer-port` nor the
+/// config file names one -- unlike `binary_port`, which stays off
+/// entirely with no default, clustering being *on* already implies a
+/// peer listener is wanted, so this one has a default the way
+/// `http_port` does.
+const DEFAULT_PEER_PORT: u16 = 8082;
 
 /// Where to listen for a given port.
 ///
@@ -51,6 +60,7 @@ struct Args {
     chunk_size: Option<u32>,
     http_port: Option<u16>,
     binary_port: Option<u16>,
+    peer_port: Option<u16>,
     max_concurrent_disk_ops: Option<usize>,
     max_cached_chunks: Option<usize>,
 }
@@ -63,6 +73,7 @@ fn parse_args() -> Args {
     let mut chunk_size = None;
     let mut http_port = None;
     let mut binary_port = None;
+    let mut peer_port = None;
     let mut max_concurrent_disk_ops = None;
     let mut max_cached_chunks = None;
 
@@ -103,6 +114,7 @@ fn parse_args() -> Args {
             }
             "--http-port" => http_port = Some(expect_port(&mut args, "--http-port")),
             "--binary-port" => binary_port = Some(expect_port(&mut args, "--binary-port")),
+            "--peer-port" => peer_port = Some(expect_port(&mut args, "--peer-port")),
             "--max-concurrent-disk-ops" => {
                 max_concurrent_disk_ops = Some(
                     expect_value(&mut args, "--max-concurrent-disk-ops")
@@ -143,6 +155,7 @@ fn parse_args() -> Args {
         chunk_size,
         http_port,
         binary_port,
+        peer_port,
         max_concurrent_disk_ops,
         max_cached_chunks,
     }
@@ -216,6 +229,10 @@ fn print_help() {
          wire.rs and docs/binary-protocol.md) -- disabled unless given;\n                          \
          same databases, same accounts as the\n                          \
          REST API, just without HTTP/JSON overhead\n    \
+         --peer-port <port>   Port the peer-replication protocol listens on, when\n                          \
+         clustering is enabled (config file's cluster_secret -- see\n                          \
+         docs/clustering.md); default {} if cluster_secret is set but this\n                          \
+         isn't. Has no effect at all without cluster_secret\n    \
          --max-concurrent-disk-ops <n>\n                          \
          Cap on concurrent filesystem operations, applied to every\n                          \
          database (default: {}; see\n                          \
@@ -247,6 +264,7 @@ fn print_help() {
         kblockdblib::WORLD_DIM,
         kblockdblib::DEFAULT_CHUNK_DIM,
         DEFAULT_HTTP_PORT,
+        DEFAULT_PEER_PORT,
         kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS,
         kblockdblib::DEFAULT_MAX_CACHED_CHUNKS
     );
@@ -334,6 +352,57 @@ async fn main() {
         state = state.with_hostname(hostname);
     }
     println!("kblockdbserver: reporting hostname '{}'", state.hostname);
+
+    // Clustering is entirely opt-in: nothing in this block runs, and
+    // `state.replication` stays `None`, unless the config sets
+    // `cluster_secret` -- see `config::Config::validate`'s matching rule
+    // that `cluster_secret` is required whenever `[[peers]]` is non-empty
+    // (but not the other way around: a `cluster_secret` with no `peers`
+    // still starts a peer listener, just with nothing to connect out to --
+    // e.g. a node everyone else points at).
+    if let Some(cluster_secret) = config.cluster_secret.clone() {
+        let peer_addr = bind_addr(
+            args.peer_port
+                .or(config.peer_port)
+                .unwrap_or(DEFAULT_PEER_PORT),
+        );
+        let peer_listener = tokio::net::TcpListener::bind(&peer_addr)
+            .await
+            .unwrap_or_else(|e| {
+                eprintln!("failed to bind peer protocol address {peer_addr}: {e}");
+                std::process::exit(1);
+            });
+        let shown = peer_listener
+            .local_addr()
+            .map(reachable_addr)
+            .unwrap_or_else(|_| reachable_addr(peer_addr));
+        println!(
+            "kblockdbserver peer protocol listening on {shown} ({} peer(s) configured)",
+            config.peers.len()
+        );
+
+        let hub = kblockdbcluster::hub::ReplicationHub::new();
+        state = state
+            .with_replication(hub.clone())
+            .with_peers(config.peers.iter().map(|p| p.address.clone()).collect());
+
+        let peer_state = state.clone();
+        let peer_secret = cluster_secret.clone();
+        tokio::spawn(async move {
+            kblockdbcluster::server::serve(peer_listener, peer_state, peer_secret).await;
+        });
+
+        let server_id = state.hostname.to_string();
+        for peer in &config.peers {
+            let address = peer.address.clone();
+            let secret = cluster_secret.clone();
+            let server_id = server_id.clone();
+            let hub = hub.clone();
+            tokio::spawn(async move {
+                kblockdbcluster::client::run(address, secret, server_id, hub).await;
+            });
+        }
+    }
 
     if let Some(binary_addr) = binary_addr {
         let binary_listener = tokio::net::TcpListener::bind(&binary_addr)

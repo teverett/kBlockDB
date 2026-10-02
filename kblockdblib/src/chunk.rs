@@ -221,7 +221,15 @@ impl Chunk {
     /// caller (`World`) rather than read here, so this stays a pure
     /// function of its arguments -- deterministic and easy to test without
     /// depending on wall-clock time.
-    pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value, now_ms: u64) {
+    /// The presence/data half of a write -- creating the column on first
+    /// use in this chunk, then either overwriting or inserting `value` --
+    /// shared by `set` (which derives a fresh `CellMeta` from `now_ms`) and
+    /// `set_with_meta` (which applies a replicated write's `CellMeta`
+    /// verbatim). Returns whether the cell already held a value for this
+    /// key (so the caller knows whether to bump a version/keep
+    /// `created_at_ms` or start fresh) and its rank within the column, for
+    /// indexing `col.meta`.
+    fn store_value(&mut self, local_idx: usize, key_id: u32, value: Value) -> (bool, usize) {
         let presence_bytes = self.presence_bytes;
         let col = self.columns.entry(key_id).or_insert_with(|| Column {
             presence: Bitset::new(presence_bytes),
@@ -248,9 +256,6 @@ impl Chunk {
                      caller should have checked this against Schema first"
                 ),
             }
-            let meta = &mut col.meta[rank];
-            meta.modified_at_ms = now_ms;
-            meta.version += 1;
         } else {
             col.presence.set(local_idx, true);
             match (&mut col.data, value) {
@@ -263,14 +268,52 @@ impl Chunk {
                      caller should have checked this against Schema first"
                 ),
             }
-            col.meta.insert(
-                rank,
-                CellMeta {
-                    created_at_ms: now_ms,
-                    modified_at_ms: now_ms,
-                    version: 0,
-                },
-            );
+        }
+        (already_present, rank)
+    }
+
+    /// `now_ms` is milliseconds since the Unix epoch, supplied by the
+    /// caller (`World`) rather than read here, so this stays a pure
+    /// function of its arguments -- deterministic and easy to test without
+    /// depending on wall-clock time.
+    pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value, now_ms: u64) -> CellMeta {
+        let (already_present, rank) = self.store_value(local_idx, key_id, value);
+        let col = self
+            .columns
+            .get_mut(&key_id)
+            .expect("store_value just populated this column");
+        if already_present {
+            let meta = &mut col.meta[rank];
+            meta.modified_at_ms = now_ms;
+            meta.version += 1;
+            *meta
+        } else {
+            let meta = CellMeta {
+                created_at_ms: now_ms,
+                modified_at_ms: now_ms,
+                version: 0,
+            };
+            col.meta.insert(rank, meta);
+            meta
+        }
+    }
+
+    /// Like `set`, but applies `meta` verbatim instead of deriving one
+    /// from `now_ms` -- no version bump, no created/modified computation.
+    /// Used only to apply a replicated write with its origin's own
+    /// metadata (see `World::apply_replicated`), so the cluster converges
+    /// on the same `CellMeta` for a given write everywhere, not a new one
+    /// per node that received it.
+    pub fn set_with_meta(&mut self, local_idx: usize, key_id: u32, value: Value, meta: CellMeta) {
+        let (already_present, rank) = self.store_value(local_idx, key_id, value);
+        let col = self
+            .columns
+            .get_mut(&key_id)
+            .expect("store_value just populated this column");
+        if already_present {
+            col.meta[rank] = meta;
+        } else {
+            col.meta.insert(rank, meta);
         }
     }
 

@@ -242,11 +242,24 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Ok(db) => db.to_string(),
                 Err(response) => return response,
             };
+            let replication = state.replication.clone();
+            let (db2, coord2, key2, value2) =
+                (db.clone(), coord.clone(), key.clone(), value.clone());
             match state
                 .with_database(&db, move |w| w.set(&coord, &key, value))
                 .await
             {
-                Ok(()) => Response::Ok,
+                Ok(meta) => {
+                    kblockdbcluster::hub::publish_set(
+                        &replication,
+                        &db2,
+                        &coord2,
+                        &key2,
+                        value2,
+                        meta,
+                    );
+                    Response::Ok
+                }
                 Err(e) => response_from_error(e),
             }
         }
@@ -255,11 +268,23 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Ok(db) => db.to_string(),
                 Err(response) => return response,
             };
+            let replication = state.replication.clone();
+            let (db2, coord2, key2) = (db.clone(), coord.clone(), key.clone());
+            let modified_at_ms = kblockdbcluster::hub::now_ms();
             match state
                 .with_database(&db, move |w| w.remove(&coord, &key))
                 .await
             {
-                Ok(()) => Response::Ok,
+                Ok(()) => {
+                    kblockdbcluster::hub::publish_remove(
+                        &replication,
+                        &db2,
+                        &coord2,
+                        &key2,
+                        modified_at_ms,
+                    );
+                    Response::Ok
+                }
                 Err(e) => response_from_error(e),
             }
         }
@@ -317,11 +342,26 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Err(response) => return response,
             };
             let region = kblockdblib::Region::new(origin, extent);
+            let replication = state.replication.clone();
+            let (db2, region2, key2, values2) =
+                (db.clone(), region.clone(), key.clone(), values.clone());
             match state
                 .with_database(&db, move |w| w.set_region(&region, &key, &values))
                 .await
             {
-                Ok(()) => Response::Ok,
+                Ok(metas) => {
+                    for ((coord, value), meta) in region2.iter().zip(values2).zip(metas) {
+                        kblockdbcluster::hub::publish_set(
+                            &replication,
+                            &db2,
+                            &coord,
+                            &key2,
+                            value,
+                            meta,
+                        );
+                    }
+                    Response::Ok
+                }
                 Err(e) => response_from_error(e),
             }
         }
@@ -335,11 +375,25 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Err(response) => return response,
             };
             let region = kblockdblib::Region::new(origin, extent);
+            let replication = state.replication.clone();
+            let (db2, region2, key2) = (db.clone(), region.clone(), key.clone());
+            let modified_at_ms = kblockdbcluster::hub::now_ms();
             match state
                 .with_database(&db, move |w| w.remove_region(&region, &key))
                 .await
             {
-                Ok(()) => Response::Ok,
+                Ok(()) => {
+                    for coord in region2.iter() {
+                        kblockdbcluster::hub::publish_remove(
+                            &replication,
+                            &db2,
+                            &coord,
+                            &key2,
+                            modified_at_ms,
+                        );
+                    }
+                    Response::Ok
+                }
                 Err(e) => response_from_error(e),
             }
         }

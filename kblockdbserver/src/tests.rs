@@ -228,6 +228,26 @@ async fn health_reports_the_configured_hostname_override() {
     assert_eq!(body["hostname"], "db-1.example.com");
 }
 
+#[tokio::test]
+async fn health_reports_an_empty_peer_list_when_unclustered() {
+    let (status, body) = send(test_app().0, get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"], json!([]));
+}
+
+#[tokio::test]
+async fn health_reports_the_configured_peer_list() {
+    let (databases, _dir) = test_databases();
+    let state = AppState::new(databases, Arc::new(HashMap::new())).with_peers(vec![
+        "10.0.0.2:8082".to_string(),
+        "10.0.0.3:8082".to_string(),
+    ]);
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"], json!(["10.0.0.2:8082", "10.0.0.3:8082"]));
+}
+
 /// `/rest/health` is what a load balancer polls, so it must stay
 /// unauthenticated even though it now names the instance.
 #[tokio::test]

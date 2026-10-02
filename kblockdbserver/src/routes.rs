@@ -129,6 +129,10 @@ pub struct HealthResponse {
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
     timestamp: u64,
+    /// This instance's configured peer addresses (see `[[peers]]` in
+    /// `docs/clustering.md`) -- empty unless clustering is configured.
+    /// Just the configured list, not live connection status.
+    peers: Vec<String>,
 }
 
 #[utoipa::path(
@@ -146,6 +150,7 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         hostname: state.hostname.to_string(),
         database_count,
         timestamp: unix_timestamp(),
+        peers: (*state.peers).clone(),
     }))
 }
 
@@ -446,9 +451,11 @@ async fn set_cell(
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
     let value: kblockdblib::Value = body.into();
-    state
+    let (coord2, key2, value2) = (coord.clone(), key.clone(), value.clone());
+    let meta = state
         .with_database(&db, move |w| w.set(&coord, &key, value))
         .await?;
+    kblockdbcluster::hub::publish_set(&state.replication, &db, &coord2, &key2, value2, meta);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -475,9 +482,12 @@ async fn remove_cell(
     Path((db, coords, key)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
+    let (coord2, key2) = (coord.clone(), key.clone());
+    let modified_at_ms = kblockdbcluster::hub::now_ms();
     state
         .with_database(&db, move |w| w.remove(&coord, &key))
         .await?;
+    kblockdbcluster::hub::publish_remove(&state.replication, &db, &coord2, &key2, modified_at_ms);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -560,9 +570,13 @@ async fn set_region(
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
     let values: Vec<kblockdblib::Value> = body.values.into_iter().map(Into::into).collect();
-    state
+    let (region2, key2, values2) = (region.clone(), key.clone(), values.clone());
+    let metas = state
         .with_database(&db, move |w| w.set_region(&region, &key, &values))
         .await?;
+    for ((coord, value), meta) in region2.iter().zip(values2).zip(metas) {
+        kblockdbcluster::hub::publish_set(&state.replication, &db, &coord, &key2, value, meta);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -592,9 +606,20 @@ async fn remove_region(
     let origin = parse_coords(&origin)?;
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
+    let (region2, key2) = (region.clone(), key.clone());
+    let modified_at_ms = kblockdbcluster::hub::now_ms();
     state
         .with_database(&db, move |w| w.remove_region(&region, &key))
         .await?;
+    for coord in region2.iter() {
+        kblockdbcluster::hub::publish_remove(
+            &state.replication,
+            &db,
+            &coord,
+            &key2,
+            modified_at_ms,
+        );
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -828,16 +853,29 @@ pub(crate) async fn execute_query(
                 .map(|c| c.coord.to_vec())
                 .collect();
             let affected = matching.len();
-            state
+            let written: Vec<(Vec<i32>, String, kblockdblib::Value, kblockdblib::CellMeta)> = state
                 .with_database(db, move |w| {
+                    let mut written = Vec::new();
                     for coord in &matching {
                         for (key, literal) in &assignments {
-                            w.set(coord, key, literal.to_value())?;
+                            let value = literal.to_value();
+                            let meta = w.set(coord, key, value.clone())?;
+                            written.push((coord.clone(), key.clone(), value, meta));
                         }
                     }
-                    Ok(())
+                    Ok(written)
                 })
                 .await?;
+            for (coord, key, value, meta) in written {
+                kblockdbcluster::hub::publish_set(
+                    &state.replication,
+                    db,
+                    &coord,
+                    &key,
+                    value,
+                    meta,
+                );
+            }
             Ok(QueryResponse::affected(affected))
         }
         query::Statement::Delete {
@@ -858,9 +896,11 @@ pub(crate) async fn execute_query(
                 })
                 .collect();
             let affected = matching.len();
+            let modified_at_ms = kblockdbcluster::hub::now_ms();
+            let matching2 = matching.clone();
             state
                 .with_database(db, move |w| {
-                    for (coord, keys) in &matching {
+                    for (coord, keys) in &matching2 {
                         for key in keys {
                             w.remove(coord, key)?;
                         }
@@ -868,6 +908,17 @@ pub(crate) async fn execute_query(
                     Ok(())
                 })
                 .await?;
+            for (coord, keys) in &matching {
+                for key in keys {
+                    kblockdbcluster::hub::publish_remove(
+                        &state.replication,
+                        db,
+                        coord,
+                        key,
+                        modified_at_ms,
+                    );
+                }
+            }
             Ok(QueryResponse::affected(affected))
         }
     }
@@ -910,14 +961,29 @@ async fn execute_set(
             .into_iter()
             .map(|(key, literal)| (key, literal.to_value()))
             .collect();
-        state
+        let region2 = region.clone();
+        let values2 = values.clone();
+        let per_key_metas: Vec<Vec<kblockdblib::CellMeta>> = state
             .with_database(db, move |w| {
+                let mut per_key_metas = Vec::with_capacity(values.len());
                 for (key, value) in &values {
-                    w.set_region(&region, key, &vec![value.clone(); volume])?;
+                    per_key_metas.push(w.set_region(&region, key, &vec![value.clone(); volume])?);
                 }
-                Ok(())
+                Ok(per_key_metas)
             })
             .await?;
+        for ((key, value), metas) in values2.into_iter().zip(per_key_metas) {
+            for (coord, meta) in region2.iter().zip(metas) {
+                kblockdbcluster::hub::publish_set(
+                    &state.replication,
+                    db,
+                    &coord,
+                    &key,
+                    value.clone(),
+                    meta,
+                );
+            }
+        }
         return Ok(QueryResponse::affected(volume));
     };
 
@@ -943,16 +1009,22 @@ async fn execute_set(
         .collect();
 
     let affected = targets.len();
-    state
+    let written: Vec<(Vec<i32>, String, kblockdblib::Value, kblockdblib::CellMeta)> = state
         .with_database(db, move |w| {
+            let mut written = Vec::new();
             for coord in &targets {
                 for (key, literal) in &assignments {
-                    w.set(coord, key, literal.to_value())?;
+                    let value = literal.to_value();
+                    let meta = w.set(coord, key, value.clone())?;
+                    written.push((coord.clone(), key.clone(), value, meta));
                 }
             }
-            Ok(())
+            Ok(written)
         })
         .await?;
+    for (coord, key, value, meta) in written {
+        kblockdbcluster::hub::publish_set(&state.replication, db, &coord, &key, value, meta);
+    }
     Ok(QueryResponse::affected(affected))
 }
 

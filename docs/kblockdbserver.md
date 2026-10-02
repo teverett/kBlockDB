@@ -72,6 +72,10 @@ OPTIONS:
                                     Binds every interface; 0 asks the OS for a free port
     --binary-port <port>           Also listen on this port for the binary protocol
                                     (see docs/binary-protocol.md); disabled unless given
+    --peer-port <port>             Port the peer-replication protocol listens on, when
+                                    clustering is enabled (config file's cluster_secret --
+                                    see docs/clustering.md); default 8082 if
+                                    cluster_secret is set but this isn't
     --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
                                     (default: 32 -- see kblockdblib's "Concurrency"
                                     section; measure the right value for your
@@ -136,6 +140,14 @@ password = "alice-password"
 username = "viewer"
 password = "viewer-password"
 read_only = true              # optional, defaults to false
+
+# Clustering (see docs/clustering.md) -- optional; off entirely unless
+# cluster_secret is set.
+peer_port = 8082
+cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
+
+[[peers]]
+address = "10.0.0.2:8082"
 ```
 
 `admin_password` and each `[[users]]` entry are separate accounts.
@@ -249,7 +261,7 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600}` |
+| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -275,7 +287,10 @@ currently manages (same number `GET /rest/databases` would list) -- health
 is server-wide, not scoped to any one database, so it has no per-database
 shape to report the way the old single-world `/rest/health` once did; ask
 `GET /rest/db/{db}/stats` or a binary-protocol `Hello` for a specific
-database's shape.
+database's shape. `peers` lists this instance's configured `[[peers]]`
+addresses (see [clustering.md](clustering.md)) -- empty unless clustering
+is configured, and always just the configured list, not live
+connected/reconnecting status for each one.
 
 `/rest/db/{db}/stats` walks the on-disk chunk files under that database's
 directory and reports: `total_chunks` (chunk files currently on disk --
@@ -537,3 +552,16 @@ the frame/request/response byte layout.
 - `kblockdbserver/src/binary_server.rs` -- the binary protocol's TCP
   listener and per-connection handler, reusing the same `AppState` the
   REST API's handlers do.
+- `kblockdbserver/src/cluster.rs`    -- the only clustering-related code
+  that lives in this crate: implements `kblockdbcluster::server::
+  ReplicationSink` for `AppState` (applying an incoming change against
+  this server's actual `World`s, auto-creating an unseen database).
+  Everything else -- the peer wire format, the in-process publish hub,
+  the connecting and accepting sides of a peer link -- lives in the
+  separate [`kblockdbcluster`](clustering.md) crate, which this crate
+  depends on but which knows nothing about `AppState`/`World`/accounts in
+  return; see that crate's own doc comment for why the split is shaped
+  this way. `main.rs` wires `kblockdbcluster::server::serve`/
+  `kblockdbcluster::client::run` into this server's config and startup;
+  every write call site in `routes.rs`/`binary_server.rs` publishes
+  through `kblockdbcluster::hub::publish_set`/`publish_remove`.

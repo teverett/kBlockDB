@@ -20,6 +20,7 @@ path = "src/main.rs"
 [dependencies]
 kblockdblib = { path = "../kblockdblib" }
 kblockdbquery = { path = "../kblockdbquery" }
+kblockdbcluster = { path = "../kblockdbcluster" }
 axum = "0.8"
 axum-extra = { version = "0.12", features = ["typed-header"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "io-util"] }

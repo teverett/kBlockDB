@@ -266,6 +266,21 @@ pub struct AppState {
     /// What `/rest/health` (and the binary protocol's `Health`) reports as
     /// this instance's name -- see [`AppState::with_hostname`].
     pub hostname: Arc<str>,
+    /// `None` unless clustering is configured (a `cluster_secret` is set --
+    /// see `config::Config`) -- every write call site in `routes.rs`/
+    /// `binary_server.rs` publishes through this when it's `Some`, and is a
+    /// no-op otherwise, so an unclustered server behaves exactly as it did
+    /// before this field existed. See `kblockdbcluster::hub` and
+    /// `cluster.rs` (this server's `ReplicationSink` impl, which
+    /// `kblockdbcluster::server::serve` applies incoming changes through).
+    pub replication: Option<Arc<kblockdbcluster::hub::ReplicationHub>>,
+    /// The `address` of every configured `[[peers]]` entry -- empty
+    /// unless clustering is configured. Reported by `/rest/health` so a
+    /// caller can see this instance's cluster membership without reading
+    /// its config file. Just the configured list, not live connection
+    /// status: `kblockdbcluster::client::run` doesn't report its own
+    /// connected/reconnecting state back anywhere today.
+    pub peers: Arc<Vec<String>>,
     credentials: Arc<HashMap<String, Account>>,
 }
 
@@ -274,6 +289,8 @@ impl AppState {
         AppState {
             databases,
             hostname: Arc::from(os_hostname()),
+            replication: None,
+            peers: Arc::new(Vec::new()),
             credentials,
         }
     }
@@ -286,6 +303,22 @@ impl AppState {
     /// config key is the only caller.
     pub fn with_hostname(mut self, hostname: String) -> Self {
         self.hostname = Arc::from(hostname);
+        self
+    }
+
+    /// Enables replication -- called once at startup, only when the
+    /// config sets a `cluster_secret`. See this struct's `replication`
+    /// field doc comment.
+    pub fn with_replication(mut self, hub: Arc<kblockdbcluster::hub::ReplicationHub>) -> Self {
+        self.replication = Some(hub);
+        self
+    }
+
+    /// Records this instance's configured peer addresses, for
+    /// `/rest/health` to report. See this struct's `peers` field doc
+    /// comment.
+    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
+        self.peers = Arc::new(peers);
         self
     }
 

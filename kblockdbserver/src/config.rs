@@ -23,6 +23,15 @@ pub struct UserConfig {
     pub read_only: bool,
 }
 
+/// One `[[peers]]` entry: another `kblockdbserver` instance to replicate
+/// local writes to -- see `replication.rs`/`peer_client.rs`. `address` is
+/// a `host:port` pair naming that peer's *peer* port (its own `peer_port`
+/// config/`--peer-port` flag, not its HTTP or binary-protocol port).
+#[derive(Debug, Deserialize, Clone)]
+pub struct PeerConfig {
+    pub address: String,
+}
+
 /// The `[worldparameters]` table: the three numbers that fix a *new*
 /// world's shape (see `kblockdblib::params::WorldParams`) -- meaningless,
 /// and ignored, when reopening an existing one (`World::open` reads the
@@ -82,6 +91,20 @@ pub struct Config {
     pub admin_password: String,
     #[serde(default)]
     pub users: Vec<UserConfig>,
+    /// The port the peer-replication protocol listens on -- see
+    /// `peer_server.rs`. Like `binary_port`, has no default: clustering
+    /// stays off unless `cluster_secret` is also set (see `validate`).
+    #[serde(default)]
+    pub peer_port: Option<u16>,
+    /// Shared secret every peer connection (both directions) is checked
+    /// against -- see `peer_server.rs`'s `Hello` handling. Required (and
+    /// must be non-empty) if `peers` is non-empty; clustering is entirely
+    /// opt-in and disabled by default (no `peers`, no `cluster_secret`).
+    #[serde(default)]
+    pub cluster_secret: Option<String>,
+    /// Other servers to replicate local writes to -- see `replication.rs`.
+    #[serde(default)]
+    pub peers: Vec<PeerConfig>,
 }
 
 impl Config {
@@ -111,6 +134,16 @@ impl Config {
         }
         if self.hostname.as_deref().is_some_and(str::is_empty) {
             return Err("hostname must not be empty".to_string());
+        }
+        if !self.peers.is_empty() {
+            match self.cluster_secret.as_deref() {
+                None | Some("") => {
+                    return Err(
+                        "cluster_secret must be set (and non-empty) to use [[peers]]".to_string(),
+                    )
+                }
+                Some(_) => {}
+            }
         }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         seen.insert("admin");
@@ -423,6 +456,83 @@ mod tests {
         let creds = config.credentials();
         assert!(!creds.get("alice").unwrap().read_only);
         assert!(creds.get("bob").unwrap().read_only);
+    }
+
+    #[test]
+    fn peers_and_cluster_secret_default_to_empty_and_unset() {
+        let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
+        assert!(config.peers.is_empty());
+        assert_eq!(config.cluster_secret, None);
+        assert_eq!(config.peer_port, None);
+    }
+
+    #[test]
+    fn parses_peers_and_cluster_secret() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            peer_port = 8082
+            cluster_secret = "shh"
+
+            [[peers]]
+            address = "10.0.0.2:8082"
+
+            [[peers]]
+            address = "10.0.0.3:8082"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.peer_port, Some(8082));
+        assert_eq!(config.cluster_secret.as_deref(), Some("shh"));
+        assert_eq!(
+            config
+                .peers
+                .iter()
+                .map(|p| p.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["10.0.0.2:8082", "10.0.0.3:8082"]
+        );
+    }
+
+    #[test]
+    fn peers_without_a_cluster_secret_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            [[peers]]
+            address = "10.0.0.2:8082"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("cluster_secret"), "{err}");
+    }
+
+    #[test]
+    fn peers_with_an_empty_cluster_secret_is_rejected() {
+        let err = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            cluster_secret = ""
+            [[peers]]
+            address = "10.0.0.2:8082"
+            "#,
+        )
+        .unwrap_err();
+        assert!(err.contains("cluster_secret"), "{err}");
+    }
+
+    #[test]
+    fn a_cluster_secret_with_no_peers_is_fine() {
+        // Accepting connections without replicating to anyone is a valid
+        // (if unusual) setup -- e.g. a node everyone else points at.
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            cluster_secret = "shh"
+            "#,
+        )
+        .unwrap();
+        assert!(config.peers.is_empty());
     }
 
     #[test]

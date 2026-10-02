@@ -596,6 +596,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kblockdbcluster"
+version = "0.1.0"
+dependencies = [
+ "kblockdblib",
+ "tokio",
+]
+
+[[package]]
 name = "kblockdblib"
 version = "0.1.0"
 dependencies = [
@@ -630,6 +638,7 @@ dependencies = [
  "axum-extra",
  "hostname",
  "http-body-util",
+ "kblockdbcluster",
  "kblockdblib",
  "kblockdbquery",
  "serde",

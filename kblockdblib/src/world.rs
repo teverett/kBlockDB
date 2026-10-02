@@ -1027,7 +1027,11 @@ impl World {
         })
     }
 
-    pub fn set(&self, coord: &[i32], key: &str, value: Value) -> io::Result<()> {
+    /// Returns the `CellMeta` this write just produced -- callers that
+    /// replicate writes to peer servers (`kblockdbserver`) use this to
+    /// ship the exact metadata a peer should apply, rather than needing a
+    /// second lookup.
+    pub fn set(&self, coord: &[i32], key: &str, value: Value) -> io::Result<CellMeta> {
         // Validate the coordinate before interning `key`: a failed `set`
         // shouldn't have the side effect of permanently registering a new
         // key that was never actually written anywhere.
@@ -1038,6 +1042,72 @@ impl World {
         let key_id = self.schema().intern(key, value.value_type())?;
         let now_ms = now_ms();
         self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value, now_ms))
+    }
+
+    /// Applies a replicated write -- `value`/`meta` as reported by the
+    /// peer that originated it -- with last-write-wins conflict
+    /// resolution: if this cell/key already holds a value whose
+    /// `modified_at_ms` is greater than or equal to `meta.modified_at_ms`,
+    /// the incoming write is simply discarded (a tie keeps whatever is
+    /// already here -- an accepted, documented imprecision of
+    /// millisecond-resolution timestamps, not a correctness bug). Returns
+    /// whether the write was actually applied.
+    ///
+    /// Unlike `set`, this never derives its own timestamp/version --
+    /// `meta` is applied verbatim (see `Chunk::set_with_meta`) -- so every
+    /// node in a cluster converges on the exact same `CellMeta` for a
+    /// given logical write, not a new one per node that received it.
+    ///
+    /// The read-compare-write happens inside one `with_chunk_maybe_write`
+    /// closure so it's atomic with respect to any other write (local or
+    /// replicated) landing on the same chunk concurrently.
+    pub fn apply_replicated(
+        &self,
+        coord: &[i32],
+        key: &str,
+        value: Value,
+        meta: CellMeta,
+    ) -> io::Result<bool> {
+        let (ckey, local_idx) = self.split(coord)?;
+        let key_id = self.schema().intern(key, value.value_type())?;
+        self.with_chunk_maybe_write(&ckey, |chunk| {
+            let wins = match chunk.get_meta(local_idx, key_id) {
+                Some(existing) => meta.modified_at_ms > existing.modified_at_ms,
+                None => true,
+            };
+            if wins {
+                chunk.set_with_meta(local_idx, key_id, value, meta);
+            }
+            (wins, wins)
+        })
+    }
+
+    /// `apply_replicated`'s counterpart for a replicated removal: applies
+    /// last-write-wins the same way, comparing `modified_at_ms` against
+    /// whatever this cell/key currently holds (a cell with nothing set for
+    /// `key` is removed "for free" -- there's nothing to compare against,
+    /// so the remove always "wins" but has no effect either way). Returns
+    /// whether anything was actually removed.
+    pub fn apply_replicated_remove(
+        &self,
+        coord: &[i32],
+        key: &str,
+        modified_at_ms: u64,
+    ) -> io::Result<bool> {
+        let (ckey, local_idx) = self.split(coord)?;
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return Ok(false); // never interned anywhere: nothing to remove
+        };
+        self.with_chunk_maybe_write(&ckey, |chunk| {
+            let wins = match chunk.get_meta(local_idx, key_id) {
+                Some(existing) => modified_at_ms > existing.modified_at_ms,
+                None => false, // nothing set here -- no-op, not an error
+            };
+            if wins {
+                chunk.remove(local_idx, key_id);
+            }
+            (wins, wins)
+        })
     }
 
     pub fn remove(&self, coord: &[i32], key: &str) -> io::Result<()> {
@@ -1147,7 +1217,15 @@ impl World {
     /// comment) -- same error, same all-or-nothing guarantee. A no-op
     /// region (any axis's extent zero, so `values` must be empty too)
     /// doesn't even intern `key`.
-    pub fn set_region(&self, region: &Region, key: &str, values: &[Value]) -> io::Result<()> {
+    /// Returns each cell's resulting `CellMeta`, in the same `RegionIter`
+    /// order as `values`/`get_region`'s result -- same reasoning as
+    /// `set`'s own return value.
+    pub fn set_region(
+        &self,
+        region: &Region,
+        key: &str,
+        values: &[Value],
+    ) -> io::Result<Vec<CellMeta>> {
         self.check_region(region)?;
         let volume = region.volume() as usize;
         if values.len() != volume {
@@ -1160,7 +1238,7 @@ impl World {
             ));
         }
         if volume == 0 {
-            return Ok(());
+            return Ok(Vec::new());
         }
         let value_type = values[0].value_type();
         if let Some(bad) = values.iter().position(|v| v.value_type() != value_type) {
@@ -1176,17 +1254,25 @@ impl World {
         }
         let key_id = self.schema().intern(key, value_type)?;
         let now_ms = now_ms();
+        let mut metas = vec![
+            CellMeta {
+                created_at_ms: 0,
+                modified_at_ms: 0,
+                version: 0
+            };
+            volume
+        ];
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             self.with_chunk_write(&ckey, |chunk| {
                 for (i, local_idx) in cells {
-                    chunk.set(local_idx, key_id, values[i].clone(), now_ms);
+                    metas[i] = chunk.set(local_idx, key_id, values[i].clone(), now_ms);
                 }
             })?;
         }
         crate::logger::info(format!(
             "set region {region:?} key '{key}' from {volume} per-cell values"
         ));
-        Ok(())
+        Ok(metas)
     }
 
     /// Removes `key` from every cell in `region`, spanning chunks and
@@ -1756,6 +1842,170 @@ mod tests {
         let meta = w.get_meta(&c, "material").unwrap().unwrap();
         assert_eq!(meta.version, 0);
         assert_eq!(meta.created_at_ms, meta.modified_at_ms);
+    }
+
+    // --- apply_replicated / apply_replicated_remove ---
+
+    #[test]
+    fn apply_replicated_writes_a_fresh_cell_with_the_given_meta_verbatim() {
+        let dir = TempDir::new("replicated-fresh");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        let meta = CellMeta {
+            created_at_ms: 100,
+            modified_at_ms: 100,
+            version: 5,
+        };
+
+        let applied = w
+            .apply_replicated(&c, "material", Value::Str("stone".into()), meta)
+            .unwrap();
+        assert!(applied);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+        // Applied verbatim -- not re-derived the way a local `set` would
+        // (which would start a fresh cell at version 0).
+        assert_eq!(w.get_meta(&c, "material").unwrap(), Some(meta));
+    }
+
+    #[test]
+    fn apply_replicated_discards_a_write_older_than_what_is_already_here() {
+        let dir = TempDir::new("replicated-stale");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        let newer = CellMeta {
+            created_at_ms: 100,
+            modified_at_ms: 200,
+            version: 1,
+        };
+        w.apply_replicated(&c, "material", Value::Str("granite".into()), newer)
+            .unwrap();
+
+        let older = CellMeta {
+            created_at_ms: 50,
+            modified_at_ms: 150,
+            version: 9,
+        };
+        let applied = w
+            .apply_replicated(&c, "material", Value::Str("stone".into()), older)
+            .unwrap();
+
+        assert!(!applied);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("granite".into()))
+        );
+        assert_eq!(w.get_meta(&c, "material").unwrap(), Some(newer));
+    }
+
+    #[test]
+    fn apply_replicated_applies_a_write_newer_than_what_is_already_here() {
+        let dir = TempDir::new("replicated-newer-wins");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        let older = CellMeta {
+            created_at_ms: 50,
+            modified_at_ms: 100,
+            version: 0,
+        };
+        w.apply_replicated(&c, "material", Value::Str("stone".into()), older)
+            .unwrap();
+
+        let newer = CellMeta {
+            created_at_ms: 50,
+            modified_at_ms: 200,
+            version: 1,
+        };
+        let applied = w
+            .apply_replicated(&c, "material", Value::Str("granite".into()), newer)
+            .unwrap();
+
+        assert!(applied);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("granite".into()))
+        );
+    }
+
+    #[test]
+    fn apply_replicated_with_an_equal_timestamp_keeps_the_existing_value() {
+        let dir = TempDir::new("replicated-tie");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        let meta = CellMeta {
+            created_at_ms: 50,
+            modified_at_ms: 100,
+            version: 0,
+        };
+        w.apply_replicated(&c, "material", Value::Str("stone".into()), meta)
+            .unwrap();
+
+        let applied = w
+            .apply_replicated(&c, "material", Value::Str("granite".into()), meta)
+            .unwrap();
+
+        assert!(!applied);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+    }
+
+    #[test]
+    fn apply_replicated_remove_removes_a_cell_newer_than_what_is_already_here() {
+        let dir = TempDir::new("replicated-remove-wins");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.apply_replicated(
+            &c,
+            "material",
+            Value::Str("stone".into()),
+            CellMeta {
+                created_at_ms: 50,
+                modified_at_ms: 100,
+                version: 0,
+            },
+        )
+        .unwrap();
+
+        let applied = w.apply_replicated_remove(&c, "material", 200).unwrap();
+        assert!(applied);
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn apply_replicated_remove_ignores_a_removal_older_than_what_is_already_here() {
+        let dir = TempDir::new("replicated-remove-stale");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.apply_replicated(
+            &c,
+            "material",
+            Value::Str("stone".into()),
+            CellMeta {
+                created_at_ms: 50,
+                modified_at_ms: 200,
+                version: 0,
+            },
+        )
+        .unwrap();
+
+        let applied = w.apply_replicated_remove(&c, "material", 100).unwrap();
+        assert!(!applied);
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("stone".into()))
+        );
+    }
+
+    #[test]
+    fn apply_replicated_remove_of_a_never_set_key_is_a_harmless_noop() {
+        let dir = TempDir::new("replicated-remove-missing");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        assert!(!w.apply_replicated_remove(&c, "material", 100).unwrap());
     }
 
     #[test]
