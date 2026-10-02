@@ -276,11 +276,19 @@ pub struct AppState {
     pub replication: Option<Arc<kblockdbcluster::hub::ReplicationHub>>,
     /// The `address` of every configured `[[peers]]` entry -- empty
     /// unless clustering is configured. Reported by `/rest/health` so a
-    /// caller can see this instance's cluster membership without reading
-    /// its config file. Just the configured list, not live connection
-    /// status: `kblockdbcluster::client::run` doesn't report its own
-    /// connected/reconnecting state back anywhere today.
+    /// caller can see this instance's outbound cluster membership without
+    /// reading its config file. Just the configured list, not whether
+    /// `kblockdbcluster::client::run` has actually managed to connect to
+    /// each one.
     pub peers: Arc<Vec<String>>,
+    /// Who currently has a live *inbound* connection to this instance's
+    /// peer listener, by their own self-reported `server_id` -- `None`
+    /// unless clustering is configured, in which case it's always
+    /// `Some`, live-updated by `kblockdbcluster::server::serve` as peers
+    /// connect and disconnect. `/rest/health` reports this alongside
+    /// `peers` so a peer that dialed *into* this instance (and so isn't
+    /// necessarily in its own `[[peers]]` list) still shows up.
+    pub connected_peers: Option<kblockdbcluster::registry::PeerRegistry>,
     credentials: Arc<HashMap<String, Account>>,
 }
 
@@ -291,6 +299,7 @@ impl AppState {
             hostname: Arc::from(os_hostname()),
             replication: None,
             peers: Arc::new(Vec::new()),
+            connected_peers: None,
             credentials,
         }
     }
@@ -319,6 +328,15 @@ impl AppState {
     /// comment.
     pub fn with_peers(mut self, peers: Vec<String>) -> Self {
         self.peers = Arc::new(peers);
+        self
+    }
+
+    /// Enables reporting connected-peer status -- called once at startup,
+    /// only when the config sets a `cluster_secret`, with the same
+    /// `PeerRegistry` passed to `kblockdbcluster::server::serve`. See
+    /// this struct's `connected_peers` field doc comment.
+    pub fn with_peer_registry(mut self, registry: kblockdbcluster::registry::PeerRegistry) -> Self {
+        self.connected_peers = Some(registry);
         self
     }
 

@@ -52,9 +52,16 @@ locally-originated writes are published to the hub, so in a full mesh
 every node already has a direct connection to every other node and
 nothing needs multi-hop forwarding.
 
-`GET /rest/health` reports this instance's configured peer addresses as
-`"peers": [...]` (empty unless clustering is configured) -- just the
-configured list, not each one's live connected/reconnecting status.
+`GET /rest/health` reports this instance's cluster membership as
+`"peers": [...]` (empty unless clustering is configured): every
+configured `[[peers]]` address this instance dials *out* to, plus the
+`server_id` of every peer currently dialed *into* it -- so a server with
+no `[[peers]]` of its own, but that other nodes point at, still shows
+them once they connect. An inbound peer disappears from the list the
+instant its connection drops (see `kblockdbcluster::registry::
+PeerRegistry`) -- this is live connected status for the inbound half,
+but still just the configured (not live-verified) list for the outbound
+half.
 
 ## Crate split
 

@@ -129,9 +129,12 @@ pub struct HealthResponse {
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
     timestamp: u64,
-    /// This instance's configured peer addresses (see `[[peers]]` in
-    /// `docs/clustering.md`) -- empty unless clustering is configured.
-    /// Just the configured list, not live connection status.
+    /// This instance's cluster membership: every configured `[[peers]]`
+    /// address (see `docs/clustering.md`) this instance dials out to,
+    /// plus the `server_id` of every peer currently dialed *into* it
+    /// (deduplicated against the configured list, in case a configured
+    /// peer's `server_id` happens to equal its own address) -- empty
+    /// unless clustering is configured.
     peers: Vec<String>,
 }
 
@@ -145,12 +148,20 @@ pub struct HealthResponse {
 )]
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let database_count = state.list_databases().await?.len();
+    let mut peers = (*state.peers).clone();
+    if let Some(registry) = &state.connected_peers {
+        for server_id in registry.connected() {
+            if !peers.contains(&server_id) {
+                peers.push(server_id);
+            }
+        }
+    }
     Ok(Json(HealthResponse {
         status: "ok".to_string(),
         hostname: state.hostname.to_string(),
         database_count,
         timestamp: unix_timestamp(),
-        peers: (*state.peers).clone(),
+        peers,
     }))
 }
 

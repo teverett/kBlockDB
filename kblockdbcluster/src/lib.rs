@@ -25,9 +25,14 @@
 //! - `server` -- the accepting side: the peer protocol's TCP listener,
 //!   per-connection `Hello` authentication, and applying every incoming
 //!   `ChangeEntry` via a `ReplicationSink`.
+//! - `registry` -- `PeerRegistry`, which peers currently have a live
+//!   inbound connection to `server::serve` (by their own self-reported
+//!   `server_id`), for an embedder to report (e.g. from a health
+//!   endpoint).
 
 pub mod client;
 pub mod hub;
+pub mod registry;
 pub mod server;
 pub mod wire;
 

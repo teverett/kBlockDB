@@ -382,14 +382,17 @@ async fn main() {
         );
 
         let hub = kblockdbcluster::hub::ReplicationHub::new();
+        let peer_registry = kblockdbcluster::registry::PeerRegistry::new();
         state = state
             .with_replication(hub.clone())
-            .with_peers(config.peers.iter().map(|p| p.address.clone()).collect());
+            .with_peers(config.peers.iter().map(|p| p.address.clone()).collect())
+            .with_peer_registry(peer_registry.clone());
 
         let peer_state = state.clone();
         let peer_secret = cluster_secret.clone();
         tokio::spawn(async move {
-            kblockdbcluster::server::serve(peer_listener, peer_state, peer_secret).await;
+            kblockdbcluster::server::serve(peer_listener, peer_state, peer_secret, peer_registry)
+                .await;
         });
 
         let server_id = state.hostname.to_string();

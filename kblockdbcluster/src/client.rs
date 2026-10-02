@@ -143,6 +143,7 @@ mod tests {
             listener,
             sink.clone(),
             CLUSTER_SECRET.to_string(),
+            crate::registry::PeerRegistry::new(),
         ));
         (addr, sink)
     }

@@ -288,10 +288,12 @@ currently manages (same number `GET /rest/databases` would list) -- health
 is server-wide, not scoped to any one database, so it has no per-database
 shape to report the way the old single-world `/rest/health` once did; ask
 `GET /rest/db/{db}/stats` or a binary-protocol `Hello` for a specific
-database's shape. `peers` lists this instance's configured `[[peers]]`
-addresses (see [clustering.md](clustering.md)) -- empty unless clustering
-is configured, and always just the configured list, not live
-connected/reconnecting status for each one.
+database's shape. `peers` is this instance's cluster membership (see
+[clustering.md](clustering.md)) -- empty unless clustering is
+configured, otherwise its configured `[[peers]]` addresses plus the
+`server_id` of every peer currently connected *into* it, so a peer that
+dialed in without being listed in this instance's own `[[peers]]` still
+shows up.
 
 `/rest/db/{db}/stats` walks the on-disk chunk files under that database's
 directory and reports: `total_chunks` (chunk files currently on disk --

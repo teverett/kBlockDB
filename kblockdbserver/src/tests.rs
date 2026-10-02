@@ -248,6 +248,34 @@ async fn health_reports_the_configured_peer_list() {
     assert_eq!(body["peers"], json!(["10.0.0.2:8082", "10.0.0.3:8082"]));
 }
 
+#[tokio::test]
+async fn health_includes_a_peer_connected_into_this_instance() {
+    let (databases, _dir) = test_databases();
+    let registry = kblockdbcluster::registry::PeerRegistry::new();
+    let _connected = registry.track("node-b".to_string());
+    let state = AppState::new(databases, Arc::new(HashMap::new()))
+        .with_peers(vec!["10.0.0.2:8082".to_string()])
+        .with_peer_registry(registry);
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"], json!(["10.0.0.2:8082", "node-b"]));
+}
+
+#[tokio::test]
+async fn health_does_not_duplicate_a_connected_peer_already_in_the_configured_list() {
+    let (databases, _dir) = test_databases();
+    let registry = kblockdbcluster::registry::PeerRegistry::new();
+    let _connected = registry.track("10.0.0.2:8082".to_string());
+    let state = AppState::new(databases, Arc::new(HashMap::new()))
+        .with_peers(vec!["10.0.0.2:8082".to_string()])
+        .with_peer_registry(registry);
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"], json!(["10.0.0.2:8082"]));
+}
+
 /// `/rest/health` is what a load balancer polls, so it must stay
 /// unauthenticated even though it now names the instance.
 #[tokio::test]
