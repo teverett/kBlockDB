@@ -662,16 +662,34 @@ pub struct QueryRow {
     pub(crate) values: Vec<QueryKeyValue>,
 }
 
-/// `SELECT` populates `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE` populate
-/// `affected_cells` instead -- one statement, one endpoint, but a
-/// different result shape depending on which kind was sent (fields the
-/// statement kind doesn't produce are omitted, not null).
+/// One `count`/`sum`/`mean`/`max`/`min` result from a `SELECT` whose
+/// `<columns>` was an aggregate list rather than `*`/a key list -- see
+/// `kblockdbquery::AggregateResult`.
+#[derive(Serialize, ToSchema)]
+pub struct AggregateResponse {
+    /// Echoes the function call it was parsed from, e.g. `"sum(density)"`.
+    pub(crate) label: String,
+    /// `None` only for `mean`/`max`/`min` when no matching cell had a
+    /// numeric value for the key in question -- never an error, same
+    /// "doesn't apply" philosophy as the rest of this query language.
+    pub(crate) value: Option<f64>,
+}
+
+/// `SELECT *`/`SELECT <columns>` populates `total_rows`/`rows`; `SELECT
+/// count(*)`/`sum(...)`/... populates `aggregates` instead (one result
+/// summarizing every matching cell, not one row per cell);
+/// `SET`/`UPDATE`/`DELETE` populate `affected_cells` instead of either --
+/// one statement, one endpoint, but a different result shape depending on
+/// which kind was sent (fields the statement kind doesn't produce are
+/// omitted, not null).
 #[derive(Serialize, ToSchema)]
 pub struct QueryResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) total_rows: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) rows: Option<Vec<QueryRow>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) aggregates: Option<Vec<AggregateResponse>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) affected_cells: Option<usize>,
 }
@@ -681,6 +699,24 @@ impl QueryResponse {
         QueryResponse {
             total_rows: Some(rows.len()),
             rows: Some(rows),
+            aggregates: None,
+            affected_cells: None,
+        }
+    }
+
+    fn aggregates(results: Vec<query::AggregateResult>) -> Self {
+        QueryResponse {
+            total_rows: None,
+            rows: None,
+            aggregates: Some(
+                results
+                    .into_iter()
+                    .map(|r| AggregateResponse {
+                        label: r.label,
+                        value: r.value,
+                    })
+                    .collect(),
+            ),
             affected_cells: None,
         }
     }
@@ -689,6 +725,7 @@ impl QueryResponse {
         QueryResponse {
             total_rows: None,
             rows: None,
+            aggregates: None,
             affected_cells: Some(n),
         }
     }
@@ -752,12 +789,19 @@ pub(crate) async fn execute_query(
             let cells = state
                 .with_database(db, kblockdblib::World::list_cells)
                 .await?;
-            let rows = cells
+            let matching: Vec<&kblockdblib::CellEntry> = cells
                 .iter()
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
-                .map(|c| project_row(&columns, c))
                 .collect();
-            Ok(QueryResponse::rows(rows))
+            match &columns {
+                query::Columns::Aggregates(aggregates) => {
+                    Ok(QueryResponse::aggregates(query::aggregate(aggregates, &matching)))
+                }
+                _ => {
+                    let rows = matching.iter().map(|c| project_row(&columns, c)).collect();
+                    Ok(QueryResponse::rows(rows))
+                }
+            }
         }
         query::Statement::Set {
             assignments,
@@ -943,6 +987,11 @@ fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError
     }
 }
 
+/// Never called with `columns: &query::Columns::Aggregates(_)` -- the
+/// caller (`execute_query`'s `Select` arm) branches on that case itself
+/// and calls `query::aggregate` instead, since an aggregate `SELECT`
+/// produces one result per function, not one row per cell the way `All`/
+/// `Named` do here.
 fn project_row(columns: &query::Columns, cell: &kblockdblib::CellEntry) -> QueryRow {
     let selected: Box<dyn Iterator<Item = &(String, kblockdblib::Value, kblockdblib::CellMeta)>> =
         match columns {
@@ -952,6 +1001,9 @@ fn project_row(columns: &query::Columns, cell: &kblockdblib::CellEntry) -> Query
                     .iter()
                     .filter_map(|name| cell.values.iter().find(|(k, _, _)| k == name)),
             ),
+            query::Columns::Aggregates(_) => {
+                unreachable!("execute_query's Select arm never calls project_row for Aggregates")
+            }
         };
     let values = selected
         .map(|(k, v, meta)| QueryKeyValue {

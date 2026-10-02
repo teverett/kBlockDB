@@ -68,6 +68,59 @@ struct QueryGrammar;
 pub enum Columns {
     All,
     Named(Vec<String>),
+    /// `SELECT count(*), sum(density), ...` -- unlike `All`/`Named`, this
+    /// collapses every matching cell into one aggregate result per
+    /// function, not one row per cell. See `aggregate` for how.
+    Aggregates(Vec<Aggregate>),
+}
+
+/// One aggregate function over a `SELECT`'s matching cells -- `count(*)`
+/// counts cells; the rest reduce the named key's numeric value across
+/// every cell where it's set (ignoring cells where it's missing or
+/// non-numeric, same "doesn't apply, not an error" philosophy as the rest
+/// of this language). See `aggregate`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Aggregate {
+    /// `count(*)`: how many cells matched, regardless of any key.
+    Count,
+    /// `sum(key)`: the sum of `key`'s numeric value across every matching
+    /// cell where it's set. `0.0` if none are.
+    Sum(String),
+    /// `mean(key)`: the arithmetic mean of `key`'s numeric value across
+    /// every matching cell where it's set. `None` (not `0.0`/`NaN`) if
+    /// none are -- a mean of nothing is undefined, not zero.
+    Mean(String),
+    /// `max(key)`: the largest numeric value `key` takes across every
+    /// matching cell where it's set. `None` if none are.
+    Max(String),
+    /// `min(key)`: the smallest numeric value `key` takes across every
+    /// matching cell where it's set. `None` if none are.
+    Min(String),
+}
+
+impl Aggregate {
+    /// The label this aggregate's result is reported under -- e.g.
+    /// `"sum(density)"` -- echoing the function call it was parsed from
+    /// rather than inventing a separate naming scheme.
+    pub fn label(&self) -> String {
+        match self {
+            Aggregate::Count => "count(*)".to_string(),
+            Aggregate::Sum(key) => format!("sum({key})"),
+            Aggregate::Mean(key) => format!("mean({key})"),
+            Aggregate::Max(key) => format!("max({key})"),
+            Aggregate::Min(key) => format!("min({key})"),
+        }
+    }
+}
+
+/// One `Aggregate`'s result, labeled for display -- see `aggregate`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggregateResult {
+    pub label: String,
+    /// `None` only for `mean`/`max`/`min` when no matching cell had a
+    /// numeric value for the key in question -- `count`/`sum` are always
+    /// `Some` (0 is a perfectly good count or sum of nothing).
+    pub value: Option<f64>,
 }
 
 /// An axis-aligned box: `from` inclusive, `to` exclusive on every axis --
@@ -335,14 +388,45 @@ fn build_delete(pair: Pair<Rule>) -> Result<Statement, ParseError> {
 fn build_columns(pair: Pair<Rule>) -> Columns {
     match pair.into_inner().next() {
         None => Columns::All, // matched the literal "*", which has no inner rule
-        Some(column_list) => {
-            let names = column_list
-                .into_inner()
-                .map(|ident| ident.as_str().to_string())
-                .collect();
-            Columns::Named(names)
-        }
+        Some(inner) => match inner.as_rule() {
+            Rule::column_list => Columns::Named(
+                inner
+                    .into_inner()
+                    .map(|ident| ident.as_str().to_string())
+                    .collect(),
+            ),
+            Rule::aggregate_list => {
+                Columns::Aggregates(inner.into_inner().map(build_aggregate_call).collect())
+            }
+            other => unreachable!("columns can only contain column_list/aggregate_list, got {other:?}"),
+        },
     }
+}
+
+fn build_aggregate_call(pair: Pair<Rule>) -> Aggregate {
+    // aggregate_call = { count_call | sum_call | mean_call | max_call | min_call }
+    let inner = pair.into_inner().next().unwrap();
+    match inner.as_rule() {
+        Rule::count_call => Aggregate::Count,
+        // sum_call = { ^"SUM" ~ "(" ~ ident ~ ")" }, etc. -- the literal
+        // keyword text and parens produce no pairs of their own, so the
+        // single remaining inner pair is always the key name.
+        Rule::sum_call => Aggregate::Sum(aggregate_arg(inner)),
+        Rule::mean_call => Aggregate::Mean(aggregate_arg(inner)),
+        Rule::max_call => Aggregate::Max(aggregate_arg(inner)),
+        Rule::min_call => Aggregate::Min(aggregate_arg(inner)),
+        other => unreachable!(
+            "aggregate_call can only contain count/sum/mean/max/min_call, got {other:?}"
+        ),
+    }
+}
+
+fn aggregate_arg(call: Pair<Rule>) -> String {
+    call.into_inner()
+        .next()
+        .expect("sum/mean/max/min_call always has an ident pair")
+        .as_str()
+        .to_string()
 }
 
 fn build_assignment_list(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>, ParseError> {
@@ -635,6 +719,59 @@ fn eval_compare(operand: &Operand, op: CompareOp, literal: &Literal, cell: &Cell
             }
         }
     }
+}
+
+/// Computes every `aggregates` entry over `cells` -- the cells a
+/// `SELECT`'s `range`/`where_clause` already matched, via `matches`. One
+/// result per entry, in the same order, labeled by `Aggregate::label`.
+///
+/// `cells` is iterated once per aggregate (cheap: `Vec::iter`, not a
+/// re-scan of `World`), so this is just as happy with one aggregate as
+/// with several in the same `SELECT`.
+pub fn aggregate(aggregates: &[Aggregate], cells: &[&CellEntry]) -> Vec<AggregateResult> {
+    aggregates
+        .iter()
+        .map(|agg| AggregateResult {
+            label: agg.label(),
+            value: match agg {
+                Aggregate::Count => Some(cells.len() as f64),
+                Aggregate::Sum(key) => Some(numeric_values(cells, key).sum()),
+                Aggregate::Mean(key) => {
+                    let values: Vec<f64> = numeric_values(cells, key).collect();
+                    if values.is_empty() {
+                        None
+                    } else {
+                        Some(values.iter().sum::<f64>() / values.len() as f64)
+                    }
+                }
+                Aggregate::Max(key) => numeric_values(cells, key).fold(None, |max, n| {
+                    Some(max.map_or(n, |max: f64| max.max(n)))
+                }),
+                Aggregate::Min(key) => numeric_values(cells, key).fold(None, |min, n| {
+                    Some(min.map_or(n, |min: f64| min.min(n)))
+                }),
+            },
+        })
+        .collect()
+}
+
+/// `key`'s numeric value (`I64` or `F64`, as `f64`) at every cell in
+/// `cells` where it's set to one -- skipping a cell where it's missing,
+/// or set to a `Str`/`Bool`, same "doesn't apply, not an error"
+/// philosophy as everywhere else in this crate.
+fn numeric_values<'a>(cells: &'a [&CellEntry], key: &'a str) -> impl Iterator<Item = f64> + 'a {
+    cells.iter().filter_map(move |cell| {
+        cell.values.iter().find_map(|(k, v, _)| {
+            if k != key {
+                return None;
+            }
+            match v {
+                Value::I64(n) => Some(*n as f64),
+                Value::F64(n) => Some(*n),
+                _ => None,
+            }
+        })
+    })
 }
 
 fn compare_f64(a: f64, op: CompareOp, b: f64) -> bool {
@@ -1341,6 +1478,161 @@ mod tests {
         let c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
         assert!(!eval(&parse_expr("version = 'zero'"), &c));
         assert!(!eval(&parse_expr("version = true"), &c));
+    }
+
+    // --- Parsing/evaluation: aggregates (count/sum/mean/max/min) ---
+
+    #[test]
+    fn parses_count_star() {
+        let stmt = parse("SELECT count(*)").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(columns, Columns::Aggregates(vec![Aggregate::Count]));
+    }
+
+    #[test]
+    fn parses_count_star_with_from_and_where() {
+        let stmt = parse(
+            "SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'",
+        )
+        .unwrap();
+        let Statement::Select {
+            columns,
+            range,
+            where_clause,
+        } = stmt
+        else {
+            panic!("expected Select");
+        };
+        assert_eq!(columns, Columns::Aggregates(vec![Aggregate::Count]));
+        assert!(range.is_some());
+        assert!(where_clause.is_some());
+    }
+
+    #[test]
+    fn parses_sum_mean_max_min_and_is_case_insensitive() {
+        let stmt = parse("SELECT SUM(density), Mean(density), max(density), MIN(density)").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(
+            columns,
+            Columns::Aggregates(vec![
+                Aggregate::Sum("density".to_string()),
+                Aggregate::Mean("density".to_string()),
+                Aggregate::Max("density".to_string()),
+                Aggregate::Min("density".to_string()),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_key_named_like_an_aggregate_function_still_works_as_a_plain_column() {
+        // No "(" immediately after -- same "the paren disambiguates" rule
+        // as `now()` -- so this is just an ordinary named column, not
+        // count(*).
+        let stmt = parse("SELECT count, material").unwrap();
+        let Statement::Select { columns, .. } = stmt else {
+            panic!("expected Select");
+        };
+        assert_eq!(
+            columns,
+            Columns::Named(vec!["count".to_string(), "material".to_string()])
+        );
+    }
+
+    #[test]
+    fn aggregate_label_echoes_the_function_call() {
+        assert_eq!(Aggregate::Count.label(), "count(*)");
+        assert_eq!(Aggregate::Sum("density".to_string()).label(), "sum(density)");
+        assert_eq!(Aggregate::Mean("density".to_string()).label(), "mean(density)");
+        assert_eq!(Aggregate::Max("density".to_string()).label(), "max(density)");
+        assert_eq!(Aggregate::Min("density".to_string()).label(), "min(density)");
+    }
+
+    #[test]
+    fn count_counts_cells_regardless_of_any_key() {
+        let a = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        let b = cell(&[1, 0, 0], vec![]);
+        let results = aggregate(&[Aggregate::Count], &[&a, &b]);
+        assert_eq!(
+            results,
+            vec![AggregateResult {
+                label: "count(*)".to_string(),
+                value: Some(2.0),
+            }]
+        );
+    }
+
+    #[test]
+    fn sum_mean_max_min_reduce_a_keys_numeric_value_across_cells() {
+        let a = cell(&[0, 0, 0], vec![("density", Value::F64(2.0))]);
+        let b = cell(&[1, 0, 0], vec![("density", Value::I64(5))]);
+        let c = cell(&[2, 0, 0], vec![("density", Value::F64(-1.0))]);
+        let cells: Vec<&CellEntry> = vec![&a, &b, &c];
+
+        let results = aggregate(
+            &[
+                Aggregate::Sum("density".to_string()),
+                Aggregate::Mean("density".to_string()),
+                Aggregate::Max("density".to_string()),
+                Aggregate::Min("density".to_string()),
+            ],
+            &cells,
+        );
+        assert_eq!(
+            results,
+            vec![
+                AggregateResult {
+                    label: "sum(density)".to_string(),
+                    value: Some(6.0),
+                },
+                AggregateResult {
+                    label: "mean(density)".to_string(),
+                    value: Some(2.0),
+                },
+                AggregateResult {
+                    label: "max(density)".to_string(),
+                    value: Some(5.0),
+                },
+                AggregateResult {
+                    label: "min(density)".to_string(),
+                    value: Some(-1.0),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn sum_of_nothing_is_zero_but_mean_max_min_of_nothing_is_none() {
+        let a = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        let results = aggregate(
+            &[
+                Aggregate::Sum("density".to_string()),
+                Aggregate::Mean("density".to_string()),
+                Aggregate::Max("density".to_string()),
+                Aggregate::Min("density".to_string()),
+            ],
+            &[&a],
+        );
+        assert_eq!(results[0].value, Some(0.0)); // sum
+        assert_eq!(results[1].value, None); // mean
+        assert_eq!(results[2].value, None); // max
+        assert_eq!(results[3].value, None); // min
+    }
+
+    #[test]
+    fn aggregates_skip_cells_where_the_key_is_missing_or_non_numeric() {
+        let numeric = cell(&[0, 0, 0], vec![("density", Value::F64(10.0))]);
+        let missing = cell(&[1, 0, 0], vec![]);
+        let wrong_type = cell(&[2, 0, 0], vec![("density", Value::Str("heavy".into()))]);
+        let results = aggregate(
+            &[Aggregate::Sum("density".to_string()), Aggregate::Count],
+            &[&numeric, &missing, &wrong_type],
+        );
+        assert_eq!(results[0].value, Some(10.0)); // only `numeric` contributes
+        assert_eq!(results[1].value, Some(3.0)); // but count(*) still counts all 3 cells
     }
 
     // --- Parsing/evaluation: now() ---

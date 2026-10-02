@@ -252,9 +252,23 @@ pub struct QueryRow {
     pub values: Vec<QueryValue>,
 }
 
+/// One `count`/`sum`/`mean`/`max`/`min` result from a `SELECT` whose
+/// columns were an aggregate list -- see `QueryResult::Aggregates` and
+/// `kblockdbquery::AggregateResult`, which this mirrors on the wire.
+#[derive(Debug, PartialEq)]
+pub struct AggregateValue {
+    pub label: String,
+    /// `None` only for `mean`/`max`/`min` with nothing numeric to reduce
+    /// -- `count`/`sum` are always `Some`.
+    pub value: Option<f64>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum QueryResult {
     Rows(Vec<QueryRow>),
+    /// `SELECT count(*)`/`sum(...)`/... -- one result per aggregate
+    /// function, summarizing every matching cell rather than listing them.
+    Aggregates(Vec<AggregateValue>),
     Affected(u64),
 }
 
@@ -546,6 +560,20 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
                 QueryResult::Affected(count) => {
                     buf.push(1);
                     buf.extend_from_slice(&count.to_le_bytes());
+                }
+                QueryResult::Aggregates(results) => {
+                    buf.push(2);
+                    buf.extend_from_slice(&(results.len() as u32).to_le_bytes());
+                    for result in results {
+                        put_message(&mut buf, &result.label);
+                        match result.value {
+                            Some(v) => {
+                                buf.push(1);
+                                buf.extend_from_slice(&v.to_le_bytes());
+                            }
+                            None => buf.push(0),
+                        }
+                    }
                 }
             }
         }
@@ -890,6 +918,20 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
                 Ok(Response::Query(QueryResult::Rows(rows)))
             }
             1 => Ok(Response::Query(QueryResult::Affected(r.u64()?))),
+            2 => {
+                let count = r.u32()? as usize;
+                let results = (0..count)
+                    .map(|_| {
+                        let label = r.message()?;
+                        let value = match r.u8()? {
+                            0 => None,
+                            _ => Some(r.f64()?),
+                        };
+                        Ok(AggregateValue { label, value })
+                    })
+                    .collect::<Result<Vec<_>, DecodeError>>()?;
+                Ok(Response::Query(QueryResult::Aggregates(results)))
+            }
             other => Err(DecodeError::UnknownStatus(other)),
         },
         0x0c => {
@@ -1159,6 +1201,16 @@ mod tests {
             }],
         }])));
         roundtrip_response(Response::Query(QueryResult::Affected(9)));
+        roundtrip_response(Response::Query(QueryResult::Aggregates(vec![
+            AggregateValue {
+                label: "count(*)".into(),
+                value: Some(3.0),
+            },
+            AggregateValue {
+                label: "mean(density)".into(),
+                value: None,
+            },
+        ])));
     }
 
     #[test]

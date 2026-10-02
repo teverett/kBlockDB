@@ -50,8 +50,22 @@ set_stmt    = { kw_set ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ kw_i
 update_stmt = { kw_update ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
 delete_stmt = { kw_delete ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
 
-columns     = { "*" | column_list }
-column_list = { ident ~ ("," ~ ident)* }
+// Aggregates are tried first: `count(*)`/`sum(key)`/... need their "("
+// checked before `column_list` could mistake the function name alone
+// (e.g. "count") for a plain column -- same "the paren disambiguates"
+// trick `now_call` (see `literal` below) already relies on, so no
+// separate word-boundary keyword is needed here either. Without a
+// preceding paren, e.g. bare `SELECT count`, this alternative simply
+// fails to match and `column_list` picks it up as an ordinary key name.
+columns         = { aggregate_list | "*" | column_list }
+column_list     = { ident ~ ("," ~ ident)* }
+aggregate_list  = { aggregate_call ~ ("," ~ aggregate_call)* }
+aggregate_call  = { count_call | sum_call | mean_call | max_call | min_call }
+count_call      = { ^"COUNT" ~ "(" ~ "*" ~ ")" }
+sum_call        = { ^"SUM"  ~ "(" ~ ident ~ ")" }
+mean_call       = { ^"MEAN" ~ "(" ~ ident ~ ")" }
+max_call        = { ^"MAX"  ~ "(" ~ ident ~ ")" }
+min_call        = { ^"MIN"  ~ "(" ~ ident ~ ")" }
 
 assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment      = { ident ~ "=" ~ literal }

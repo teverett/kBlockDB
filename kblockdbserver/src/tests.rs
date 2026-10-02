@@ -1169,6 +1169,111 @@ async fn select_named_columns_omits_the_rest() {
 }
 
 #[tokio::test]
+async fn select_count_star_counts_matching_cells() {
+    let (app, _dir) = test_app();
+    for (coords, material) in [("1,2,3", "stone"), ("4,5,6", "stone"), ("7,8,9", "air")] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/db/db/cells/{coords}/material"),
+                json!({"type": "str", "value": material}),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/db/db/query",
+            query("SELECT count(*) WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["aggregates"],
+        json!([{"label": "count(*)", "value": 2.0}])
+    );
+    // Not a row listing -- aggregates replace rows/total_rows, they don't
+    // sit alongside them.
+    assert!(body.get("rows").is_none());
+    assert!(body.get("total_rows").is_none());
+
+    let (_, body) = send(app, post("/rest/db/db/query", query("SELECT count(*)"))).await;
+    assert_eq!(
+        body["aggregates"],
+        json!([{"label": "count(*)", "value": 3.0}])
+    );
+}
+
+#[tokio::test]
+async fn select_sum_mean_max_min_reduce_a_keys_numeric_value() {
+    let (app, _dir) = test_app();
+    for (coords, density) in [("1,0,0", 2.0), ("2,0,0", 5.0), ("3,0,0", 8.0)] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/db/db/cells/{coords}/density"),
+                json!({"type": "f64", "value": density}),
+            ),
+        )
+        .await;
+    }
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT sum(density), mean(density), max(density), min(density)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["aggregates"],
+        json!([
+            {"label": "sum(density)", "value": 15.0},
+            {"label": "mean(density)", "value": 5.0},
+            {"label": "max(density)", "value": 8.0},
+            {"label": "min(density)", "value": 2.0},
+        ])
+    );
+}
+
+#[tokio::test]
+async fn select_mean_max_min_of_a_key_no_matching_cell_has_is_null_not_zero() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT sum(density), mean(density), max(density), min(density)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["aggregates"],
+        json!([
+            {"label": "sum(density)", "value": 0.0},
+            {"label": "mean(density)", "value": null},
+            {"label": "max(density)", "value": null},
+            {"label": "min(density)", "value": null},
+        ])
+    );
+}
+
+#[tokio::test]
 async fn select_where_filters_by_value() {
     let (app, _dir) = test_app();
     send(

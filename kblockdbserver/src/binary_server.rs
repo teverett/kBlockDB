@@ -22,7 +22,8 @@
 use crate::error::ApiError;
 use crate::state::{Account, AppState};
 use kblockdbserver::wire::{
-    self, Column, DatabaseShape, QueryResult, QueryRow, QueryValue, Request, Response,
+    self, AggregateValue, Column, DatabaseShape, QueryResult, QueryRow, QueryValue, Request,
+    Response,
 };
 use tokio::net::{TcpListener, TcpStream};
 
@@ -413,6 +414,16 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                                             version: value.version,
                                         })
                                         .collect(),
+                                })
+                                .collect(),
+                        ))
+                    } else if let Some(aggregates) = result.aggregates {
+                        Response::Query(QueryResult::Aggregates(
+                            aggregates
+                                .into_iter()
+                                .map(|a| AggregateValue {
+                                    label: a.label,
+                                    value: a.value,
                                 })
                                 .collect(),
                         ))
@@ -1099,6 +1110,44 @@ mod tests {
         )
         .await;
         assert!(matches!(query, Response::Forbidden(_)));
+    }
+
+    #[tokio::test]
+    async fn select_count_star_returns_an_aggregate_result_over_the_binary_protocol() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello_db(&mut stream, "admin", ADMIN_PASSWORD, "agg").await;
+        roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: "agg".to_string(),
+            },
+        )
+        .await;
+        hello_db(&mut stream, "admin", ADMIN_PASSWORD, "agg").await;
+
+        roundtrip(
+            &mut stream,
+            &Request::Query {
+                query: "SET (material='stone') IN (0,0,0) TO (2,1,1)".to_string(),
+            },
+        )
+        .await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::Query {
+                query: "SELECT count(*) WHERE material = 'stone'".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(
+            response,
+            Response::Query(QueryResult::Aggregates(vec![AggregateValue {
+                label: "count(*)".to_string(),
+                value: Some(2.0),
+            }]))
+        );
     }
 
     #[tokio::test]

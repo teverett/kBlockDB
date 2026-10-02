@@ -20,7 +20,11 @@ UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
 DELETE [WHERE <criteria>] [IN <range>]
 ```
 
-- `<columns>` is `*` or a comma-separated key list (`material, density`).
+- `<columns>` is `*`, a comma-separated key list (`material, density`), or
+  a comma-separated aggregate list (`count(*)`, `sum(density)`,
+  `mean(density), max(density), min(density)`) -- see "Aggregates" below.
+  A query can't mix the two: it's either plain columns or aggregates, not
+  both (there's no `GROUP BY` to make a mix meaningful).
 - `<range>` is `(o0,o1,...) TO (e0,e1,...)` -- an axis-aligned box, `o`
   inclusive/`e` exclusive on every axis, same convention as
   `kblockdblib::Region` (origin + extent), just written as two corners.
@@ -80,6 +84,33 @@ DELETE [WHERE <criteria>] [IN <range>]
   deliberately test for that "not set" case instead of just falling
   through it.
 
+**Aggregates.** `SELECT`'s `<columns>` can instead be a comma-separated
+list of `count(*)`, `sum(<key>)`, `mean(<key>)`, `max(<key>)`, or
+`min(<key>)` calls (case-insensitive, e.g. `SELECT COUNT(*)` works too).
+Each collapses every cell `FROM`/`WHERE` matched into a single number,
+rather than one row per cell:
+
+- `count(*)` -- how many cells matched, regardless of any key.
+- `sum`/`mean`/`max`/`min(<key>)` -- that reduction of `<key>`'s numeric
+  value across every matching cell where it's *set to a number*. A cell
+  where `<key>` is missing, or set to a string or boolean, is simply
+  skipped for that aggregate -- same "doesn't apply, not an error"
+  philosophy as everywhere else here (it does *not* disqualify the cell
+  from `count(*)` or from any other aggregate in the same `SELECT`).
+  `sum` of nothing is `0`; `mean`/`max`/`min` of nothing is `null` --
+  unlike `sum`, there's no sensible number to report for an empty set.
+
+A key literally named e.g. `count`, `sum`, `mean`, `max`, or `min` can
+still be selected or compared against as an ordinary column/key -- same
+"the `(` right after disambiguates it, same as `now()`" rule as the
+metadata keywords above; only when immediately followed by `(` does one
+of these parse as an aggregate call.
+
+```text
+SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'
+SELECT sum(density), mean(density), max(density), min(density)
+```
+
 **`SET` is an upsert; `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all run
 on `kblockdblib::World::list_cells` -- i.e. only cells that already have at
 least one key set somewhere. `UPDATE` can only ever change such a cell,
@@ -121,9 +152,12 @@ UPDATE (material='basalt', hardness=9) WHERE material = 'stone' IN (0,0,0) TO (2
 DELETE WHERE material = 'air'
 ```
 
-`SELECT` returns the matching rows (each with every requested column's
-value and metadata); `SET`/`UPDATE`/`DELETE` return how many cells were
-affected instead. `DELETE` clears *every* key set at each matching cell --
+A plain `SELECT` returns the matching rows (each with every requested
+column's value and metadata); an aggregate `SELECT` (`count(*)`,
+`sum(...)`, ...) returns one summary result per function instead, over
+every matching cell, not one row per cell; `SET`/`UPDATE`/`DELETE` return
+how many cells were affected instead of either. `DELETE` clears *every*
+key set at each matching cell --
 there's no column list to delete only some of them. See
 [the REST API](kblockdbserver.md#query) or the [binary
 protocol](binary-protocol.md) for the exact response shape on the wire.

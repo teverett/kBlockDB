@@ -602,8 +602,9 @@ fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Re
     print_query_response(&body)
 }
 
-/// Renders a `/rest/query` response (kblockdbserver's `QueryResponse`), which
-/// is shaped one way for `SELECT` (`rows`) and another for
+/// Renders a `/rest/query` response (kblockdbserver's `QueryResponse`),
+/// which is shaped one way for a plain `SELECT` (`rows`), another for a
+/// `SELECT count(*)`/`sum(...)`/... (`aggregates`), and a third for
 /// `SET`/`UPDATE`/`DELETE` (`affected_cells`).
 fn print_query_response(body: &Json) -> Result<(), String> {
     if let Some(rows) = body.get("rows").and_then(Json::as_array) {
@@ -612,12 +613,30 @@ fn print_query_response(body: &Json) -> Result<(), String> {
         }
         println!("{} row(s)", rows.len());
         Ok(())
+    } else if let Some(aggregates) = body.get("aggregates").and_then(Json::as_array) {
+        for result in aggregates {
+            println!("{}", describe_aggregate_result(result)?);
+        }
+        Ok(())
     } else if let Some(affected) = body.get("affected_cells").and_then(Json::as_u64) {
         println!("{affected} cell(s) affected");
         Ok(())
     } else {
         Err("unrecognized query response shape".to_string())
     }
+}
+
+/// Renders one `AggregateResponse` as `label = value` -- e.g.
+/// `count(*) = 5` or `mean(density) = null` when nothing numeric matched.
+fn describe_aggregate_result(result: &Json) -> Result<String, String> {
+    let label = result["label"]
+        .as_str()
+        .ok_or("aggregate result is missing 'label'")?;
+    let value = match &result["value"] {
+        Json::Null => "null".to_string(),
+        other => other.to_string(),
+    };
+    Ok(format!("{label} = {value}"))
 }
 
 /// Renders one `QueryResponse` row as `(c0,c1,...) key=value (type), ...`.
@@ -879,8 +898,35 @@ mod unit_tests {
     }
 
     #[test]
+    fn print_query_response_accepts_an_aggregate_shape() {
+        let body = json!({"aggregates": [{"label": "count(*)", "value": 5.0}]});
+        assert!(print_query_response(&body).is_ok());
+    }
+
+    #[test]
     fn print_query_response_rejects_an_unrecognized_shape() {
         assert!(print_query_response(&json!({})).is_err());
+    }
+
+    #[test]
+    fn describe_aggregate_result_renders_label_equals_value() {
+        assert_eq!(
+            describe_aggregate_result(&json!({"label": "count(*)", "value": 5.0})).unwrap(),
+            "count(*) = 5.0"
+        );
+    }
+
+    #[test]
+    fn describe_aggregate_result_renders_null_for_a_missing_value() {
+        assert_eq!(
+            describe_aggregate_result(&json!({"label": "mean(density)", "value": null})).unwrap(),
+            "mean(density) = null"
+        );
+    }
+
+    #[test]
+    fn describe_aggregate_result_rejects_a_missing_label() {
+        assert!(describe_aggregate_result(&json!({"value": 1.0})).is_err());
     }
 
     #[test]

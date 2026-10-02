@@ -377,11 +377,16 @@ removal interacts with the append-only `schema.txt`.
 against that database -- see that page for the full grammar (statement
 kinds, ranges, criteria including `EXISTS`) and semantics; this is just
 the REST-specific wire shape. The request body is `{"query": "<text>"}`.
-`SELECT`'s response has `total_rows`/`rows` (each row's `values` entries
-carrying the same `created_at_ms`/`modified_at_ms`/`version` metadata the
-single-cell `GET` reports, not just the value); `SET`/`UPDATE`/`DELETE`'s
-has `affected_cells` instead (the fields the statement kind doesn't
-produce are omitted, not null). This is the one route in the whole REST
+A plain `SELECT`'s response has `total_rows`/`rows` (each row's `values`
+entries carrying the same `created_at_ms`/`modified_at_ms`/`version`
+metadata the single-cell `GET` reports, not just the value); `SELECT
+count(*)`/`sum(...)`/`mean(...)`/`max(...)`/`min(...)`'s has `aggregates`
+instead -- one `{"label": ..., "value": ...}` per function, summarizing
+every matching cell rather than listing them (`value` is `null` only for
+`mean`/`max`/`min` when no matching cell had a numeric value for the
+key); `SET`/`UPDATE`/`DELETE`'s has `affected_cells` instead of either
+(the fields the statement kind doesn't produce are omitted, not null).
+This is the one route in the whole REST
 API where `read_only` isn't decided by HTTP method the way it is
 everywhere else (see `routes.rs`'s doc comment) -- all four statement
 kinds share this one `POST` endpoint, so it's decided by which kind was
@@ -413,6 +418,12 @@ curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "DELETE WHERE material = '"'"'air'"'"'"}'
 # {"affected_cells":1}
+
+# aggregates: one summary result per function, not one row per cell
+curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
+  -H 'content-type: application/json' \
+  -d '{"query": "SELECT count(*), mean(density) WHERE material = '"'"'stone'"'"'"}'
+# {"aggregates":[{"label":"count(*)","value":8000.0},{"label":"mean(density)","value":2.6}]}
 ```
 
 ## Data browser
