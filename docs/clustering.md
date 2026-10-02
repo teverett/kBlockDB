@@ -3,12 +3,13 @@
 A `kblockdbserver` instance can list other instances as peers and
 replicate its own local writes to each of them, so a small cluster of
 servers converges on the same data over time. This is **opt-in and off by
-default** -- nothing in this page applies unless the config file sets
-`cluster_secret`.
+default** -- nothing in this page applies unless the config file's
+`[cluster]` table sets `cluster_secret`.
 
 ## Config
 
 ```toml
+[cluster]
 # Enables clustering. Required (and must be non-empty) if [[peers]] is
 # non-empty; a server with cluster_secret set but no peers still accepts
 # incoming peer connections, it just has nothing to connect out to.

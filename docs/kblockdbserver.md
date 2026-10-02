@@ -143,6 +143,7 @@ read_only = true              # optional, defaults to false
 
 # Clustering (see docs/clustering.md) -- optional; off entirely unless
 # cluster_secret is set.
+[cluster]
 peer_port = 8082
 cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
 

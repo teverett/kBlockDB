@@ -22,8 +22,8 @@ use std::path::PathBuf;
 const DEFAULT_HTTP_PORT: u16 = 8080;
 
 /// The peer-replication protocol's port when clustering is enabled (see
-/// `config::Config::cluster_secret`) but neither `--peer-port` nor the
-/// config file names one -- unlike `binary_port`, which stays off
+/// `config::ClusterConfig::cluster_secret`) but neither `--peer-port` nor
+/// the config file names one -- unlike `binary_port`, which stays off
 /// entirely with no default, clustering being *on* already implies a
 /// peer listener is wanted, so this one has a default the way
 /// `http_port` does.
@@ -360,10 +360,10 @@ async fn main() {
     // (but not the other way around: a `cluster_secret` with no `peers`
     // still starts a peer listener, just with nothing to connect out to --
     // e.g. a node everyone else points at).
-    if let Some(cluster_secret) = config.cluster_secret.clone() {
+    if let Some(cluster_secret) = config.cluster.cluster_secret.clone() {
         let peer_addr = bind_addr(
             args.peer_port
-                .or(config.peer_port)
+                .or(config.cluster.peer_port)
                 .unwrap_or(DEFAULT_PEER_PORT),
         );
         let peer_listener = tokio::net::TcpListener::bind(&peer_addr)

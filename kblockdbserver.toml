@@ -14,6 +14,17 @@ admin_password = "changeme"
 max_cached_chunks = 10000
 compression = false
 
+# Clustering (see docs/clustering.md) is off by default -- uncomment to
+# replicate this server's local writes to one or more peers. cluster_secret
+# must be set (and match every peer's own) for either direction of the peer
+# link to work; change it from this placeholder before using this for real.
+[cluster]
+peer_port = 8082
+cluster_secret = "changeme"
+
+[[peers]]
+address = "192.168.75.160:8082"
+
 # Default shape for a database created without an explicit shape of its own
 # (see /rest/databases in docs/kblockdbserver.md) -- no database is ever
 # created automatically. Reopening an existing database, or creating one
@@ -26,13 +37,3 @@ chunk_size = 32
 [[users]]
 username = "user"
 password = "changeme"
-
-# Clustering (see docs/clustering.md) is off by default -- uncomment to
-# replicate this server's local writes to one or more peers. cluster_secret
-# must be set (and match every peer's own) for either direction of the peer
-# link to work; change it from this placeholder before using this for real.
-peer_port = 8082
-cluster_secret = "changeme"
-#
-# [[peers]]
-# address = "10.0.0.2:8082"

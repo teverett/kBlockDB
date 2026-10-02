@@ -32,6 +32,30 @@ pub struct PeerConfig {
     pub address: String,
 }
 
+/// The `[cluster]` table: `peer_port`/`cluster_secret`, grouped under
+/// their own table rather than flat keys on `Config` -- same
+/// "only ever make sense together" reasoning as `[worldparameters]`'s own
+/// doc comment, applied here to clustering's pair instead of a world's
+/// shape. `[[peers]]` stays its own top-level array-of-tables rather than
+/// nested under here: it's a list of however many peers, not a second
+/// member of this pair.
+#[derive(Debug, Deserialize, Default)]
+pub struct ClusterConfig {
+    /// The port the peer-replication protocol listens on -- see
+    /// `peer_server.rs`. Like `binary_port`, has no default: clustering
+    /// stays off unless `cluster_secret` is also set (see
+    /// `Config::validate`).
+    #[serde(default)]
+    pub peer_port: Option<u16>,
+    /// Shared secret every peer connection (both directions) is checked
+    /// against -- see `peer_server.rs`'s `Hello` handling. Required (and
+    /// must be non-empty) if `[[peers]]` is non-empty; clustering is
+    /// entirely opt-in and disabled by default (no `[[peers]]`, no
+    /// `cluster_secret`).
+    #[serde(default)]
+    pub cluster_secret: Option<String>,
+}
+
 /// The `[worldparameters]` table: the three numbers that fix a *new*
 /// world's shape (see `kblockdblib::params::WorldParams`) -- meaningless,
 /// and ignored, when reopening an existing one (`World::open` reads the
@@ -91,17 +115,10 @@ pub struct Config {
     pub admin_password: String,
     #[serde(default)]
     pub users: Vec<UserConfig>,
-    /// The port the peer-replication protocol listens on -- see
-    /// `peer_server.rs`. Like `binary_port`, has no default: clustering
-    /// stays off unless `cluster_secret` is also set (see `validate`).
+    /// `peer_port`/`cluster_secret` -- see `ClusterConfig`'s doc comment
+    /// for why these two are grouped under their own table.
     #[serde(default)]
-    pub peer_port: Option<u16>,
-    /// Shared secret every peer connection (both directions) is checked
-    /// against -- see `peer_server.rs`'s `Hello` handling. Required (and
-    /// must be non-empty) if `peers` is non-empty; clustering is entirely
-    /// opt-in and disabled by default (no `peers`, no `cluster_secret`).
-    #[serde(default)]
-    pub cluster_secret: Option<String>,
+    pub cluster: ClusterConfig,
     /// Other servers to replicate local writes to -- see `replication.rs`.
     #[serde(default)]
     pub peers: Vec<PeerConfig>,
@@ -136,10 +153,11 @@ impl Config {
             return Err("hostname must not be empty".to_string());
         }
         if !self.peers.is_empty() {
-            match self.cluster_secret.as_deref() {
+            match self.cluster.cluster_secret.as_deref() {
                 None | Some("") => {
                     return Err(
-                        "cluster_secret must be set (and non-empty) to use [[peers]]".to_string(),
+                        "[cluster].cluster_secret must be set (and non-empty) to use [[peers]]"
+                            .to_string(),
                     )
                 }
                 Some(_) => {}
@@ -459,18 +477,20 @@ mod tests {
     }
 
     #[test]
-    fn peers_and_cluster_secret_default_to_empty_and_unset() {
+    fn peers_and_cluster_default_to_empty_and_unset() {
         let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
         assert!(config.peers.is_empty());
-        assert_eq!(config.cluster_secret, None);
-        assert_eq!(config.peer_port, None);
+        assert_eq!(config.cluster.cluster_secret, None);
+        assert_eq!(config.cluster.peer_port, None);
     }
 
     #[test]
-    fn parses_peers_and_cluster_secret() {
+    fn parses_the_cluster_table_and_peers() {
         let config = Config::from_toml_str(
             r#"
             admin_password = "secret"
+
+            [cluster]
             peer_port = 8082
             cluster_secret = "shh"
 
@@ -482,8 +502,8 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(config.peer_port, Some(8082));
-        assert_eq!(config.cluster_secret.as_deref(), Some("shh"));
+        assert_eq!(config.cluster.peer_port, Some(8082));
+        assert_eq!(config.cluster.cluster_secret.as_deref(), Some("shh"));
         assert_eq!(
             config
                 .peers
@@ -492,6 +512,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["10.0.0.2:8082", "10.0.0.3:8082"]
         );
+    }
+
+    #[test]
+    fn a_cluster_table_after_an_array_of_tables_still_parses_correctly() {
+        // The bug `[cluster]` was introduced to close: a bare
+        // `peer_port = ...`/`cluster_secret = ...` placed after
+        // `[[users]]` used to be silently absorbed into that `[[users]]`
+        // entry instead of reaching the document root (TOML attaches a
+        // later bare `key = value` to whichever table/array entry was
+        // most recently opened). An explicit `[cluster]` table header
+        // reopens at the document root regardless of what came before
+        // it, so this ordering -- which used to lose the settings
+        // entirely -- now parses exactly as if `[cluster]` had come
+        // first.
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+
+            [[users]]
+            username = "alice"
+            password = "alice-pw"
+
+            [cluster]
+            peer_port = 8082
+            cluster_secret = "shh"
+
+            [[peers]]
+            address = "10.0.0.2:8082"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.cluster.peer_port, Some(8082));
+        assert_eq!(config.cluster.cluster_secret.as_deref(), Some("shh"));
+        assert_eq!(config.peers.len(), 1);
     }
 
     #[test]
@@ -512,6 +566,7 @@ mod tests {
         let err = Config::from_toml_str(
             r#"
             admin_password = "secret"
+            [cluster]
             cluster_secret = ""
             [[peers]]
             address = "10.0.0.2:8082"
@@ -528,6 +583,7 @@ mod tests {
         let config = Config::from_toml_str(
             r#"
             admin_password = "secret"
+            [cluster]
             cluster_secret = "shh"
             "#,
         )
