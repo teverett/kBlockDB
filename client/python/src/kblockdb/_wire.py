@@ -26,6 +26,12 @@ from .models import (
 
 MAX_FRAME_LEN = 64 * 1024 * 1024
 
+#: This client's binary protocol version -- see kblockdbserver's
+#: ``wire.rs`` module doc comment ("Versioning") for the full story. Sent
+#: as ``Hello``'s first field; the server echoes its own back in
+#: ``HelloOk.server_version``. There is, as yet, only this one version.
+PROTOCOL_VERSION = 1
+
 
 def _pack_short_string(value: str) -> bytes:
     encoded = value.encode("utf-8")
@@ -71,6 +77,7 @@ def _pack_value(value: Value) -> bytes:
 def encode_hello(username: str, password: str, database: str) -> bytes:
     return (
         b"\x00"
+        + struct.pack("<B", PROTOCOL_VERSION)
         + _pack_short_string(username)
         + _pack_short_string(password)
         + _pack_short_string(database)
@@ -204,6 +211,8 @@ class DatabaseShape:
 
 @dataclass(frozen=True, slots=True)
 class HelloOk:
+    # This server's `PROTOCOL_VERSION` -- see that constant's doc comment.
+    server_version: int
     read_only: bool
     # `None` if `Hello`'s named database doesn't exist yet -- the account
     # still authenticated, but no database is selected (see
@@ -391,13 +400,16 @@ def _read_health(reader: "_Reader") -> Health:
 
 
 def _read_hello_ok(reader: "_Reader") -> HelloOk:
+    server_version = reader.u8()
     read_only = reader.u8() != 0
     if reader.u8() == 0:
-        return HelloOk(read_only, None)
+        return HelloOk(server_version, read_only, None)
     axes = reader.u8()
     world_dim = reader.u32()
     chunk_dim = reader.u32()
-    return HelloOk(read_only, DatabaseShape(axes, world_dim, chunk_dim))
+    return HelloOk(
+        server_version, read_only, DatabaseShape(axes, world_dim, chunk_dim)
+    )
 
 
 def _read_databases(reader: "_Reader") -> DatabasesResponse:

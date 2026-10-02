@@ -23,8 +23,12 @@ from kblockdb import _wire
 class WireEncodingTest(unittest.TestCase):
     def test_encodes_hello(self) -> None:
         self.assertEqual(
-            b"\x00\x05admin\x02hi\x02db", _wire.encode_hello("admin", "hi", "db")
+            b"\x00\x01\x05admin\x02hi\x02db", _wire.encode_hello("admin", "hi", "db")
         )
+        # Pinned separately from the byte literal above so a change to
+        # `PROTOCOL_VERSION` without updating that literal fails loudly
+        # here rather than this test silently tracking the constant.
+        self.assertEqual(1, _wire.PROTOCOL_VERSION)
 
     def test_encodes_cell_operations(self) -> None:
         coord = b"\x03" + struct.pack("<iii", 1, -2, 3)
@@ -107,18 +111,28 @@ class WireDecodingTest(unittest.TestCase):
     def test_decodes_hello_with_a_selected_database(self) -> None:
         self.assertEqual(
             _wire.HelloOk(
+                server_version=1,
                 read_only=False,
                 database=_wire.DatabaseShape(axes=3, world_dim=10_000, chunk_dim=32),
             ),
             _wire.decode_response(
-                b"\x00\x00\x01\x03" + struct.pack("<II", 10_000, 32)
+                b"\x00\x01\x00\x01\x03" + struct.pack("<II", 10_000, 32)
             ),
         )
 
     def test_decodes_hello_with_no_database_selected(self) -> None:
         self.assertEqual(
-            _wire.HelloOk(read_only=True, database=None),
-            _wire.decode_response(b"\x00\x01\x00"),
+            _wire.HelloOk(server_version=1, read_only=True, database=None),
+            _wire.decode_response(b"\x00\x01\x01\x00"),
+        )
+
+    def test_decodes_a_server_version_different_from_this_clients(self) -> None:
+        # The server's version is whatever byte is on the wire, not
+        # necessarily this client's own `PROTOCOL_VERSION` -- decoding must
+        # read it as plain data, not assume the two always match.
+        self.assertEqual(
+            _wire.HelloOk(server_version=7, read_only=False, database=None),
+            _wire.decode_response(b"\x00\x07\x00\x00"),
         )
 
     def test_decodes_health_and_stats(self) -> None:

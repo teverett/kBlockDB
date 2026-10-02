@@ -88,6 +88,7 @@ class KBlockDBClient:
             raise
 
     def _apply_hello(self, hello: _wire.HelloOk) -> None:
+        self.server_version = hello.server_version
         self.read_only = hello.read_only
         self.database_selected = hello.database is not None
         self.axes = hello.database.axes if hello.database else None

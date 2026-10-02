@@ -71,7 +71,7 @@ OPTIONS:
     --http-port <port>             Port to listen on for the REST API (default: 8080).
                                     Binds every interface; 0 asks the OS for a free port
     --binary-port <port>           Also listen on this port for the binary protocol
-                                    (see "Binary protocol" below); disabled unless given
+                                    (see docs/binary-protocol.md); disabled unless given
     --max-concurrent-disk-ops <n>  Cap on concurrent filesystem operations
                                     (default: 32 -- see kblockdblib's "Concurrency"
                                     section; measure the right value for your
@@ -109,7 +109,7 @@ flag, so they don't end up in shell history or `ps` output):
 
 ```toml
 http_port = 8080             # optional; same defaults/precedence as the CLI flags
-binary_port = 8081           # optional; disabled unless given (see "Binary protocol" below)
+binary_port = 8081           # optional; disabled unless given (see docs/binary-protocol.md)
 data_dir = "./data"          # optional
 max_concurrent_disk_ops = 32 # optional
 max_cached_chunks = 100000   # optional
@@ -207,9 +207,9 @@ Every per-database route below is scoped under `/rest/db/{db}/...`, naming
 which database it operates on -- `{db}` must already exist (see
 "Databases" above) or the route 404s. Routes are mounted under the `/rest`
 context path generally (`/rest/db/{db}/cells/...`, `/rest/databases`,
-`/rest/health`, ...) -- kept separate from the binary protocol's own
-listener (see "Binary protocol" below) and from whatever else might one
-day share this HTTP server.
+`/rest/health`, ...) -- kept separate from the
+[binary protocol](binary-protocol.md)'s own listener and from whatever
+else might one day share this HTTP server.
 
 An OpenAPI spec for everything below is generated (via
 [utoipa](https://github.com/juhaku/utoipa)) straight from the same
@@ -371,62 +371,21 @@ account gets `403`; `GET /rest/db/{db}/columns` is readable by any
 account. See the [storage engine's notes](kblockdblib.md#columns) for how
 removal interacts with the append-only `schema.txt`.
 
-## Query language
+### Query
 
-`POST /rest/db/{db}/query` runs a small SQL-like query language over that
-database's cells, parsed with a [pest](https://pest.rs) grammar
-(`kblockdbserver/src/query.pest`/`query.rs`). Four statement kinds:
-
-```text
-SELECT <columns> [FROM <range>] [WHERE <criteria>]
-SET (<key>=<value>, ...) [WHERE <criteria>] IN <range>
-UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
-DELETE [WHERE <criteria>] [IN <range>]
-```
-
-- `<columns>` is `*` or a comma-separated key list (`material, density`).
-- `<range>` is `(o0,o1,...) TO (e0,e1,...)` -- an axis-aligned box, `o`
-  inclusive/`e` exclusive on every axis, same convention as
-  `kblockdblib::Region` (origin + extent), just written as two corners.
-  Each component is a signed integer (a database's valid range is centered
-  on zero -- see "Coordinate space" above), e.g. `(-10,-10,-10) TO (10,10,10)`.
-  Its axis count must match the database's, or the query is rejected with
-  `400` before touching any data.
-- `<criteria>` is a boolean expression: comparisons (`=`, `!=`, `<`, `<=`,
-  `>`, `>=`) combined with `AND`/`OR`/`NOT` and parentheses, standard
-  precedence (`NOT` binds tightest, then `AND`, then `OR`). A comparison's
-  left side is either `x<N>` (coordinate axis `N`, zero-indexed) or a key
-  name; its right side is a string (`'stone'`), integer, float, or boolean
-  (`true`/`false`, case-insensitive) literal (`x0 >= -10` works the same as
-  any other comparison). Keywords are case-insensitive; key/axis names are
-  not. A key literally named e.g. `x0` can't be addressed this way -- a
-  known limitation of a generic axis-count grammar.
-- A comparison against a key that isn't set at a given cell, or whose
-  value's type doesn't match the literal's (a string literal against a
-  numeric key, say), simply doesn't match that cell -- never an error, the
-  same "total, not partial" philosophy `kblockdblib` itself uses.
-
-**`SET` is an upsert; `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all run
-on `kblockdblib::World::list_cells` -- i.e. only cells that already have at
-least one key set somewhere. `UPDATE` can only ever change such a cell,
-never create one, same as this whole language's original `SET` used to
-work. `SET` is different: it upserts every coordinate in its `IN <range>`
-that satisfies `WHERE`, creating a cell there if one doesn't already exist
--- which is exactly why `IN <range>` isn't optional for `SET` the way it is
-for `UPDATE`/`DELETE`: "upsert everywhere" has no meaningful bound. Because
-a `WHERE` clause comparing against a *key* can never match a cell that
-doesn't exist yet (a missing key is always "doesn't match", per the bullet
-above), a key-based `WHERE` makes `SET` behave exactly like `UPDATE` in
-practice -- the two only diverge with no `WHERE` at all, or one that only
-compares axis coordinates (`x<N>`), where `SET` can genuinely bring new
-cells into existence.
-
-`SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes. All four are behind
-the same `POST /rest/db/{db}/query`, so this is the one route in the whole
-REST API where `read_only` isn't decided by HTTP method the way it is
-everywhere else (see `routes.rs`'s doc comment) -- it's decided by which
-kind of statement was actually sent, checked after parsing, before
-touching anything.
+`POST /rest/db/{db}/query` runs the [query language](query-language.md)
+against that database -- see that page for the full grammar (statement
+kinds, ranges, criteria including `EXISTS`) and semantics; this is just
+the REST-specific wire shape. The request body is `{"query": "<text>"}`.
+`SELECT`'s response has `total_rows`/`rows` (each row's `values` entries
+carrying the same `created_at_ms`/`modified_at_ms`/`version` metadata the
+single-cell `GET` reports, not just the value); `SET`/`UPDATE`/`DELETE`'s
+has `affected_cells` instead (the fields the statement kind doesn't
+produce are omitted, not null). This is the one route in the whole REST
+API where `read_only` isn't decided by HTTP method the way it is
+everywhere else (see `routes.rs`'s doc comment) -- all four statement
+kinds share this one `POST` endpoint, so it's decided by which kind was
+actually sent, checked after parsing, before touching anything.
 
 ```sh
 curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
@@ -445,42 +404,16 @@ curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -d '{"query": "SET (material='"'"'stone'"'"') IN (0,0,0) TO (20,20,20)"}'
 # {"affected_cells":8000}
 
-# update: only changes cells that already have material='stone' -- never
-# creates one, whether or not IN is given.
+# EXISTS: cells that do (or don't) have a key set at all, regardless of value
 curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
-  -d '{"query": "UPDATE (material='"'"'basalt'"'"', hardness=9) WHERE material = '"'"'stone'"'"' IN (0,0,0) TO (20,20,20)"}'
-# {"affected_cells":1}
+  -d '{"query": "SELECT * WHERE EXISTS(density)"}'
 
 curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "DELETE WHERE material = '"'"'air'"'"'"}'
 # {"affected_cells":1}
 ```
-
-`SELECT`'s response has `total_rows`/`rows`; `SET`/`UPDATE`/`DELETE`'s has
-`affected_cells` instead (the fields the statement kind doesn't produce
-are omitted, not null). Each row's `values` entries carry the same
-`created_at_ms`/`modified_at_ms`/`version` metadata the single-cell `GET`
-reports (see "Cells and regions" above), not just the value. `DELETE`
-clears *every* key set at each matching cell -- there's no column list to
-delete only some of them.
-
-`SELECT`/`UPDATE`/`DELETE` run on `kblockdblib::World::list_cells` under
-the hood (the same full-chunk-decode walk the data browser below uses) --
-`SELECT` filters and projects it directly; `UPDATE`/`DELETE` use it to
-find matching coordinates, then apply the write in a second pass. `SET`
-without a `WHERE` skips `list_cells` entirely and goes straight to
-`World::set_region` (the same primitive `/rest/db/{db}/regions` uses) --
-one call per assignment, as efficient as the region endpoints; `SET`
-*with* a `WHERE` falls back to a `list_cells`-plus-per-coordinate-
-`Region::iter` scan, since which coordinates match can depend on a cell's
-existing values. None of this is atomic with respect to a concurrent
-writer touching the same range in between the scan and the write -- a real
-(if narrow) race, same honest trade-off `list_cells`'s own doc comment
-already makes for reads. Fine for the occasional bulk edit; not meant for
-a database with millions of populated cells or for these write statements
-racing each other at high frequency.
 
 ## Data browser
 
@@ -522,61 +455,14 @@ annotation and doesn't appear in `/rest/api-docs/openapi.json`.
 
 ## Binary protocol
 
-A binary protocol covering the full REST API surface above -- database
-management, health, stats, single-cell and region operations, schema
-columns, and queries -- as a *peer* to that API, not a replacement for it.
-It uses the same databases, accounts, and semantics, just without
-HTTP/JSON's per-call overhead (see the
-[storage engine's cache measurements](kblockdblib.md#concurrency) for why
-that overhead is worth caring about in the first place: on a cache-hit
-`get`, roughly three-quarters of the total call time measured there was
-HTTP/transport, not the actual work). Disabled by default -- enable it
-with `--binary-port <port>` (or `binary_port` in the config file)
-alongside the REST API's own `--http-port`; both can run at once, against
-the same databases.
-
-Authentication *and database selection* here are per-*connection*, not
-per-request the way HTTP Basic Auth plus a `/db/{name}/` path segment are:
-a client sends one `Hello` right after connecting (username, password,
-*and* the database to select), and every request after that on the same
-connection is treated as that account against that database until the
-connection closes (or a later `Hello` re-selects either -- allowed, not
-required). If `Hello`'s named database doesn't exist yet, the account
-still authenticates -- so `ListDatabases`/`CreateDatabase`/
-`RemoveDatabase` work regardless -- but no database is selected, and every
-data request (`Get`/`Set`/`Query`/...) gets a `BadRequest` until the
-client creates that database and sends `Hello` again on the same
-connection to actually select it. (The REST API has no equivalent
-wrinkle: Basic Auth is already per-request, so `PUT /rest/databases/{name}`
-needs nothing more than valid credentials.) One request, one response,
-strictly in order -- this minimal version doesn't pipeline multiple
-in-flight requests on one connection; a client that wants more throughput
-than one connection's round-trip latency allows should open more
-connections, the same way it would against the REST API.
-
-Every message, either direction, is a length-prefixed frame
-(`[u32 LE payload_len][payload_len bytes]`) -- see
-`kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
-of every request (`Hello`, health/stats, cell/region operations, column
-add/remove/list, database list/create/remove, and queries) and response
-kind. The `Health` response carries the same fields as `/rest/health` --
-hostname, database count, timestamp -- read from the same server state, so
-the two transports can never disagree about what this instance is. A
-successful `Hello` (one that selected a database) reports that database's
-axes/world_dim/chunk_dim, the same shape a `/rest/db/{db}/stats` call's
-target database has. A successful `Get`'s `Value` response carries the cell's metadata alongside
-its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
-fields the REST API's single-cell `GET` reports (see "Cells and regions"
-above) -- read from the same server-side snapshot, so the two can never
-disagree. Framing only depends on the length prefix, never on
-understanding the payload, so a malformed request (an unknown opcode, a
-bad coordinate, and so on) becomes an error response rather than closing
-the connection.
-
-`kblockdbperf/src/binary_client.rs` uses the server's published `wire`
-module directly. The standalone [Java client](java-client.md) and
-[Python client](python-client.md) reimplement the format for their
-respective runtimes.
+A compact binary protocol covering this same REST API's full surface, as
+a *peer* to it rather than a replacement -- same databases, accounts, and
+semantics, just without HTTP/JSON's per-call overhead. Disabled by
+default; enable it with `--binary-port <port>` (or `binary_port` in the
+config file) alongside `--http-port`. See [Binary protocol](binary-protocol.md)
+for the full story: connection-scoped auth and database selection, the
+bootstrap flow for a not-yet-created database, protocol versioning, and
+the frame/request/response byte layout.
 
 ## Layout
 
@@ -597,10 +483,11 @@ respective runtimes.
 - `kblockdbserver/src/routes.rs`     -- the router (mounted under `/rest`,
   see "Databases"/"REST API" above), all HTTP handlers, and each one's
   `#[utoipa::path(...)]` OpenAPI annotation.
-- `kblockdbserver/src/query.pest`/`query.rs` -- the query language (see
-  "Query language" above): grammar, AST, parsing, and in-memory evaluation
-  against a `kblockdblib::CellEntry` (no I/O -- `routes.rs`'s query handler
-  owns every actual `World` call the parsed statement implies).
+- `kblockdbserver/src/query.pest`/`query.rs` -- the
+  [query language](query-language.md): grammar, AST, parsing, and
+  in-memory evaluation against a `kblockdblib::CellEntry` (no I/O --
+  `routes.rs`'s query handler owns every actual `World` call the parsed
+  statement implies).
 - `kblockdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
@@ -633,9 +520,10 @@ respective runtimes.
 - `kblockdbserver/src/tests.rs`      -- HTTP-level integration tests (real
   requests through the real `Router` via `tower::ServiceExt::oneshot`, no
   TCP socket needed).
-- `kblockdbserver/src/wire.rs`       -- the binary protocol's wire format
-  (see "Binary protocol" above): frame I/O, and every request/response
-  kind's encode/decode, plus their own round-trip tests.
+- `kblockdbserver/src/wire.rs`       -- the
+  [binary protocol](binary-protocol.md)'s wire format: frame I/O, and
+  every request/response kind's encode/decode, plus their own round-trip
+  tests.
 - `kblockdbserver/src/binary_server.rs` -- the binary protocol's TCP
   listener and per-connection handler, reusing the same `AppState` the
   REST API's handlers do.

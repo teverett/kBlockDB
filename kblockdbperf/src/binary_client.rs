@@ -59,6 +59,7 @@ impl BinaryClient {
         let mut stream = TcpStream::connect(addr).await.ok()?;
         stream.set_nodelay(true).ok()?;
         let hello = Request::Hello {
+            version: wire::PROTOCOL_VERSION,
             username: username.to_string(),
             password: password.to_string(),
             database: database.to_string(),

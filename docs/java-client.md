@@ -43,7 +43,7 @@ The resulting dependency-free jar is written to
 
 The server's binary listener must be enabled with `--binary-port` or the
 `binary_port` configuration setting. See the
-[server documentation](kblockdbserver.md#binary-protocol).
+[binary protocol documentation](binary-protocol.md).
 
 ## Usage
 
@@ -103,6 +103,7 @@ try (KBlockDBClient db =
 | `reauthenticate(username, password)` | `void` | Changes the account on the existing connection, keeping the selected database. |
 | `useDatabase(name)` | `void` | Selects a different database on the existing connection, reusing the cached credentials. |
 | `databaseSelected()` | `boolean` | Whether this connection currently has a database selected. |
+| `serverVersion()` | `int` | This server's binary protocol version, as reported by the most recent `Hello` -- meaningful whether or not a database is selected. |
 | `listDatabases()` | `List<String>` | Every database the server manages, sorted by name. Needs no selected database. |
 | `createDatabase(name)` | `void` | Creates a database with the server's default shape. Needs no selected database. (No way to override the shape over this protocol -- use the REST API's `PUT /rest/databases/{name}` for that.) |
 | `removeDatabase(name)` | `boolean` | Deletes a database and all its data; `false` if it didn't exist. |
@@ -136,8 +137,8 @@ the details.
 
 `Value` has `Str`, `F64`, `I64`, and `Bool` variants. A `SELECT` returns
 `QueryResult.Rows`; mutating statements return `QueryResult.Affected`.
-See the [query language documentation](kblockdbserver.md#query-language)
-for the grammar and examples.
+See the [query language documentation](query-language.md) for the grammar
+and examples.
 
 ## Errors
 

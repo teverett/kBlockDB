@@ -84,7 +84,7 @@ kblockdbserver's own error message to stderr and exit non-zero -- nothing
 is swallowed or retried silently.
 
 `query` takes the entire query text as one shell-quoted argument (see the
-[query language](kblockdbserver.md#query-language) for the grammar) and
+[query language](query-language.md) for the grammar) and
 posts it to `/rest/db/{db}/query`. A `SELECT` prints one line per matching
 cell, as `(coords) key=value (type) (created=<ms> modified=<ms> version=<n>), ...`
 -- the same per-key metadata `get` reports -- followed by a `<n> row(s)`

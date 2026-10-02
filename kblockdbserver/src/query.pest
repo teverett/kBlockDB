@@ -1,7 +1,7 @@
 // Grammar for kBlockDB's query language -- see query.rs's doc comment for
-// the three statement kinds and README's "Query language" section for
-// worked examples. Parsed with pest (https://pest.rs); `query.rs` walks
-// the resulting parse tree into this module's typed AST.
+// the four statement kinds and docs/query-language.md for worked examples.
+// Parsed with pest (https://pest.rs); `query.rs` walks the resulting parse
+// tree into this module's typed AST.
 
 WHITESPACE = _{ " " | "\t" | "\n" | "\r" }
 
@@ -28,6 +28,7 @@ kw_to     = @{ ^"TO"     ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_and    = @{ ^"AND"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_or     = @{ ^"OR"     ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not    = @{ ^"NOT"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_exists = @{ ^"EXISTS" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 statement = { SOI ~ (select_stmt | set_stmt | update_stmt | delete_stmt) ~ EOI }
 
@@ -59,7 +60,13 @@ expr      = { or_expr }
 or_expr   = { and_expr ~ (kw_or ~ and_expr)* }
 and_expr  = { not_expr ~ (kw_and ~ not_expr)* }
 not_expr  = { kw_not ~ not_expr | primary }
-primary   = { "(" ~ expr ~ ")" | comparison }
+primary   = { "(" ~ expr ~ ")" | exists | comparison }
+
+// Whether a key is set at a cell at all, regardless of its value or type --
+// `EXISTS(density)`. Always a plain key name, never `x<N>`: every cell has
+// every axis coordinate, so "does this axis exist" isn't a meaningful
+// question the way "is this key set" is.
+exists = { kw_exists ~ "(" ~ ident ~ ")" }
 
 comparison = { operand ~ compare_op ~ literal }
 // `x0`, `x1`, ... addresses a coordinate axis by index; anything else is a

@@ -171,36 +171,52 @@ fn require_write_database(session: &Session) -> Result<&str, Response> {
 async fn handle_request(req: Request, state: &AppState, session: &mut Session) -> Response {
     match req {
         Request::Hello {
+            version,
             username,
             password,
             database,
-        } => match state.authenticate(&username, &password) {
-            Some(acc) => {
-                let read_only = acc.read_only;
-                session.account = Some(acc);
-                match state.resolve_database(&database).await {
-                    Ok(world) => {
-                        session.database = Some(database);
-                        Response::HelloOk {
-                            read_only,
-                            database: Some(DatabaseShape {
-                                axes: world.axes() as u8,
-                                world_dim: world.world_dim(),
-                                chunk_dim: world.chunk_dim(),
-                            }),
+        } => {
+            // Checked before authenticating: a client this server can't
+            // safely decode past the version byte shouldn't learn anything
+            // about whether its credentials are even valid -- see
+            // `wire.rs`'s "Versioning" doc comment.
+            if version > wire::PROTOCOL_VERSION {
+                return Response::BadRequest(format!(
+                    "client protocol version {version} is newer than this server supports \
+                     (version {})",
+                    wire::PROTOCOL_VERSION
+                ));
+            }
+            match state.authenticate(&username, &password) {
+                Some(acc) => {
+                    let read_only = acc.read_only;
+                    session.account = Some(acc);
+                    match state.resolve_database(&database).await {
+                        Ok(world) => {
+                            session.database = Some(database);
+                            Response::HelloOk {
+                                server_version: wire::PROTOCOL_VERSION,
+                                read_only,
+                                database: Some(DatabaseShape {
+                                    axes: world.axes() as u8,
+                                    world_dim: world.world_dim(),
+                                    chunk_dim: world.chunk_dim(),
+                                }),
+                            }
                         }
-                    }
-                    Err(_) => {
-                        session.database = None;
-                        Response::HelloOk {
-                            read_only,
-                            database: None,
+                        Err(_) => {
+                            session.database = None;
+                            Response::HelloOk {
+                                server_version: wire::PROTOCOL_VERSION,
+                                read_only,
+                                database: None,
+                            }
                         }
                     }
                 }
+                None => Response::Unauthorized("invalid username or password".to_string()),
             }
-            None => Response::Unauthorized("invalid username or password".to_string()),
-        },
+        }
         Request::Get { coord, key } => {
             let db = match require_database(session) {
                 Ok(db) => db.to_string(),
@@ -555,6 +571,7 @@ mod tests {
         roundtrip(
             stream,
             &Request::Hello {
+                version: wire::PROTOCOL_VERSION,
                 username: username.to_string(),
                 password: password.to_string(),
                 database: database.to_string(),
@@ -583,6 +600,7 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
+                server_version: wire::PROTOCOL_VERSION,
                 read_only: false,
                 database: Some(DatabaseShape {
                     axes: 3,
@@ -602,6 +620,7 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
+                server_version: wire::PROTOCOL_VERSION,
                 read_only: true,
                 database: Some(DatabaseShape {
                     axes: 3,
@@ -622,6 +641,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hello_with_a_newer_client_version_is_rejected_before_checking_credentials() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::Hello {
+                version: wire::PROTOCOL_VERSION.saturating_add(1),
+                // Wrong password too -- if this were checked first it
+                // would come back `Unauthorized`, not `BadRequest`;
+                // getting `BadRequest` proves the version is checked
+                // before credentials are.
+                username: "admin".to_string(),
+                password: "wrong".to_string(),
+                database: DB.to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(response, Response::BadRequest(_)), "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn hello_with_an_older_or_matching_client_version_is_accepted() {
+        let server = spawn_test_server(3, 10_000).await;
+
+        for version in [0, wire::PROTOCOL_VERSION] {
+            let mut stream = connect(&server).await;
+            let response = roundtrip(
+                &mut stream,
+                &Request::Hello {
+                    version,
+                    username: "admin".to_string(),
+                    password: ADMIN_PASSWORD.to_string(),
+                    database: DB.to_string(),
+                },
+            )
+            .await;
+            assert!(matches!(response, Response::HelloOk { .. }), "{response:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn hello_ok_echoes_the_servers_protocol_version() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        let response = hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+        match response {
+            Response::HelloOk { server_version, .. } => {
+                assert_eq!(server_version, wire::PROTOCOL_VERSION);
+            }
+            other => panic!("expected Response::HelloOk, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn hello_against_an_unknown_database_still_authenticates_but_selects_nothing() {
         let server = spawn_test_server(3, 10_000).await;
         let mut stream = connect(&server).await;
@@ -630,6 +705,7 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
+                server_version: wire::PROTOCOL_VERSION,
                 read_only: false,
                 database: None,
             }
@@ -674,6 +750,7 @@ mod tests {
         assert_eq!(
             hello_db(&mut stream, "admin", ADMIN_PASSWORD, "fresh").await,
             Response::HelloOk {
+                server_version: wire::PROTOCOL_VERSION,
                 read_only: false,
                 database: None,
             }
@@ -703,6 +780,7 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
+                server_version: wire::PROTOCOL_VERSION,
                 read_only: false,
                 database: Some(DatabaseShape {
                     axes: 3,

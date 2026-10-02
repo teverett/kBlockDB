@@ -1202,6 +1202,55 @@ async fn select_where_filters_by_value() {
 }
 
 #[tokio::test]
+async fn select_where_exists_filters_by_whether_a_key_is_set() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/density",
+            json!({"type": "f64", "value": 2.6}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/material",
+            json!({"type": "str", "value": "air"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post("/rest/db/db/query", query("SELECT * WHERE EXISTS(density)")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+
+    let (_, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE NOT EXISTS(density)"),
+        ),
+    )
+    .await;
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([4, 5, 6]));
+}
+
+#[tokio::test]
 async fn select_where_filters_by_axis_coordinate() {
     let (app, _dir) = test_app();
     for coords in ["1,1,1", "40,40,40"] {

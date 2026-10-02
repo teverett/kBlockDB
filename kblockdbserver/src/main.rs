@@ -214,8 +214,8 @@ fn print_help() {
          running it somewhere untrusted. 0 asks the OS for a free\n                          \
          port, which the startup banner then reports.\n    \
          --binary-port <port> Also listen on this port for the binary protocol (see\n                          \
-         wire.rs and the README's \"Binary protocol\" section) --\n                          \
-         disabled unless given; same databases, same accounts as the\n                          \
+         wire.rs and docs/binary-protocol.md) -- disabled unless given;\n                          \
+         same databases, same accounts as the\n                          \
          REST API, just without HTTP/JSON overhead\n    \
          --max-concurrent-disk-ops <n>\n                          \
          Cap on concurrent filesystem operations, applied to every\n                          \

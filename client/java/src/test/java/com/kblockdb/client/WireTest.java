@@ -62,11 +62,16 @@ class WireTest {
         byte[] payload = Wire.encodeHello("admin", "hi", "mydb");
         byte[] expected = {
                 0x00,
+                Wire.PROTOCOL_VERSION,
                 5, 'a', 'd', 'm', 'i', 'n',
                 2, 'h', 'i',
                 4, 'm', 'y', 'd', 'b',
         };
         assertArrayEquals(expected, payload);
+        // Pinned separately from the byte literal above so a change to
+        // PROTOCOL_VERSION without updating that literal fails loudly here
+        // rather than this test silently tracking the constant.
+        assertEquals(1, Wire.PROTOCOL_VERSION);
     }
 
     @Test
@@ -276,6 +281,7 @@ class WireTest {
     void decodesHelloOk() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(1); // server_version
         buf.write(0); // read_only = false
         buf.write(1); // database_selected = true
         buf.write(3);
@@ -284,7 +290,7 @@ class WireTest {
 
         Wire.Response response = Wire.decodeResponse(buf.toByteArray());
         assertEquals(
-                new Wire.HelloOk(false, Optional.of(new Wire.DatabaseShape(3, 10_000L, 32L))),
+                new Wire.HelloOk(1, false, Optional.of(new Wire.DatabaseShape(3, 10_000L, 32L))),
                 response);
     }
 
@@ -292,6 +298,7 @@ class WireTest {
     void decodesHelloOkReportingAReadOnlyAccount() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(1); // server_version
         buf.write(1); // read_only = true
         buf.write(1); // database_selected = true
         buf.write(4);
@@ -300,7 +307,7 @@ class WireTest {
 
         Wire.Response response = Wire.decodeResponse(buf.toByteArray());
         assertEquals(
-                new Wire.HelloOk(true, Optional.of(new Wire.DatabaseShape(4, 1L, 1L))),
+                new Wire.HelloOk(1, true, Optional.of(new Wire.DatabaseShape(4, 1L, 1L))),
                 response);
     }
 
@@ -308,11 +315,12 @@ class WireTest {
     void decodesHelloOkWithNoDatabaseSelected() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(1); // server_version
         buf.write(0); // read_only = false
         buf.write(0); // database_selected = false -- no shape fields follow
 
         Wire.Response response = Wire.decodeResponse(buf.toByteArray());
-        assertEquals(new Wire.HelloOk(false, Optional.empty()), response);
+        assertEquals(new Wire.HelloOk(1, false, Optional.empty()), response);
     }
 
     @Test
@@ -461,8 +469,8 @@ class WireTest {
     @Test
     void decodeResponseRejectsATruncatedPayload() {
         // HelloOk promising a selected database's shape, but cut off after
-        // read_only/database_selected.
-        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(new byte[] {0x00, 0, 1}));
+        // server_version/read_only/database_selected.
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(new byte[] {0x00, 1, 0, 1}));
     }
 
     @Test

@@ -75,7 +75,7 @@ well under a minute, and every default is overridable.
 - **`binary_set_cell` / `binary_get_cell` / `binary_remove_cell`** -- the
   same sequential single-cell workload as `set_cell`/`get_cell`/
   `remove_cell`, but over the
-  [binary protocol](kblockdbserver.md#binary-protocol) instead of REST,
+  [binary protocol](binary-protocol.md) instead of REST,
   via `binary_client.rs`. Comparing these against
   their REST counterparts is the point -- same database, same semantics,
   just without HTTP/JSON's per-call overhead.

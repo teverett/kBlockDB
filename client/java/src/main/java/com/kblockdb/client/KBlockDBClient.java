@@ -61,6 +61,7 @@ public final class KBlockDBClient implements Closeable {
     private int axes;
     private long worldDim;
     private long chunkDim;
+    private int serverVersion;
     private boolean readOnly;
     private boolean databaseSelected;
 
@@ -77,6 +78,7 @@ public final class KBlockDBClient implements Closeable {
     }
 
     private void applyHello(Wire.HelloOk hello) {
+        this.serverVersion = hello.serverVersion();
         this.readOnly = hello.readOnly();
         this.databaseSelected = hello.database().isPresent();
         Wire.DatabaseShape shape = hello.database().orElse(null);
@@ -124,6 +126,20 @@ public final class KBlockDBClient implements Closeable {
             closeQuietly(socket);
             throw e;
         }
+    }
+
+    /**
+     * This server's binary protocol version, as reported by the most
+     * recent {@code Hello} -- unlike {@link #axes()}/{@link #worldDim()}/
+     * {@link #chunkDim()}, meaningful whether or not a database is
+     * currently selected, since it's server-wide, not per-database. A
+     * client that knows about more than one protocol version can compare
+     * this against its own to decide how to speak to an older (or newer)
+     * server -- see {@code kblockdbserver::wire}'s "Versioning" doc
+     * comment.
+     */
+    public int serverVersion() {
+        return serverVersion;
     }
 
     /**

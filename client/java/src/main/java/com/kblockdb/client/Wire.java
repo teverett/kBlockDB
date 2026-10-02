@@ -33,6 +33,15 @@ final class Wire {
      */
     static final long MAX_FRAME_LEN = 64L * 1024 * 1024;
 
+    /**
+     * This client's binary protocol version -- matches
+     * {@code kblockdbserver::wire::PROTOCOL_VERSION}. Sent as {@code Hello}'s
+     * first field; the server echoes its own back in
+     * {@code HelloOk.serverVersion}. There is, as yet, only this one
+     * version -- see that constant's doc comment for the full story.
+     */
+    static final int PROTOCOL_VERSION = 1;
+
     // --- Frame I/O ---
     //
     // Every message, either direction, is a length-prefixed frame:
@@ -194,6 +203,7 @@ final class Wire {
     static byte[] encodeHello(String username, String password, String database) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(PROTOCOL_VERSION);
         writeShortString(buf, username);
         writeShortString(buf, password);
         writeShortString(buf, database);
@@ -327,12 +337,14 @@ final class Wire {
     }
 
     /**
+     * @param serverVersion this server's {@code PROTOCOL_VERSION} -- see
+     *                      that constant's doc comment.
      * @param database empty if {@code Hello}'s named database didn't exist
      *                 yet -- the account still authenticated, but no
      *                 database is selected for this connection until a
      *                 later {@code Hello} (see {@link KBlockDBClient#useDatabase}) names one that exists.
      */
-    record HelloOk(boolean readOnly, Optional<DatabaseShape> database) implements Response {
+    record HelloOk(int serverVersion, boolean readOnly, Optional<DatabaseShape> database) implements Response {
         HelloOk {
             Objects.requireNonNull(database, "database");
         }
@@ -429,17 +441,18 @@ final class Wire {
     }
 
     /**
-     * {@code 0x00 HelloOk}: {@code [u8 read_only][u8 database_selected]},
+     * {@code 0x00 HelloOk}: {@code [u8 server_version][u8 read_only][u8 database_selected]},
      * then only if {@code database_selected != 0}:
      * {@code [u8 axes][u32 LE world_dim][u32 LE chunk_dim]}.
      */
     private static HelloOk helloOkOf(Reader r) throws ProtocolException {
+        int serverVersion = r.u8();
         boolean readOnly = r.u8() != 0;
         boolean selected = r.u8() != 0;
         Optional<DatabaseShape> database = selected
                 ? Optional.of(new DatabaseShape(r.u8(), r.u32(), r.u32()))
                 : Optional.empty();
-        return new HelloOk(readOnly, database);
+        return new HelloOk(serverVersion, readOnly, database);
     }
 
     /**

@@ -102,7 +102,11 @@ docs/             per-component documentation
 - [`kblockdblib`](docs/kblockdblib.md) -- storage engine design, chunk
   format, caching, concurrency, and compression.
 - [`kblockdbserver`](docs/kblockdbserver.md) -- configuration, REST API,
-  query language, data browser, and binary protocol.
+  and data browser.
+- [Query language](docs/query-language.md) -- the SQL-like
+  `SELECT`/`SET`/`UPDATE`/`DELETE` grammar every transport shares.
+- [Binary protocol](docs/binary-protocol.md) -- the compact TCP protocol
+  that peers with the REST API.
 - [`kblockdbperf`](docs/kblockdbperf.md) -- performance suite usage and
   scenarios.
 - [`kblockdbcli`](docs/kblockdbcli.md) -- command-line client usage.

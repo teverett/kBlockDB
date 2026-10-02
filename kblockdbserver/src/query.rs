@@ -12,9 +12,11 @@
 //! `(o0,o1,...) TO (e0,e1,...)`, inclusive of `o`/exclusive of `e` on every
 //! axis (matching `kblockdblib::Region`'s own origin/extent convention).
 //! `<criteria>` is a boolean expression combining comparisons
-//! (`key = 'value'`, `x0 >= 10`, ...) with `AND`/`OR`/`NOT` and
+//! (`key = 'value'`, `x0 >= 10`, ...) and `EXISTS(key)` (whether `key` is
+//! set at a cell at all, regardless of its value) with `AND`/`OR`/`NOT` and
 //! parentheses; `x<N>` addresses coordinate axis `N`, anything else is a
-//! key name.
+//! key name. See `docs/query-language.md` for the full grammar and
+//! worked examples.
 //!
 //! **`SET` is an upsert, `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all
 //! operate on `kblockdblib::World::list_cells` -- i.e. only cells that
@@ -119,6 +121,11 @@ pub enum Expr {
     Or(Box<Expr>, Box<Expr>),
     Not(Box<Expr>),
     Compare(Operand, CompareOp, Literal),
+    /// `EXISTS(key)`: whether `key` is set at a cell at all, regardless of
+    /// its value or type -- unlike `Compare`, which only ever matches a
+    /// *particular* value, this is how `WHERE` asks "is this key set here"
+    /// on its own.
+    Exists(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -397,9 +404,22 @@ fn build_primary(pair: Pair<Rule>) -> Expr {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::expr => build_expr(inner),
+        Rule::exists => build_exists(inner),
         Rule::comparison => build_comparison(inner),
-        other => unreachable!("primary can only contain expr/comparison, got {other:?}"),
+        other => unreachable!("primary can only contain expr/exists/comparison, got {other:?}"),
     }
+}
+
+fn build_exists(pair: Pair<Rule>) -> Expr {
+    // exists = { kw_exists ~ "(" ~ ident ~ ")" } -- kw_exists is atomic, so
+    // (like the statement/connective keywords elsewhere in this file) it
+    // shows up as its own pair in inner(), ahead of the ident we actually
+    // want.
+    let ident = pair
+        .into_inner()
+        .find(|p| p.as_rule() == Rule::ident)
+        .expect("exists always has an ident pair besides its keyword");
+    Expr::Exists(ident.as_str().to_string())
 }
 
 fn build_comparison(pair: Pair<Rule>) -> Expr {
@@ -500,6 +520,7 @@ pub fn eval(expr: &Expr, cell: &CellEntry) -> bool {
         Expr::Or(a, b) => eval(a, cell) || eval(b, cell),
         Expr::Not(a) => !eval(a, cell),
         Expr::Compare(operand, op, literal) => eval_compare(operand, *op, literal, cell),
+        Expr::Exists(key) => cell.values.iter().any(|(k, _, _)| k == key),
     }
 }
 
@@ -895,6 +916,57 @@ mod tests {
     }
 
     #[test]
+    fn parses_exists() {
+        let stmt = parse("SELECT * WHERE EXISTS(density)").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(expr, Expr::Exists("density".to_string()));
+    }
+
+    #[test]
+    fn exists_is_case_insensitive_like_other_keywords() {
+        assert!(parse("SELECT * WHERE exists(density)").is_ok());
+        assert!(parse("SELECT * WHERE Exists(density)").is_ok());
+    }
+
+    #[test]
+    fn a_key_named_like_the_exists_keyword_still_works_as_an_ordinary_comparison() {
+        // Same word-boundary guarantee every other keyword has (see
+        // query.pest's kw_* doc comment): "EXISTS" only matches the
+        // keyword at a word boundary, so a key that merely starts with it
+        // is still an ordinary identifier.
+        let stmt = parse("SELECT * WHERE existsflag = true").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::Compare(
+                Operand::Key("existsflag".to_string()),
+                CompareOp::Eq,
+                Literal::Bool(true)
+            )
+        );
+    }
+
+    #[test]
+    fn exists_without_parentheses_or_a_key_is_rejected() {
+        assert!(parse("SELECT * WHERE EXISTS").is_err());
+        assert!(parse("SELECT * WHERE EXISTS density").is_err());
+        assert!(parse("SELECT * WHERE EXISTS()").is_err());
+        assert!(parse("SELECT * WHERE EXISTS(1)").is_err()); // not an ident
+    }
+
+    #[test]
     fn parentheses_override_precedence() {
         // (x0=1 OR x1=2) AND x2=3 -- top level must be AND, not OR.
         let stmt = parse("SELECT * WHERE (x0 = 1 OR x1 = 2) AND x2 = 3").unwrap();
@@ -1053,6 +1125,50 @@ mod tests {
         assert!(eval(&parse_expr("x0 = 99 OR material = 'stone'"), &c));
         assert!(eval(&parse_expr("NOT x0 = 99"), &c));
         assert!(!eval(&parse_expr("NOT x0 = 10"), &c));
+    }
+
+    #[test]
+    fn eval_exists_is_true_when_the_key_is_set_regardless_of_its_value() {
+        let c = cell(
+            &[0, 0, 0],
+            vec![
+                ("material", Value::Str("stone".into())),
+                ("hardness", Value::I64(0)), // a falsy-looking value still counts
+                ("flammable", Value::Bool(false)),
+            ],
+        );
+        assert!(eval(&parse_expr("EXISTS(material)"), &c));
+        assert!(eval(&parse_expr("EXISTS(hardness)"), &c));
+        assert!(eval(&parse_expr("EXISTS(flammable)"), &c));
+    }
+
+    #[test]
+    fn eval_exists_is_false_when_the_key_is_not_set() {
+        let c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        assert!(!eval(&parse_expr("EXISTS(density)"), &c));
+    }
+
+    #[test]
+    fn eval_exists_combines_with_not_and_and_or() {
+        let with_density = cell(&[0, 0, 0], vec![("density", Value::F64(2.6))]);
+        let without_density = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+
+        assert!(eval(&parse_expr("NOT EXISTS(density)"), &without_density));
+        assert!(!eval(&parse_expr("NOT EXISTS(density)"), &with_density));
+
+        assert!(eval(
+            &parse_expr("EXISTS(density) AND density > 1"),
+            &with_density
+        ));
+        assert!(!eval(
+            &parse_expr("EXISTS(density) AND density > 1"),
+            &without_density
+        ));
+
+        assert!(eval(
+            &parse_expr("EXISTS(density) OR material = 'stone'"),
+            &without_density
+        ));
     }
 
     /// Test-only helper: parses `SELECT * WHERE <src>` and returns just the

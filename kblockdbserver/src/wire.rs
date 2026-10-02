@@ -28,6 +28,29 @@
 //! find the start of the *next* frame regardless of whether it understood
 //! this one, so one bad request doesn't have to end the connection.
 //!
+//! **Versioning.** `Hello` carries the client's protocol version
+//! ([`PROTOCOL_VERSION`] for any client in this repo), and `HelloOk` echoes
+//! back the version the *server* speaks -- the one place every client
+//! already has to round-trip before anything else, so it's the one choke
+//! point a version mismatch needs to be caught at, rather than every
+//! opcode carrying its own version. Two directions this enables, neither
+//! exercised yet since there's only one version in existence:
+//! - A future client built against a newer protocol version can read
+//!   `HelloOk`'s `server_version`, see it's talking to an older server, and
+//!   adapt (speak that older server's opcodes/fields, warn, refuse, ...) --
+//!   this is the "compatibility code for old servers" `server_version`
+//!   exists to make possible, and it's entirely client-side; nothing here
+//!   needs to change for it.
+//! - A server can protect itself from a client claiming a version *newer*
+//!   than it understands (`binary_server.rs`'s `Hello` handler rejects this
+//!   with `BadRequest`), since past the version byte itself it has no way
+//!   to know what that version's field shapes look like. A client claiming
+//!   its own version or older is accepted, on the assumption that a future
+//!   version's server-side decode logic will keep knowing how to read every
+//!   earlier version's request shapes -- that per-version decode dispatch
+//!   doesn't exist yet either, since there's nothing to dispatch *to* with
+//!   only one version defined.
+//!
 //! **Databases.** kBlockDB manages any number of independent databases
 //! under one `--data-dir`, each one its own `kblockdblib::World` (see
 //! `state::Databases`). `Hello` authenticates an account *and* selects one
@@ -47,7 +70,8 @@
 //! ```text
 //! [u8 opcode] <opcode-specific fields>
 //!
-//! 0x00 Hello:  [u8 username_len][username bytes]
+//! 0x00 Hello:  [u8 client_protocol_version]
+//!              [u8 username_len][username bytes]
 //!              [u8 password_len][password bytes]
 //!              [u8 database_len][database bytes]
 //! 0x01 Get:    <coord> <key>
@@ -86,7 +110,8 @@
 //! ```text
 //! [u8 status] <status-specific fields>
 //!
-//! 0x00 HelloOk:      [u8 read_only (0/1)][u8 database_selected (0/1)]
+//! 0x00 HelloOk:      [u8 server_protocol_version]
+//!                    [u8 read_only (0/1)][u8 database_selected (0/1)]
 //!                    (if database_selected: [u8 axes][u32 LE world_dim][u32 LE chunk_dim])
 //! 0x01 Ok:           (Set/Remove succeeded)
 //! 0x02 Value:        <value> <meta>
@@ -128,9 +153,18 @@ use std::fmt;
 /// peer can make this server try to allocate from one length prefix.
 pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 
+/// This build's binary protocol version -- see this module's doc comment's
+/// "Versioning" section. Sent as `Hello`'s first field and echoed back as
+/// `HelloOk`'s. There is, as yet, only ever this one version: it exists so
+/// a later, genuinely incompatible wire change has a number to bump and a
+/// place (`binary_server.rs`'s `Hello` handling) to branch on it, not
+/// because anything currently reads it as anything but this one constant.
+pub const PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Debug, PartialEq)]
 pub enum Request {
     Hello {
+        version: u8,
         username: String,
         password: String,
         database: String,
@@ -227,6 +261,9 @@ pub enum QueryResult {
 #[derive(Debug, PartialEq)]
 pub enum Response {
     HelloOk {
+        /// This server's [`PROTOCOL_VERSION`] -- see this module's doc
+        /// comment's "Versioning" section.
+        server_version: u8,
         read_only: bool,
         /// `None` if `Hello`'s named database doesn't exist yet -- see this
         /// module's doc comment on the bootstrap flow that follows.
@@ -312,11 +349,13 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut buf = Vec::new();
     match req {
         Request::Hello {
+            version,
             username,
             password,
             database,
         } => {
             buf.push(0x00);
+            buf.push(*version);
             put_short_string(&mut buf, username);
             put_short_string(&mut buf, password);
             put_short_string(&mut buf, database);
@@ -405,10 +444,12 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
     let mut buf = Vec::new();
     match resp {
         Response::HelloOk {
+            server_version,
             read_only,
             database,
         } => {
             buf.push(0x00);
+            buf.push(*server_version);
             buf.push(u8::from(*read_only));
             match database {
                 Some(shape) => {
@@ -701,6 +742,7 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
     let mut r = Reader::new(payload);
     match r.u8()? {
         0x00 => Ok(Request::Hello {
+            version: r.u8()?,
             username: r.short_string()?,
             password: r.short_string()?,
             database: r.short_string()?,
@@ -769,6 +811,7 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
     let mut r = Reader::new(payload);
     match r.u8()? {
         0x00 => {
+            let server_version = r.u8()?;
             let read_only = r.u8()? != 0;
             let database = match r.u8()? {
                 0 => None,
@@ -779,6 +822,7 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
                 }),
             };
             Ok(Response::HelloOk {
+                server_version,
                 read_only,
                 database,
             })
@@ -946,11 +990,13 @@ mod tests {
     #[test]
     fn hello_request_round_trips() {
         roundtrip_request(Request::Hello {
+            version: PROTOCOL_VERSION,
             username: "admin".into(),
             password: "hunter2".into(),
             database: "mydb".into(),
         });
         roundtrip_request(Request::Hello {
+            version: 0,
             username: String::new(),
             password: String::new(),
             database: String::new(),
@@ -1049,6 +1095,7 @@ mod tests {
     #[test]
     fn hello_ok_response_round_trips() {
         roundtrip_response(Response::HelloOk {
+            server_version: PROTOCOL_VERSION,
             read_only: false,
             database: Some(DatabaseShape {
                 axes: 3,
@@ -1057,6 +1104,7 @@ mod tests {
             }),
         });
         roundtrip_response(Response::HelloOk {
+            server_version: PROTOCOL_VERSION,
             read_only: true,
             database: Some(DatabaseShape {
                 axes: 4,
@@ -1067,6 +1115,7 @@ mod tests {
         // No database selected (Hello named one that doesn't exist yet) --
         // see this module's doc comment on the bootstrap flow.
         roundtrip_response(Response::HelloOk {
+            server_version: PROTOCOL_VERSION,
             read_only: false,
             database: None,
         });

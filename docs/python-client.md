@@ -23,6 +23,12 @@ if not client.database_selected:
     client.use_database("newdb")
 ```
 
+`connect()`/`use_database()`/`reauthenticate()` also set `client.server_version`
+to this server's binary protocol version (meaningful whether or not a
+database is selected) -- a client that knows about more than one protocol
+version can compare it against its own to decide how to talk to an older
+(or newer) server.
+
 ## Install
 
 Install the package from the repository:
@@ -33,7 +39,7 @@ python3 -m pip install ./client/python
 
 The server's binary listener must be enabled with `--binary-port` or the
 `binary_port` configuration setting. See the
-[server documentation](kblockdbserver.md#binary-protocol).
+[binary protocol documentation](binary-protocol.md).
 
 ## Usage
 
@@ -118,8 +124,8 @@ existing key raises `ConflictError` rather than changing its type -- and
 whole database. See the [server's notes](kblockdbserver.md#columns) for
 the details.
 
-See the [query language documentation](kblockdbserver.md#query-language)
-for the grammar and examples.
+See the [query language documentation](query-language.md) for the grammar
+and examples.
 
 ## Errors
 
