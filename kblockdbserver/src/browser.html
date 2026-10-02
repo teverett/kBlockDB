@@ -13,12 +13,24 @@
   }
   h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
   p.sub { color: #666; margin-top: 0; }
+  .toolbar {
+    display: flex;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 1rem;
+  }
+  #database {
+    padding: 0.5rem 0.6rem;
+    font-size: 1rem;
+    border: 1px solid #ccc;
+    border-radius: 6px;
+    min-width: 10rem;
+  }
   #search {
-    width: 100%;
+    flex: 1;
     box-sizing: border-box;
     padding: 0.55rem 0.75rem;
     font-size: 1rem;
-    margin-bottom: 1rem;
     border: 1px solid #ccc;
     border-radius: 6px;
   }
@@ -92,9 +104,12 @@
 </head>
 <body>
   <h1>kBlockDB</h1>
-  <p class="sub">Every populated cell, sorted ascending by coordinate. Click a row for its full keys and values.</p>
+  <p class="sub">Every populated cell in the selected database, sorted ascending by coordinate. Click a row for its full keys and values.</p>
 
-  <input id="search" type="search" placeholder="Search by coordinate, key, or value...">
+  <div class="toolbar">
+    <select id="database" aria-label="Database"></select>
+    <input id="search" type="search" placeholder="Search by coordinate, key, or value...">
+  </div>
 
   <table>
     <thead>
@@ -140,11 +155,12 @@
 (function () {
   "use strict";
 
-  const state = { page: 1, pageSize: 50, search: "" };
+  const state = { database: "", page: 1, pageSize: 50, search: "" };
 
   const rowsBody = document.getElementById("rows");
   const emptyMsg = document.getElementById("empty");
   const pageInfo = document.getElementById("page-info");
+  const databaseSelect = document.getElementById("database");
   const searchInput = document.getElementById("search");
   const prevBtn = document.getElementById("prev");
   const nextBtn = document.getElementById("next");
@@ -181,8 +197,53 @@
     return String(v.value) + " (" + v.type + ")";
   }
 
+  async function loadDatabases() {
+    let resp;
+    try {
+      resp = await fetch("rest/databases");
+    } catch (e) {
+      renderError("request failed: " + e);
+      return;
+    }
+    if (!resp.ok) {
+      renderError(resp.status + ": " + resp.statusText);
+      return;
+    }
+    const data = await resp.json();
+    const names = data.databases || [];
+
+    databaseSelect.textContent = "";
+    names.forEach(function (name) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      databaseSelect.appendChild(opt);
+    });
+
+    if (names.length === 0) {
+      state.database = "";
+      databaseSelect.disabled = true;
+      searchInput.disabled = true;
+      renderError("No databases yet.");
+      return;
+    }
+
+    databaseSelect.disabled = false;
+    searchInput.disabled = false;
+    // Keep the previously selected database if it's still around (e.g.
+    // after it's reloaded via the dropdown change handler below);
+    // otherwise default to the first one.
+    state.database = names.includes(state.database) ? state.database : names[0];
+    databaseSelect.value = state.database;
+    load();
+  }
+
   async function load() {
+    if (!state.database) {
+      return;
+    }
     const params = new URLSearchParams({
+      db: state.database,
       page: String(state.page),
       page_size: String(state.pageSize),
       search: state.search,
@@ -291,6 +352,14 @@
     }
   });
 
+  databaseSelect.addEventListener("change", function () {
+    state.database = databaseSelect.value;
+    state.page = 1;
+    state.search = "";
+    searchInput.value = "";
+    load();
+  });
+
   let searchTimer = null;
   searchInput.addEventListener("input", function () {
     clearTimeout(searchTimer);
@@ -312,7 +381,7 @@
     load();
   });
 
-  load();
+  loadDatabases();
 })();
 </script>
 </body>

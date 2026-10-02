@@ -9,9 +9,9 @@
 
 use crate::error::ErrorBody;
 use crate::routes::{
-    self, AddColumnBody, CellResponse, ColumnResponse, ColumnsResponse, HealthResponse,
-    QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody,
-    StatsResponse,
+    self, AddColumnBody, CellResponse, ColumnResponse, ColumnsResponse, CreateDatabaseBody,
+    DatabasesResponse, HealthResponse, QueryKeyValue, QueryRequest, QueryResponse, QueryRow,
+    RegionValuesResponse, SetRegionBody, StatsResponse,
 };
 use crate::value_json::{ValueJson, ValueTypeJson};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -22,12 +22,17 @@ use utoipa::{Modify, OpenApi};
     info(
         title = "kblockdbserver",
         description = "A RESTful HTTP front end for the kblockdblib storage engine, \
-                       mounted under /rest. Every path except /rest/health requires \
-                       HTTP Basic Auth against an account from kblockdbserver's \
-                       config file.",
+                       mounted under /rest. This server manages any number of \
+                       independent databases (see /rest/databases); every \
+                       per-database path is scoped under /rest/db/{db}/. Every path \
+                       except /rest/health requires HTTP Basic Auth against an \
+                       account from kblockdbserver's config file.",
     ),
     paths(
         routes::health,
+        routes::list_databases,
+        routes::create_database,
+        routes::remove_database,
         routes::stats,
         routes::list_columns,
         routes::add_column,
@@ -42,6 +47,8 @@ use utoipa::{Modify, OpenApi};
     ),
     components(schemas(
         HealthResponse,
+        DatabasesResponse,
+        CreateDatabaseBody,
         StatsResponse,
         ColumnResponse,
         ColumnsResponse,
@@ -59,8 +66,9 @@ use utoipa::{Modify, OpenApi};
     )),
     tags(
         (name = "health", description = "Liveness -- unauthenticated"),
-        (name = "stats", description = "On-disk statistics for the world's data"),
-        (name = "columns", description = "The world's schema -- listing, adding and dropping columns"),
+        (name = "databases", description = "Which databases this server manages -- listing, creating, and deleting"),
+        (name = "stats", description = "On-disk statistics for a database's data"),
+        (name = "columns", description = "A database's schema -- listing, adding and dropping columns"),
         (name = "cells", description = "Single-cell reads and writes"),
         (name = "regions", description = "Axis-aligned box-of-cells reads and writes"),
         (name = "query", description = "The SELECT/SET/UPDATE/DELETE query language -- see the README"),

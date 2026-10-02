@@ -4,12 +4,11 @@
 //! `coords.rs`/`value_json.rs`.
 
 use crate::routes::router;
-use crate::state::{Account, AppState};
+use crate::state::{Account, AppState, Databases, WorldShape};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum_extra::headers::{Authorization, HeaderMapExt};
 use http_body_util::BodyExt;
-use kblockdblib::World;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -28,9 +27,24 @@ const TEST_USER_PASSWORD: &str = "alice-password";
 const TEST_READ_ONLY_USER: &str = "bob";
 const TEST_READ_ONLY_PASSWORD: &str = "bob-password";
 
+/// The shape every `test_app()`-created database uses, including the one
+/// `test_app()` itself pre-creates (see `DB`).
+const TEST_SHAPE: WorldShape = WorldShape {
+    axes: 3,
+    world_dim: 100,
+    chunk_dim: 32,
+};
+
+/// The database `test_app()` pre-creates, so every test written before
+/// multi-database support existed keeps working unchanged against
+/// `/rest/db/{DB}/...` -- tests that exercise database management
+/// (creating/listing/deleting, cross-database isolation, 404s against an
+/// unknown database) use other names instead.
+const DB: &str = "db";
+
 /// Removes its temp directory when dropped. Each test binds this to a local
-/// so the world's data dir outlives the `Router` built on top of it, then
-/// gets cleaned up at the end of the test.
+/// so the data dir outlives the `Router` built on top of it, then gets
+/// cleaned up at the end of the test.
 struct TestDir(PathBuf);
 
 impl Drop for TestDir {
@@ -39,15 +53,29 @@ impl Drop for TestDir {
     }
 }
 
-/// A fresh 3-axis, world_dim=100 world in its own temp directory, wrapped
-/// in a router -- what every test below starts from. Keep the returned
-/// `TestDir` alive (bind it, don't `let _ =`) for the test's duration.
+/// A fresh data directory in its own temp directory, with one pre-created
+/// database (`DB`, shaped `TEST_SHAPE`), wrapped in a router -- what every
+/// test below starts from. Keep the returned `TestDir` alive (bind it,
+/// don't `let _ =`) for the test's duration.
 fn test_app() -> (axum::Router, TestDir) {
+    let (databases, dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    (router(test_state(databases)), dir)
+}
+
+/// Core of `test_app`, minus the pre-created database and the router --
+/// for tests that need to drive `Databases`/`AppState` directly (e.g. to
+/// reopen the same data dir with different credentials) rather than through
+/// a fresh `test_app()`.
+fn test_databases() -> (Databases, TestDir) {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir: PathBuf =
         std::env::temp_dir().join(format!("kblockdbserver-test-{n}-{}", std::process::id()));
-    let world = World::create(&dir, 3, 100, 32).unwrap();
+    (Databases::new(&dir, TEST_SHAPE), TestDir(dir))
+}
+
+fn test_credentials() -> HashMap<String, Account> {
     let mut credentials = HashMap::new();
     credentials.insert(
         TEST_ADMIN.to_string(),
@@ -70,10 +98,11 @@ fn test_app() -> (axum::Router, TestDir) {
             read_only: true,
         },
     );
-    (
-        router(AppState::new(world, Arc::new(credentials))),
-        TestDir(dir),
-    )
+    credentials
+}
+
+fn test_state(databases: Databases) -> AppState {
+    AppState::new(databases, Arc::new(test_credentials()))
 }
 
 /// Adds a Basic Auth header for `user`/`password` to `req`.
@@ -153,13 +182,25 @@ fn delete(path: &str) -> Request<Body> {
 }
 
 #[tokio::test]
-async fn health_reports_the_worlds_shape() {
+async fn health_reports_status_and_the_database_count() {
     let (status, body) = send(test_app().0, get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["status"], "ok");
-    assert_eq!(body["axes"], 3);
-    assert_eq!(body["world_dim"], 100);
-    assert_eq!(body["chunk_dim"], 32);
+    // `test_app()` pre-creates exactly one database (`DB`).
+    assert_eq!(body["database_count"], 1);
+}
+
+#[tokio::test]
+async fn health_database_count_reflects_databases_created_and_removed() {
+    let (app, _dir) = test_app();
+    send(app.clone(), put("/rest/databases/extra", json!({}))).await;
+
+    let (_, body) = send(app.clone(), get("/rest/health")).await;
+    assert_eq!(body["database_count"], 2);
+
+    send(app.clone(), delete("/rest/databases/extra")).await;
+    let (_, body) = send(app, get("/rest/health")).await;
+    assert_eq!(body["database_count"], 1);
 }
 
 /// Nothing here can assert *which* hostname the machine running the
@@ -178,9 +219,8 @@ async fn health_reports_a_non_empty_hostname() {
 
 #[tokio::test]
 async fn health_reports_the_configured_hostname_override() {
-    let (_, dir) = test_app();
-    let world = World::open(&dir.0).unwrap();
-    let state = AppState::new(world, Arc::new(HashMap::new()))
+    let (databases, _dir) = test_databases();
+    let state = AppState::new(databases, Arc::new(HashMap::new()))
         .with_hostname("db-1.example.com".to_string());
 
     let (status, body) = send(router(state), get("/rest/health")).await;
@@ -200,7 +240,7 @@ async fn health_still_needs_no_credentials() {
     let (status, body) = send(test_app().0, req).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["hostname"].is_string());
-    assert_eq!(body["chunk_dim"], 32);
+    assert_eq!(body["database_count"], 1);
 }
 
 #[tokio::test]
@@ -228,7 +268,7 @@ async fn health_includes_a_current_unix_timestamp() {
 
 #[tokio::test]
 async fn stats_of_an_untouched_world_are_all_zero() {
-    let (status, body) = send(test_app().0, get("/rest/stats")).await;
+    let (status, body) = send(test_app().0, get("/rest/db/db/stats")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
@@ -242,13 +282,13 @@ async fn stats_reflect_data_written_through_the_api() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, get("/rest/stats")).await;
+    let (status, body) = send(app, get("/rest/db/db/stats")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_chunks"], 1);
     assert!(body["total_bytes"].as_u64().unwrap() > 0);
@@ -258,7 +298,7 @@ async fn stats_reflect_data_written_through_the_api() {
 async fn stats_requires_auth() {
     let req = Request::builder()
         .method("GET")
-        .uri("/rest/stats")
+        .uri("/rest/db/db/stats")
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(test_app().0, req).await;
@@ -270,7 +310,7 @@ async fn a_read_only_user_can_get_stats() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rest/stats")
+            .uri("/rest/db/db/stats")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -282,7 +322,7 @@ async fn a_read_only_user_can_get_stats() {
 
 #[tokio::test]
 async fn get_on_a_never_set_cell_is_404() {
-    let (status, body) = send(test_app().0, get("/rest/cells/1,2,3/material")).await;
+    let (status, body) = send(test_app().0, get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].is_string());
 }
@@ -294,14 +334,14 @@ async fn set_then_get_a_cell_roundtrips() {
     let (status, _) = send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
     // A fresh set: version 0, created_at/modified_at equal, both real
@@ -319,20 +359,20 @@ async fn a_bool_cell_roundtrips_through_set_get_and_select() {
     let (status, _) = send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/flammable",
+            "/rest/db/db/cells/1,2,3/flammable",
             json!({"type": "bool", "value": true}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app.clone(), get("/rest/cells/1,2,3/flammable")).await;
+    let (status, body) = send(app.clone(), get("/rest/db/db/cells/1,2,3/flammable")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "bool", "value": true}));
 
     let (status, body) = send(
         app,
-        post("/rest/query", query("SELECT * WHERE flammable = true")),
+        post("/rest/db/db/query", query("SELECT * WHERE flammable = true")),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -351,7 +391,7 @@ async fn get_cell_reports_incrementing_version_and_stable_created_at() {
         let (status, _) = send(
             app.clone(),
             put(
-                "/rest/cells/1,2,3/material",
+                "/rest/db/db/cells/1,2,3/material",
                 json!({"type": "str", "value": value}),
             ),
         )
@@ -359,7 +399,7 @@ async fn get_cell_reports_incrementing_version_and_stable_created_at() {
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
 
-    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "dirt"}));
     assert_eq!(body["version"], 2); // 3 sets total: version 0, 1, 2
@@ -374,7 +414,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
     let (status, _) = send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -387,7 +427,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
     let (status, body) = send(
         app.clone(),
         put(
-            "/rest/cells/9,9,9/material",
+            "/rest/db/db/cells/9,9,9/material",
             json!({"type": "i64", "value": 7}),
         ),
     )
@@ -397,7 +437,7 @@ async fn setting_a_key_to_a_different_type_than_it_already_holds_is_400_not_a_cr
 
     // The connection survives, and the original value is untouched --
     // this really was handled as an ordinary rejected request.
-    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
@@ -408,36 +448,36 @@ async fn set_then_delete_then_get_a_cell_is_404_again() {
     send(
         app.clone(),
         put(
-            "/rest/cells/5,5,5/hardness",
+            "/rest/db/db/cells/5,5,5/hardness",
             json!({"type": "i64", "value": 10}),
         ),
     )
     .await;
 
-    let (status, _) = send(app.clone(), delete("/rest/cells/5,5,5/hardness")).await;
+    let (status, _) = send(app.clone(), delete("/rest/db/db/cells/5,5,5/hardness")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, _) = send(app, get("/rest/cells/5,5,5/hardness")).await;
+    let (status, _) = send(app, get("/rest/db/db/cells/5,5,5/hardness")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn a_cell_coordinate_with_the_wrong_axis_count_is_400() {
-    let (status, body) = send(test_app().0, get("/rest/cells/1,2/material")).await; // 2 coords, 3-axis world
+    let (status, body) = send(test_app().0, get("/rest/db/db/cells/1,2/material")).await; // 2 coords, 3-axis world
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
 
 #[tokio::test]
 async fn a_non_numeric_coordinate_is_400() {
-    let (status, _) = send(test_app().0, get("/rest/cells/1,x,3/material")).await;
+    let (status, _) = send(test_app().0, get("/rest/db/db/cells/1,x,3/material")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
 async fn an_out_of_bounds_coordinate_is_400() {
     // world_dim is 100 in test_app().
-    let (status, _) = send(test_app().0, get("/rest/cells/999,0,0/material")).await;
+    let (status, _) = send(test_app().0, get("/rest/db/db/cells/999,0,0/material")).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -446,7 +486,7 @@ async fn malformed_json_body_is_a_client_error() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/rest/cells/0,0,0/material")
+            .uri("/rest/db/db/cells/0,0,0/material")
             .header("content-type", "application/json")
             .body(Body::from("not json"))
             .unwrap(),
@@ -472,10 +512,10 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
         {"type": "i64", "value": 2},
         {"type": "i64", "value": 3},
     ]});
-    let (status, _) = send(app.clone(), put("/rest/regions/0,0,0/2,2,1/n", values)).await;
+    let (status, _) = send(app.clone(), put("/rest/db/db/regions/0,0,0/2,2,1/n", values)).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app, get("/rest/regions/0,0,0/2,2,1/n")).await;
+    let (status, body) = send(app, get("/rest/db/db/regions/0,0,0/2,2,1/n")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         body,
@@ -490,7 +530,7 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
 
 #[tokio::test]
 async fn get_region_on_an_untouched_area_is_all_null() {
-    let (status, body) = send(test_app().0, get("/rest/regions/0,0,0/2,2,2/material")).await;
+    let (status, body) = send(test_app().0, get("/rest/db/db/regions/0,0,0/2,2,2/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["values"].as_array().unwrap().len(), 8);
     assert!(body["values"].as_array().unwrap().iter().all(Json::is_null));
@@ -501,7 +541,7 @@ async fn set_region_with_the_wrong_number_of_values_is_400() {
     let values = json!({"values": [{"type": "i64", "value": 0}]}); // region holds 8 cells
     let (status, body) = send(
         test_app().0,
-        put("/rest/regions/0,0,0/2,2,2/material", values),
+        put("/rest/db/db/regions/0,0,0/2,2,2/material", values),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -517,20 +557,20 @@ async fn remove_region_clears_every_cell_in_it() {
     ]});
     send(
         app.clone(),
-        put("/rest/regions/0,0,0/2,1,1/material", values),
+        put("/rest/db/db/regions/0,0,0/2,1,1/material", values),
     )
     .await;
 
-    let (status, _) = send(app.clone(), delete("/rest/regions/0,0,0/2,1,1/material")).await;
+    let (status, _) = send(app.clone(), delete("/rest/db/db/regions/0,0,0/2,1,1/material")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (_, body) = send(app, get("/rest/regions/0,0,0/2,1,1/material")).await;
+    let (_, body) = send(app, get("/rest/db/db/regions/0,0,0/2,1,1/material")).await;
     assert!(body["values"].as_array().unwrap().iter().all(Json::is_null));
 }
 
 #[tokio::test]
 async fn a_region_with_mismatched_origin_and_extent_axes_is_400() {
-    let (status, _) = send(test_app().0, get("/rest/regions/0,0,0/2,2/material")).await; // 3 vs 2 axes
+    let (status, _) = send(test_app().0, get("/rest/db/db/regions/0,0,0/2,2/material")).await; // 3 vs 2 axes
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -549,7 +589,7 @@ async fn health_does_not_require_auth() {
 async fn a_protected_endpoint_without_credentials_is_401() {
     let req = Request::builder()
         .method("GET")
-        .uri("/rest/cells/1,2,3/material")
+        .uri("/rest/db/db/cells/1,2,3/material")
         .body(Body::empty())
         .unwrap();
     let (status, body) = send(test_app().0, req).await;
@@ -562,7 +602,7 @@ async fn a_protected_endpoint_with_the_wrong_password_is_401() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_ADMIN,
@@ -577,7 +617,7 @@ async fn a_protected_endpoint_with_an_unknown_username_is_401() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         "nobody",
@@ -593,7 +633,7 @@ async fn a_non_admin_configured_user_can_use_protected_endpoints() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({"type": "str", "value": "stone"}).to_string(),
@@ -612,7 +652,7 @@ async fn a_read_only_user_can_get_a_cell() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -621,7 +661,7 @@ async fn a_read_only_user_can_get_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -637,7 +677,7 @@ async fn a_read_only_user_cannot_put_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .header("content-type", "application/json")
             .body(Body::from(
                 json!({"type": "str", "value": "stone"}).to_string(),
@@ -657,7 +697,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -666,7 +706,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
     let req = with_auth(
         Request::builder()
             .method("DELETE")
-            .uri("/rest/cells/1,2,3/material")
+            .uri("/rest/db/db/cells/1,2,3/material")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -677,7 +717,7 @@ async fn a_read_only_user_cannot_delete_a_cell() {
 
     // The value survives -- the DELETE was actually refused, not silently
     // accepted and ignored.
-    let (status, body) = send(app, get("/rest/cells/1,2,3/material")).await;
+    let (status, body) = send(app, get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["value"], json!({"type": "str", "value": "stone"}));
 }
@@ -688,7 +728,7 @@ async fn a_read_only_user_cannot_put_a_region() {
     let req = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/rest/regions/0,0,0/2,2,2/material")
+            .uri("/rest/db/db/regions/0,0,0/2,2,2/material")
             .header("content-type", "application/json")
             .body(Body::from(json!({"values": values}).to_string()))
             .unwrap(),
@@ -715,9 +755,11 @@ async fn openapi_json_is_served_without_auth_and_describes_every_path() {
         .expect("openapi spec should have a paths object");
     for path in [
         "/rest/health",
-        "/rest/stats",
-        "/rest/cells/{coords}/{key}",
-        "/rest/regions/{origin}/{extent}/{key}",
+        "/rest/databases",
+        "/rest/databases/{name}",
+        "/rest/db/{db}/stats",
+        "/rest/db/{db}/cells/{coords}/{key}",
+        "/rest/db/{db}/regions/{origin}/{extent}/{key}",
     ] {
         assert!(paths.contains_key(path), "spec is missing path {path}");
     }
@@ -761,10 +803,40 @@ async fn the_root_data_browser_page_is_served_to_an_authenticated_user() {
 }
 
 #[tokio::test]
+async fn rows_without_a_db_query_param_is_a_bad_request() {
+    let req = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rows")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_ADMIN,
+        TEST_ADMIN_PASSWORD,
+    );
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn rows_404s_for_an_unknown_database() {
+    let req = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rows?db=nope")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_ADMIN,
+        TEST_ADMIN_PASSWORD,
+    );
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn rows_requires_auth() {
     let req = Request::builder()
         .method("GET")
-        .uri("/rows")
+        .uri(format!("/rows?db={DB}"))
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(test_app().0, req).await;
@@ -776,7 +848,7 @@ async fn a_read_only_user_can_list_rows() {
     let req = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rows")
+            .uri(format!("/rows?db={DB}"))
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -788,7 +860,7 @@ async fn a_read_only_user_can_list_rows() {
 
 #[tokio::test]
 async fn rows_of_an_untouched_world_is_an_empty_page() {
-    let (status, body) = send(test_app().0, get("/rows")).await;
+    let (status, body) = send(test_app().0, get(&format!("/rows?db={DB}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 0);
     assert_eq!(body["rows"].as_array().unwrap().len(), 0);
@@ -800,13 +872,13 @@ async fn rows_lists_a_set_cell_with_its_metadata() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, get("/rows")).await;
+    let (status, body) = send(app, get(&format!("/rows?db={DB}"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 1);
     let row = &body["rows"][0];
@@ -821,20 +893,40 @@ async fn rows_lists_a_set_cell_with_its_metadata() {
 }
 
 #[tokio::test]
+async fn rows_are_scoped_to_the_requested_database() {
+    let (app, _dir) = test_app();
+    send(app.clone(), put("/rest/databases/other", json!({}))).await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (_, db_body) = send(app.clone(), get(&format!("/rows?db={DB}"))).await;
+    assert_eq!(db_body["total_rows"], 1);
+
+    let (_, other_body) = send(app, get("/rows?db=other")).await;
+    assert_eq!(other_body["total_rows"], 0);
+}
+
+#[tokio::test]
 async fn rows_are_sorted_ascending_by_coordinate() {
     let (app, _dir) = test_app();
     for coords in ["40,0,0", "1,2,3", "-10,0,0", "0,0,0"] {
         send(
             app.clone(),
             put(
-                &format!("/rest/cells/{coords}/k"),
+                &format!("/rest/db/db/cells/{coords}/k"),
                 json!({"type": "i64", "value": 1}),
             ),
         )
         .await;
     }
 
-    let (status, body) = send(app, get("/rows")).await;
+    let (status, body) = send(app, get(&format!("/rows?db={DB}"))).await;
     assert_eq!(status, StatusCode::OK);
     let coords: Vec<_> = body["rows"]
         .as_array()
@@ -859,7 +951,7 @@ async fn rows_search_filters_by_coordinate_key_or_value() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -867,24 +959,28 @@ async fn rows_search_filters_by_coordinate_key_or_value() {
     send(
         app.clone(),
         put(
-            "/rest/cells/9,9,9/temperature",
+            "/rest/db/db/cells/9,9,9/temperature",
             json!({"type": "f64", "value": 20.0}),
         ),
     )
     .await;
 
-    let (_, body) = send(app.clone(), get("/rows?search=stone")).await;
+    let (_, body) = send(app.clone(), get(&format!("/rows?db={DB}&search=stone"))).await;
     assert_eq!(body["total_rows"], 1);
     assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
 
-    let (_, body) = send(app.clone(), get("/rows?search=temperature")).await;
+    let (_, body) = send(
+        app.clone(),
+        get(&format!("/rows?db={DB}&search=temperature")),
+    )
+    .await;
     assert_eq!(body["total_rows"], 1);
     assert_eq!(body["rows"][0]["coord"], json!([9, 9, 9]));
 
-    let (_, body) = send(app.clone(), get("/rows?search=9,9,9")).await;
+    let (_, body) = send(app.clone(), get(&format!("/rows?db={DB}&search=9,9,9"))).await;
     assert_eq!(body["total_rows"], 1);
 
-    let (_, body) = send(app, get("/rows?search=nonexistent")).await;
+    let (_, body) = send(app, get(&format!("/rows?db={DB}&search=nonexistent"))).await;
     assert_eq!(body["total_rows"], 0);
 }
 
@@ -895,35 +991,47 @@ async fn rows_paginates() {
         send(
             app.clone(),
             put(
-                &format!("/rest/cells/{i},0,0/k"),
+                &format!("/rest/db/db/cells/{i},0,0/k"),
                 json!({"type": "i64", "value": 1}),
             ),
         )
         .await;
     }
 
-    let (status, body) = send(app.clone(), get("/rows?page=1&page_size=2")).await;
+    let (status, body) = send(
+        app.clone(),
+        get(&format!("/rows?db={DB}&page=1&page_size=2")),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 5);
     assert_eq!(body["total_pages"], 3);
     assert_eq!(body["rows"].as_array().unwrap().len(), 2);
     assert_eq!(body["rows"][0]["coord"], json!([0, 0, 0]));
 
-    let (_, body) = send(app.clone(), get("/rows?page=3&page_size=2")).await;
+    let (_, body) = send(
+        app.clone(),
+        get(&format!("/rows?db={DB}&page=3&page_size=2")),
+    )
+    .await;
     assert_eq!(body["rows"].as_array().unwrap().len(), 1);
     assert_eq!(body["rows"][0]["coord"], json!([4, 0, 0]));
 
-    let (_, body) = send(app, get("/rows?page=4&page_size=2")).await;
+    let (_, body) = send(app, get(&format!("/rows?db={DB}&page=4&page_size=2"))).await;
     assert_eq!(body["rows"].as_array().unwrap().len(), 0);
 }
 
 #[tokio::test]
 async fn rows_rejects_a_zero_page_or_an_oversized_page_size() {
     let (app, _dir) = test_app();
-    let (status, _) = send(app.clone(), get("/rows?page=0")).await;
+    let (status, _) = send(app.clone(), get(&format!("/rows?db={DB}&page=0"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, _) = send(app, get("/rows?page_size=100000")).await;
+    let (status, _) = send(
+        app,
+        get(&format!("/rows?db={DB}&page_size=100000")),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -932,12 +1040,12 @@ async fn rows_reflects_a_removed_cell() {
     let (app, _dir) = test_app();
     send(
         app.clone(),
-        put("/rest/cells/1,2,3/k", json!({"type": "i64", "value": 1})),
+        put("/rest/db/db/cells/1,2,3/k", json!({"type": "i64", "value": 1})),
     )
     .await;
-    send(app.clone(), delete("/rest/cells/1,2,3/k")).await;
+    send(app.clone(), delete("/rest/db/db/cells/1,2,3/k")).await;
 
-    let (_, body) = send(app, get("/rows")).await;
+    let (_, body) = send(app, get(&format!("/rows?db={DB}"))).await;
     assert_eq!(body["total_rows"], 0);
 }
 
@@ -951,7 +1059,7 @@ fn query(q: &str) -> Json {
 async fn query_requires_auth() {
     let req = Request::builder()
         .method("POST")
-        .uri("/rest/query")
+        .uri("/rest/db/db/query")
         .header("content-type", "application/json")
         .body(Body::from(query("SELECT *").to_string()))
         .unwrap();
@@ -965,7 +1073,7 @@ async fn select_star_returns_every_cell_with_every_key() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -973,13 +1081,13 @@ async fn select_star_returns_every_cell_with_every_key() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/hardness",
+            "/rest/db/db/cells/1,2,3/hardness",
             json!({"type": "i64", "value": 7}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, post("/rest/query", query("SELECT *"))).await;
+    let (status, body) = send(app, post("/rest/db/db/query", query("SELECT *"))).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["total_rows"], 1);
     let row = &body["rows"][0];
@@ -993,7 +1101,7 @@ async fn select_rows_report_each_keys_metadata() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -1004,13 +1112,13 @@ async fn select_rows_report_each_keys_metadata() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "granite"}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, post("/rest/query", query("SELECT *"))).await;
+    let (status, body) = send(app, post("/rest/db/db/query", query("SELECT *"))).await;
     assert_eq!(status, StatusCode::OK);
     let value = &body["rows"][0]["values"][0];
     assert_eq!(value["key"], "material");
@@ -1025,7 +1133,7 @@ async fn select_named_columns_omits_the_rest() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -1033,13 +1141,13 @@ async fn select_named_columns_omits_the_rest() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/hardness",
+            "/rest/db/db/cells/1,2,3/hardness",
             json!({"type": "i64", "value": 7}),
         ),
     )
     .await;
 
-    let (status, body) = send(app, post("/rest/query", query("SELECT material"))).await;
+    let (status, body) = send(app, post("/rest/db/db/query", query("SELECT material"))).await;
     assert_eq!(status, StatusCode::OK);
     let values = body["rows"][0]["values"].as_array().unwrap();
     assert_eq!(values.len(), 1);
@@ -1052,7 +1160,7 @@ async fn select_where_filters_by_value() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -1060,7 +1168,7 @@ async fn select_where_filters_by_value() {
     send(
         app.clone(),
         put(
-            "/rest/cells/4,5,6/material",
+            "/rest/db/db/cells/4,5,6/material",
             json!({"type": "str", "value": "air"}),
         ),
     )
@@ -1068,7 +1176,7 @@ async fn select_where_filters_by_value() {
 
     let (status, body) = send(
         app,
-        post("/rest/query", query("SELECT * WHERE material = 'stone'")),
+        post("/rest/db/db/query", query("SELECT * WHERE material = 'stone'")),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1083,14 +1191,14 @@ async fn select_where_filters_by_axis_coordinate() {
         send(
             app.clone(),
             put(
-                &format!("/rest/cells/{coords}/k"),
+                &format!("/rest/db/db/cells/{coords}/k"),
                 json!({"type": "i64", "value": 1}),
             ),
         )
         .await;
     }
 
-    let (_, body) = send(app, post("/rest/query", query("SELECT * WHERE x0 >= 10"))).await;
+    let (_, body) = send(app, post("/rest/db/db/query", query("SELECT * WHERE x0 >= 10"))).await;
     assert_eq!(body["total_rows"], 1);
     assert_eq!(body["rows"][0]["coord"], json!([40, 40, 40]));
 }
@@ -1102,7 +1210,7 @@ async fn select_from_range_scopes_to_the_box() {
         send(
             app.clone(),
             put(
-                &format!("/rest/cells/{coords}/k"),
+                &format!("/rest/db/db/cells/{coords}/k"),
                 json!({"type": "i64", "value": 1}),
             ),
         )
@@ -1111,7 +1219,7 @@ async fn select_from_range_scopes_to_the_box() {
 
     let (_, body) = send(
         app,
-        post("/rest/query", query("SELECT * FROM (0,0,0) TO (10,10,10)")),
+        post("/rest/db/db/query", query("SELECT * FROM (0,0,0) TO (10,10,10)")),
     )
     .await;
     assert_eq!(body["total_rows"], 1);
@@ -1121,7 +1229,7 @@ async fn select_from_range_scopes_to_the_box() {
 #[tokio::test]
 async fn a_malformed_query_is_400() {
     let (app, _dir) = test_app();
-    let (status, body) = send(app, post("/rest/query", query("NOT VALID SQL AT ALL"))).await;
+    let (status, body) = send(app, post("/rest/db/db/query", query("NOT VALID SQL AT ALL"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
@@ -1131,7 +1239,7 @@ async fn a_range_with_the_wrong_axis_count_is_400() {
     let (app, _dir) = test_app();
     let (status, _) = send(
         app,
-        post("/rest/query", query("SELECT * FROM (0,0) TO (10,10)")),
+        post("/rest/db/db/query", query("SELECT * FROM (0,0) TO (10,10)")),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -1144,7 +1252,7 @@ async fn update_writes_the_given_keys_to_every_matching_cell() {
         send(
             app.clone(),
             put(
-                &format!("/rest/cells/{coords}/k"),
+                &format!("/rest/db/db/cells/{coords}/k"),
                 json!({"type": "i64", "value": 1}),
             ),
         )
@@ -1154,7 +1262,7 @@ async fn update_writes_the_given_keys_to_every_matching_cell() {
     let (status, body) = send(
         app.clone(),
         post(
-            "/rest/query",
+            "/rest/db/db/query",
             query("UPDATE (material='stone', hardness=7) WHERE k = 1"),
         ),
     )
@@ -1162,7 +1270,7 @@ async fn update_writes_the_given_keys_to_every_matching_cell() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["affected_cells"], 2);
 
-    let (_, cell) = send(app, get("/rest/cells/1,1,1/material")).await;
+    let (_, cell) = send(app, get("/rest/db/db/cells/1,1,1/material")).await;
     assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
 }
 
@@ -1175,7 +1283,7 @@ async fn update_never_creates_a_cell_that_does_not_already_exist() {
     let (status, body) = send(
         app.clone(),
         post(
-            "/rest/query",
+            "/rest/db/db/query",
             query("UPDATE (material='stone') IN (0,0,0) TO (10,10,10)"),
         ),
     )
@@ -1183,7 +1291,7 @@ async fn update_never_creates_a_cell_that_does_not_already_exist() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["affected_cells"], 0);
 
-    let (status, _) = send(app, get("/rest/cells/1,1,1/material")).await;
+    let (status, _) = send(app, get("/rest/db/db/cells/1,1,1/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1191,7 +1299,7 @@ async fn update_never_creates_a_cell_that_does_not_already_exist() {
 async fn a_read_only_account_cannot_set() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/query", query("SET (k = 1) IN (0,0,0) TO (1,1,1)")),
+        post("/rest/db/db/query", query("SET (k = 1) IN (0,0,0) TO (1,1,1)")),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
@@ -1203,7 +1311,7 @@ async fn a_read_only_account_cannot_set() {
 async fn a_read_only_account_cannot_update() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/query", query("UPDATE (k = 1)")),
+        post("/rest/db/db/query", query("UPDATE (k = 1)")),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
@@ -1217,7 +1325,7 @@ async fn set_without_a_range_is_400() {
     // query.rs's doc comment), so omitting it is a parse error, not a
     // request that silently does nothing.
     let (app, _dir) = test_app();
-    let (status, _) = send(app, post("/rest/query", query("SET (k = 1)"))).await;
+    let (status, _) = send(app, post("/rest/db/db/query", query("SET (k = 1)"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1228,7 +1336,7 @@ async fn set_upserts_every_cell_in_range_when_there_is_no_where_clause() {
     let (status, body) = send(
         app.clone(),
         post(
-            "/rest/query",
+            "/rest/db/db/query",
             query("SET (material='stone') IN (0,0,0) TO (2,2,1)"),
         ),
     )
@@ -1237,7 +1345,7 @@ async fn set_upserts_every_cell_in_range_when_there_is_no_where_clause() {
     assert_eq!(body["affected_cells"], 4); // 2x2x1 box
 
     for coords in ["0,0,0", "1,0,0", "0,1,0", "1,1,0"] {
-        let (_, cell) = send(app.clone(), get(&format!("/rest/cells/{coords}/material"))).await;
+        let (_, cell) = send(app.clone(), get(&format!("/rest/db/db/cells/{coords}/material"))).await;
         assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
     }
 }
@@ -1249,7 +1357,7 @@ async fn set_with_an_axis_where_clause_only_upserts_matching_coordinates() {
     let (status, body) = send(
         app.clone(),
         post(
-            "/rest/query",
+            "/rest/db/db/query",
             query("SET (material='stone') WHERE x0 >= 1 IN (0,0,0) TO (2,1,1)"),
         ),
     )
@@ -1257,9 +1365,9 @@ async fn set_with_an_axis_where_clause_only_upserts_matching_coordinates() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["affected_cells"], 1);
 
-    let (status, _) = send(app.clone(), get("/rest/cells/0,0,0/material")).await;
+    let (status, _) = send(app.clone(), get("/rest/db/db/cells/0,0,0/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (_, cell) = send(app, get("/rest/cells/1,0,0/material")).await;
+    let (_, cell) = send(app, get("/rest/db/db/cells/1,0,0/material")).await;
     assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
 }
 
@@ -1273,7 +1381,7 @@ async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
     send(
         app.clone(),
         put(
-            "/rest/cells/0,0,0/material",
+            "/rest/db/db/cells/0,0,0/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -1282,7 +1390,7 @@ async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
     let (status, body) = send(
         app.clone(),
         post(
-            "/rest/query",
+            "/rest/db/db/query",
             query("SET (hardness=7) WHERE material = 'stone' IN (0,0,0) TO (2,2,2)"),
         ),
     )
@@ -1290,11 +1398,11 @@ async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["affected_cells"], 1);
 
-    let (_, cell) = send(app.clone(), get("/rest/cells/0,0,0/hardness")).await;
+    let (_, cell) = send(app.clone(), get("/rest/db/db/cells/0,0,0/hardness")).await;
     assert_eq!(cell["value"], json!({"type": "i64", "value": 7}));
     // Never-populated neighbor cells in the range must not have been
     // created just because they were in bounds.
-    let (status, _) = send(app, get("/rest/cells/1,1,1/hardness")).await;
+    let (status, _) = send(app, get("/rest/db/db/cells/1,1,1/hardness")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 }
 
@@ -1302,7 +1410,7 @@ async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
 async fn a_read_only_account_can_select() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/query", query("SELECT *")),
+        post("/rest/db/db/query", query("SELECT *")),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
@@ -1316,7 +1424,7 @@ async fn delete_removes_every_key_at_matching_cells() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
@@ -1324,7 +1432,7 @@ async fn delete_removes_every_key_at_matching_cells() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/hardness",
+            "/rest/db/db/cells/1,2,3/hardness",
             json!({"type": "i64", "value": 7}),
         ),
     )
@@ -1332,7 +1440,7 @@ async fn delete_removes_every_key_at_matching_cells() {
     send(
         app.clone(),
         put(
-            "/rest/cells/9,9,9/material",
+            "/rest/db/db/cells/9,9,9/material",
             json!({"type": "str", "value": "air"}),
         ),
     )
@@ -1340,15 +1448,15 @@ async fn delete_removes_every_key_at_matching_cells() {
 
     let (status, body) = send(
         app.clone(),
-        post("/rest/query", query("DELETE WHERE material = 'stone'")),
+        post("/rest/db/db/query", query("DELETE WHERE material = 'stone'")),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["affected_cells"], 1);
 
-    let (status, _) = send(app.clone(), get("/rest/cells/1,2,3/material")).await;
+    let (status, _) = send(app.clone(), get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let (status, _) = send(app, get("/rest/cells/9,9,9/material")).await;
+    let (status, _) = send(app, get("/rest/db/db/cells/9,9,9/material")).await;
     assert_eq!(status, StatusCode::OK);
 }
 
@@ -1356,7 +1464,7 @@ async fn delete_removes_every_key_at_matching_cells() {
 async fn a_read_only_account_cannot_delete() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/query", query("DELETE")),
+        post("/rest/db/db/query", query("DELETE")),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
@@ -1374,8 +1482,8 @@ async fn query_is_documented_in_the_openapi_spec() {
     let (_, body) = send(test_app().0, req).await;
     let paths = body["paths"].as_object().unwrap();
     assert!(
-        paths.contains_key("/rest/query"),
-        "spec is missing /rest/query"
+        paths.contains_key("/rest/db/{db}/query"),
+        "spec is missing /rest/db/{{db}}/query"
     );
 }
 
@@ -1384,7 +1492,7 @@ async fn query_is_documented_in_the_openapi_spec() {
 #[tokio::test]
 async fn columns_of_a_fresh_world_are_empty() {
     let (app, _dir) = test_app();
-    let (status, body) = send(app, get("/rest/columns")).await;
+    let (status, body) = send(app, get("/rest/db/db/columns")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["columns"], json!([]));
 }
@@ -1394,12 +1502,12 @@ async fn add_column_then_list_reports_it() {
     let (app, _dir) = test_app();
     let (status, _) = send(
         app.clone(),
-        put("/rest/columns/hardness", json!({"type": "f64"})),
+        put("/rest/db/db/columns/hardness", json!({"type": "f64"})),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, body) = send(app, get("/rest/columns")).await;
+    let (status, body) = send(app, get("/rest/db/db/columns")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["columns"], json!([{"key": "hardness", "type": "f64"}]));
 }
@@ -1413,14 +1521,14 @@ async fn setting_a_cell_creates_a_column_implicitly() {
     let (status, _) = send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (_, body) = send(app, get("/rest/columns")).await;
+    let (_, body) = send(app, get("/rest/db/db/columns")).await;
     assert_eq!(body["columns"], json!([{"key": "material", "type": "str"}]));
 }
 
@@ -1430,12 +1538,12 @@ async fn columns_are_listed_sorted_by_key() {
     for key in ["material", "hardness", "visible"] {
         let (status, _) = send(
             app.clone(),
-            put(&format!("/rest/columns/{key}"), json!({"type": "str"})),
+            put(&format!("/rest/db/db/columns/{key}"), json!({"type": "str"})),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
     }
-    let (_, body) = send(app, get("/rest/columns")).await;
+    let (_, body) = send(app, get("/rest/db/db/columns")).await;
     let keys: Vec<&str> = body["columns"]
         .as_array()
         .unwrap()
@@ -1450,10 +1558,10 @@ async fn adding_a_column_that_already_exists_is_409() {
     let (app, _dir) = test_app();
     send(
         app.clone(),
-        put("/rest/columns/material", json!({"type": "str"})),
+        put("/rest/db/db/columns/material", json!({"type": "str"})),
     )
     .await;
-    let (status, body) = send(app, put("/rest/columns/material", json!({"type": "str"}))).await;
+    let (status, body) = send(app, put("/rest/db/db/columns/material", json!({"type": "str"}))).await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("material"));
 }
@@ -1461,7 +1569,7 @@ async fn adding_a_column_that_already_exists_is_409() {
 #[tokio::test]
 async fn adding_a_column_with_an_unknown_type_is_a_client_error() {
     let (app, _dir) = test_app();
-    let (status, _) = send(app, put("/rest/columns/material", json!({"type": "blob"}))).await;
+    let (status, _) = send(app, put("/rest/db/db/columns/material", json!({"type": "blob"}))).await;
     // Axum's own `Json` extractor rejects this before the handler runs,
     // same as any other unparseable body -- see
     // `malformed_json_body_is_a_client_error`.
@@ -1474,7 +1582,7 @@ async fn adding_a_column_whose_key_the_schema_cant_store_is_400() {
     // A tab would split the key across `schema.txt`'s own field
     // separator, so the schema rejects it rather than writing a line it
     // couldn't read back.
-    let (status, _) = send(app, put("/rest/columns/bad%09key", json!({"type": "str"}))).await;
+    let (status, _) = send(app, put("/rest/db/db/columns/bad%09key", json!({"type": "str"}))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1484,19 +1592,19 @@ async fn removing_a_column_drops_its_values_too() {
     send(
         app.clone(),
         put(
-            "/rest/cells/1,2,3/material",
+            "/rest/db/db/cells/1,2,3/material",
             json!({"type": "str", "value": "stone"}),
         ),
     )
     .await;
 
-    let (status, _) = send(app.clone(), delete("/rest/columns/material")).await;
+    let (status, _) = send(app.clone(), delete("/rest/db/db/columns/material")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (status, _) = send(app.clone(), get("/rest/cells/1,2,3/material")).await;
+    let (status, _) = send(app.clone(), get("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
 
-    let (_, body) = send(app, get("/rest/columns")).await;
+    let (_, body) = send(app, get("/rest/db/db/columns")).await;
     assert_eq!(body["columns"], json!([]));
 }
 
@@ -1507,26 +1615,26 @@ async fn a_removed_column_can_be_re_added_with_a_different_type() {
     let (app, _dir) = test_app();
     send(
         app.clone(),
-        put("/rest/columns/material", json!({"type": "str"})),
+        put("/rest/db/db/columns/material", json!({"type": "str"})),
     )
     .await;
-    send(app.clone(), delete("/rest/columns/material")).await;
+    send(app.clone(), delete("/rest/db/db/columns/material")).await;
 
     let (status, _) = send(
         app.clone(),
-        put("/rest/columns/material", json!({"type": "i64"})),
+        put("/rest/db/db/columns/material", json!({"type": "i64"})),
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
-    let (_, body) = send(app, get("/rest/columns")).await;
+    let (_, body) = send(app, get("/rest/db/db/columns")).await;
     assert_eq!(body["columns"], json!([{"key": "material", "type": "i64"}]));
 }
 
 #[tokio::test]
 async fn removing_a_column_that_doesnt_exist_is_404() {
     let (app, _dir) = test_app();
-    let (status, body) = send(app, delete("/rest/columns/nope")).await;
+    let (status, body) = send(app, delete("/rest/db/db/columns/nope")).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(body["error"].as_str().unwrap().contains("nope"));
 }
@@ -1536,7 +1644,7 @@ async fn listing_columns_requires_auth() {
     let (app, _dir) = test_app();
     let req = Request::builder()
         .method("GET")
-        .uri("/rest/columns")
+        .uri("/rest/db/db/columns")
         .body(Body::empty())
         .unwrap();
     let (status, _) = send(app, req).await;
@@ -1549,7 +1657,7 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
     let list = with_auth(
         Request::builder()
             .method("GET")
-            .uri("/rest/columns")
+            .uri("/rest/db/db/columns")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -1561,7 +1669,7 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
     let add = with_auth(
         Request::builder()
             .method("PUT")
-            .uri("/rest/columns/material")
+            .uri("/rest/db/db/columns/material")
             .header("content-type", "application/json")
             .body(Body::from(json!({"type": "str"}).to_string()))
             .unwrap(),
@@ -1574,7 +1682,7 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
     let remove = with_auth(
         Request::builder()
             .method("DELETE")
-            .uri("/rest/columns/material")
+            .uri("/rest/db/db/columns/material")
             .body(Body::empty())
             .unwrap(),
         TEST_READ_ONLY_USER,
@@ -1662,4 +1770,223 @@ fn base_url_brackets_ipv6_so_the_port_is_unambiguous() {
         crate::base_url("[::1]:8080".parse().unwrap()),
         "http://[::1]:8080"
     );
+}
+
+// --- Database management (/rest/databases) ---
+
+#[tokio::test]
+async fn databases_lists_the_pre_created_database() {
+    let (status, body) = send(test_app().0, get("/rest/databases")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["databases"], json!([DB]));
+}
+
+#[tokio::test]
+async fn creating_a_database_with_default_shape_then_using_it_round_trips() {
+    let (app, dir) = test_app();
+    let (status, _) = send(app.clone(), put("/rest/databases/extra", json!({}))).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // It's on disk, as its own directory with its own world.txt.
+    assert!(dir.0.join("extra").join("world.txt").is_file());
+
+    let mut names = send(app.clone(), get("/rest/databases"))
+        .await
+        .1
+        .get("databases")
+        .unwrap()
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    names.sort();
+    assert_eq!(names, vec![DB.to_string(), "extra".to_string()]);
+
+    // Usable immediately for data ops, shaped like `TEST_SHAPE` (the
+    // server's configured default, since no override was given).
+    let (status, _) = send(
+        app,
+        put(
+            "/rest/db/extra/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn creating_a_database_honors_an_explicit_shape_override() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(
+        app.clone(),
+        put(
+            "/rest/databases/small",
+            json!({"axes": 1, "world_dim": 10, "chunk_size": 4}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // A 2-axis coordinate against a 1-axis database is rejected, proving
+    // the override actually took.
+    let (status, _) = send(app, get("/rest/db/small/cells/1,2/k")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn creating_a_database_that_already_exists_is_409() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, put(&format!("/rest/databases/{DB}"), json!({}))).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body["error"].as_str().unwrap().contains(DB));
+}
+
+#[tokio::test]
+async fn creating_a_database_with_an_invalid_name_is_400() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, put("/rest/databases/..", json!({}))).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn removing_a_database_deletes_its_directory() {
+    let (app, dir) = test_app();
+    send(app.clone(), put("/rest/databases/extra", json!({}))).await;
+    assert!(dir.0.join("extra").is_dir());
+
+    let (status, _) = send(app.clone(), delete("/rest/databases/extra")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!dir.0.join("extra").exists());
+
+    let (status, _) = send(app, get("/rest/db/extra/stats")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn removing_an_unknown_database_is_404() {
+    let (app, _dir) = test_app();
+    let (status, _) = send(app, delete("/rest/databases/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn databases_endpoints_require_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/databases")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_read_only_account_can_list_but_not_create_or_remove_databases() {
+    let (app, _dir) = test_app();
+    let list = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rest/databases")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), list).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let create = with_auth(
+        Request::builder()
+            .method("PUT")
+            .uri("/rest/databases/extra")
+            .header("content-type", "application/json")
+            .body(Body::from(json!({}).to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), create).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let remove = with_auth(
+        Request::builder()
+            .method("DELETE")
+            .uri(format!("/rest/databases/{DB}"))
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, remove).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// --- Cross-database isolation and unknown-database 404s ---
+
+#[tokio::test]
+async fn two_databases_are_fully_isolated() {
+    let (app, _dir) = test_app();
+    send(app.clone(), put("/rest/databases/other", json!({}))).await;
+
+    send(
+        app.clone(),
+        put(
+            &format!("/rest/db/{DB}/cells/1,2,3/material"),
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    // The same coordinate/key in the other database sees nothing.
+    let (status, _) = send(app.clone(), get("/rest/db/other/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Columns are independent too.
+    send(
+        app.clone(),
+        put("/rest/db/other/columns/hardness", json!({"type": "f64"})),
+    )
+    .await;
+    let (_, db_columns) = send(app.clone(), get(&format!("/rest/db/{DB}/columns"))).await;
+    assert_eq!(
+        db_columns["columns"],
+        json!([{"key": "material", "type": "str"}])
+    );
+    let (_, other_columns) = send(app, get("/rest/db/other/columns")).await;
+    assert_eq!(
+        other_columns["columns"],
+        json!([{"key": "hardness", "type": "f64"}])
+    );
+}
+
+#[tokio::test]
+async fn every_per_database_route_404s_for_an_unknown_database() {
+    let (app, _dir) = test_app();
+
+    let (status, _) = send(app.clone(), get("/rest/db/nope/cells/0,0,0/k")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(
+        app.clone(),
+        put("/rest/db/nope/cells/0,0,0/k", json!({"type": "i64", "value": 1})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(app.clone(), delete("/rest/db/nope/cells/0,0,0/k")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(app.clone(), get("/rest/db/nope/regions/0,0,0/1,1,1/k")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(app.clone(), get("/rest/db/nope/stats")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(app.clone(), get("/rest/db/nope/columns")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+
+    let (status, _) = send(app, post("/rest/db/nope/query", query("SELECT *"))).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
 }

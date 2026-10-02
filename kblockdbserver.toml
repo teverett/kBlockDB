@@ -3,7 +3,7 @@
 #
 # admin_password/the [[users]] entry are placeholders for local development
 # only. Change them (and don't commit your real ones) before running this
-# anywhere reachable by anyone you don't trust with access to the world --
+# anywhere reachable by anyone you don't trust with access to its databases --
 # the server listens on every interface, so that includes anyone who can
 # reach this host on the ports below.
 http_port = 8080
@@ -14,9 +14,10 @@ admin_password = "changeme"
 max_cached_chunks = 10000
 compression = false
 
-# Only matters the first time a world is created at data_dir above --
-# reopening an existing one reads its real shape from its world.txt and
-# ignores these (World::open does, not create).
+# Default shape for a database created without an explicit shape of its own
+# (see /rest/databases in docs/kblockdbserver.md) -- no database is ever
+# created automatically. Reopening an existing database, or creating one
+# with an explicit shape, ignores these.
 [worldparameters]
 axes = 4
 world_dim = 10000

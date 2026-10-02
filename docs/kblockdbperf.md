@@ -10,14 +10,21 @@ internals.
 
 ```sh
 cargo build --workspace --release
-./target/release/kblockdbperf                       # spawns its own instance, runs every scenario
-./target/release/kblockdbperf --scenario set_cell    # just one scenario
-./target/release/kblockdbperf --json > results.json  # machine-readable output
+./target/release/kblockdbperf --db perf                       # spawns its own instance, runs every scenario
+./target/release/kblockdbperf --db perf --scenario set_cell    # just one scenario
+./target/release/kblockdbperf --db perf --json > results.json  # machine-readable output
 
 # target an already-running instance instead (its REST API requires login,
 # so --password is required here)
-./target/release/kblockdbperf --url http://localhost:8080 --user admin --password change-me
+./target/release/kblockdbperf --db perf --url http://localhost:8080 --user admin --password change-me
 ```
+
+`--db <name>` is required on every run: kblockdbperf creates that database
+(shaped axes=3, world_dim=10000, chunk_size=32) up front via
+`PUT /rest/databases/{name}` if it doesn't already exist -- tolerating
+`409 Conflict` so a repeat run against the same name reuses whatever data
+it left behind -- then runs every scenario against it, over both REST and
+(for the `binary_*` scenarios) the binary protocol.
 
 When it spawns its own instance, kblockdbperf writes it a minimal config
 file itself (`admin_password` only) and authenticates as `admin`
@@ -70,7 +77,7 @@ well under a minute, and every default is overridable.
   `remove_cell`, but over the
   [binary protocol](kblockdbserver.md#binary-protocol) instead of REST,
   via `binary_client.rs`. Comparing these against
-  their REST counterparts is the point -- same `World`, same semantics,
+  their REST counterparts is the point -- same database, same semantics,
   just without HTTP/JSON's per-call overhead.
 
 ## Layout

@@ -3,20 +3,27 @@
 //! protocol" section for why this exists alongside the REST API rather
 //! than instead of it.
 //!
-//! Authentication here is per-*connection*, not per-request the way HTTP
-//! Basic Auth is: a client sends one `Hello` right after connecting, and
-//! every request after that on the same connection is treated as that
-//! account until the connection closes (or a later `Hello` re-
-//! authenticates as someone else -- allowed, not required). This is the
-//! one place this protocol's semantics genuinely differ from the REST
-//! API's, and it's why a raw `nc`/telnet session can't just fire
+//! Authentication *and database selection* here are per-*connection*, not
+//! per-request the way HTTP Basic Auth plus a `/db/{name}/` path segment
+//! are: a client sends one `Hello` (username, password, database) right
+//! after connecting, and every request after that on the same connection
+//! is treated as that account against that database until the connection
+//! closes (or a later `Hello` re-selects either -- allowed, not required).
+//! This is the one place this protocol's semantics genuinely differ from
+//! the REST API's, and it's why a raw `nc`/telnet session can't just fire
 //! `Get`/`Set` at this listener the way `curl` can against the REST one --
 //! see `kblockdbcli` (or a future binary-protocol client) for something
 //! that actually speaks it.
+//!
+//! If `Hello`'s named database doesn't exist yet, the account still
+//! authenticates (so `CreateDatabase` can be sent), but no database is
+//! selected -- see `wire.rs`'s doc comment for the full bootstrap flow.
 
 use crate::error::ApiError;
 use crate::state::{Account, AppState};
-use kblockdbserver::wire::{self, Column, QueryResult, QueryRow, QueryValue, Request, Response};
+use kblockdbserver::wire::{
+    self, Column, DatabaseShape, QueryResult, QueryRow, QueryValue, Request, Response,
+};
 use tokio::net::{TcpListener, TcpStream};
 
 /// `wire::Response` is defined in the published `wire` module and
@@ -76,7 +83,7 @@ pub async fn serve(listener: TcpListener, state: AppState) {
 /// problems (a truncated frame, an oversized one, the socket itself
 /// breaking) end the loop.
 async fn handle_connection(mut stream: TcpStream, state: AppState) {
-    let mut account: Option<Account> = None;
+    let mut session = Session::default();
 
     loop {
         let payload = match wire::read_frame(&mut stream).await {
@@ -86,7 +93,7 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) {
         };
 
         let response = match wire::decode_request(&payload) {
-            Ok(req) => handle_request(req, &state, &mut account).await,
+            Ok(req) => handle_request(req, &state, &mut session).await,
             Err(e) => Response::BadRequest(e.to_string()),
         };
 
@@ -106,47 +113,101 @@ async fn handle_connection(mut stream: TcpStream, state: AppState) {
     }
 }
 
+/// A connection's state: the account `Hello` authenticated as (if any), and
+/// the database it selected (if any -- see this module's doc comment on why
+/// those can diverge).
+#[derive(Default)]
+struct Session {
+    account: Option<Account>,
+    database: Option<String>,
+}
+
 /// This connection's account so far, or a `Response` explaining why there
 /// isn't one yet -- shared by every request kind that needs *some*
-/// authenticated account (i.e. everything but `Hello` itself).
-fn require_authenticated(account: &Option<Account>) -> Result<&Account, Response> {
-    account
+/// authenticated account (i.e. everything but `Hello`/`Health`).
+fn require_authenticated(session: &Session) -> Result<&Account, Response> {
+    session
+        .account
         .as_ref()
         .ok_or_else(|| Response::Unauthorized("send Hello first".to_string()))
 }
 
 /// Same as `require_authenticated`, plus the `read_only` check every
-/// `Set`/`Remove` needs -- mirrors `auth.rs`'s middleware, just checked
-/// here instead of before a handler runs, since this protocol has no
-/// middleware layer to put it in.
-fn require_write(account: &Option<Account>) -> Result<(), Response> {
-    let account = require_authenticated(account)?;
+/// `Set`/`Remove`/`CreateDatabase`/`RemoveDatabase` needs -- mirrors
+/// `auth.rs`'s middleware, just checked here instead of before a handler
+/// runs, since this protocol has no middleware layer to put it in.
+fn require_write(session: &Session) -> Result<(), Response> {
+    let account = require_authenticated(session)?;
     if account.read_only {
         return Err(Response::Forbidden("this account is read-only".to_string()));
     }
     Ok(())
 }
 
-async fn handle_request(req: Request, state: &AppState, account: &mut Option<Account>) -> Response {
+/// This connection's selected database, or a `Response` explaining why
+/// there isn't one -- every data request (`Get`/`Set`/`Query`/
+/// `ListColumns`/...) needs this; `ListDatabases`/`CreateDatabase`/
+/// `RemoveDatabase` don't (see this module's doc comment).
+fn require_database(session: &Session) -> Result<&str, Response> {
+    require_authenticated(session)?;
+    session.database.as_deref().ok_or_else(|| {
+        Response::BadRequest(
+            "no database selected -- Hello with an existing database name, or create one \
+             first with CreateDatabase and Hello again"
+                .to_string(),
+        )
+    })
+}
+
+/// `require_database` plus the `read_only` check -- the write-request
+/// equivalent.
+fn require_write_database(session: &Session) -> Result<&str, Response> {
+    require_write(session)?;
+    // `require_write` already confirmed `session.account` is `Some`, so
+    // this can't fail on the auth half -- only ever on "no database".
+    require_database(session)
+}
+
+async fn handle_request(req: Request, state: &AppState, session: &mut Session) -> Response {
     match req {
-        Request::Hello { username, password } => match state.authenticate(&username, &password) {
+        Request::Hello {
+            username,
+            password,
+            database,
+        } => match state.authenticate(&username, &password) {
             Some(acc) => {
-                let response = Response::HelloOk {
-                    axes: state.world.axes() as u8,
-                    world_dim: state.world.world_dim(),
-                    read_only: acc.read_only,
-                };
-                *account = Some(acc);
-                response
+                let read_only = acc.read_only;
+                session.account = Some(acc);
+                match state.resolve_database(&database).await {
+                    Ok(world) => {
+                        session.database = Some(database);
+                        Response::HelloOk {
+                            read_only,
+                            database: Some(DatabaseShape {
+                                axes: world.axes() as u8,
+                                world_dim: world.world_dim(),
+                                chunk_dim: world.chunk_dim(),
+                            }),
+                        }
+                    }
+                    Err(_) => {
+                        session.database = None;
+                        Response::HelloOk {
+                            read_only,
+                            database: None,
+                        }
+                    }
+                }
             }
             None => Response::Unauthorized("invalid username or password".to_string()),
         },
         Request::Get { coord, key } => {
-            if let Err(response) = require_authenticated(account) {
-                return response;
-            }
+            let db = match require_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
             match state
-                .with_world(move |w| w.get_with_meta(&coord, &key))
+                .with_database(&db, move |w| w.get_with_meta(&coord, &key))
                 .await
             {
                 Ok(Some((value, meta))) => Response::Value {
@@ -160,35 +221,48 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             }
         }
         Request::Set { coord, key, value } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
-            match state.with_world(move |w| w.set(&coord, &key, value)).await {
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
+            match state
+                .with_database(&db, move |w| w.set(&coord, &key, value))
+                .await
+            {
                 Ok(()) => Response::Ok,
                 Err(e) => response_from_error(e),
             }
         }
         Request::Remove { coord, key } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
-            match state.with_world(move |w| w.remove(&coord, &key)).await {
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
+            match state
+                .with_database(&db, move |w| w.remove(&coord, &key))
+                .await
+            {
                 Ok(()) => Response::Ok,
                 Err(e) => response_from_error(e),
             }
         }
-        Request::Health => Response::Health {
-            axes: state.world.axes() as u8,
-            world_dim: state.world.world_dim(),
-            chunk_dim: state.world.chunk_dim(),
-            timestamp: crate::routes::unix_timestamp(),
-            hostname: state.hostname.to_string(),
-        },
-        Request::Stats => {
-            if let Err(response) = require_authenticated(account) {
-                return response;
+        Request::Health => {
+            let database_count = match state.list_databases().await {
+                Ok(names) => names.len() as u32,
+                Err(e) => return response_from_error(e),
+            };
+            Response::Health {
+                timestamp: crate::routes::unix_timestamp(),
+                database_count,
+                hostname: state.hostname.to_string(),
             }
-            match state.with_world(kblockdblib::World::stats).await {
+        }
+        Request::Stats => {
+            let db = match require_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
+            match state.with_database(&db, kblockdblib::World::stats).await {
                 Ok(stats) => Response::Stats {
                     total_chunks: stats.total_chunks,
                     total_bytes: stats.total_bytes,
@@ -202,11 +276,15 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             extent,
             key,
         } => {
-            if let Err(response) = require_authenticated(account) {
-                return response;
-            }
+            let db = match require_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
             let region = kblockdblib::Region::new(origin, extent);
-            match state.with_world(move |w| w.get_region(&region, &key)).await {
+            match state
+                .with_database(&db, move |w| w.get_region(&region, &key))
+                .await
+            {
                 Ok(values) => Response::RegionValues(values),
                 Err(e) => response_from_error(e),
             }
@@ -217,12 +295,13 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             key,
             values,
         } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
             let region = kblockdblib::Region::new(origin, extent);
             match state
-                .with_world(move |w| w.set_region(&region, &key, &values))
+                .with_database(&db, move |w| w.set_region(&region, &key, &values))
                 .await
             {
                 Ok(()) => Response::Ok,
@@ -234,12 +313,13 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             extent,
             key,
         } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
             let region = kblockdblib::Region::new(origin, extent);
             match state
-                .with_world(move |w| w.remove_region(&region, &key))
+                .with_database(&db, move |w| w.remove_region(&region, &key))
                 .await
             {
                 Ok(()) => Response::Ok,
@@ -247,10 +327,11 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             }
         }
         Request::ListColumns => {
-            if let Err(response) = require_authenticated(account) {
-                return response;
-            }
-            match state.with_world(|w| Ok(w.columns())).await {
+            let db = match require_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
+            match state.with_database(&db, |w| Ok(w.columns())).await {
                 Ok(columns) => Response::Columns(
                     columns
                         .into_iter()
@@ -264,11 +345,12 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             }
         }
         Request::AddColumn { key, value_type } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
             match state
-                .with_world(move |w| w.add_column(&key, value_type))
+                .with_database(&db, move |w| w.add_column(&key, value_type))
                 .await
             {
                 Ok(()) => Response::Ok,
@@ -276,21 +358,28 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
             }
         }
         Request::RemoveColumn { key } => {
-            if let Err(response) = require_write(account) {
-                return response;
-            }
-            match state.with_world(move |w| w.remove_column(&key)).await {
+            let db = match require_write_database(session) {
+                Ok(db) => db.to_string(),
+                Err(response) => return response,
+            };
+            match state
+                .with_database(&db, move |w| w.remove_column(&key))
+                .await
+            {
                 Ok(true) => Response::Ok,
                 Ok(false) => Response::NotFound,
                 Err(e) => response_from_error(e),
             }
         }
         Request::Query { query } => {
-            let authenticated = match require_authenticated(account) {
-                Ok(account) => account,
+            let db = match require_database(session) {
+                Ok(db) => db.to_string(),
                 Err(response) => return response,
             };
-            match crate::routes::execute_query(state, authenticated, &query).await {
+            // `require_database` already confirmed `session.account` is
+            // `Some`.
+            let account = session.account.clone().unwrap();
+            match crate::routes::execute_query(state, &db, &account, &query).await {
                 Ok(result) => {
                     if let Some(rows) = result.rows {
                         Response::Query(QueryResult::Rows(
@@ -320,13 +409,42 @@ async fn handle_request(req: Request, state: &AppState, account: &mut Option<Acc
                 Err(e) => response_from_error(e),
             }
         }
+        Request::ListDatabases => {
+            if let Err(response) = require_authenticated(session) {
+                return response;
+            }
+            match state.list_databases().await {
+                Ok(names) => Response::Databases(names),
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::CreateDatabase { name } => {
+            if let Err(response) = require_write(session) {
+                return response;
+            }
+            match state.create_database(&name, None).await {
+                Ok(()) => Response::Ok,
+                Err(e) => response_from_error(e),
+            }
+        }
+        Request::RemoveDatabase { name } => {
+            if let Err(response) = require_write(session) {
+                return response;
+            }
+            match state.remove_database(&name).await {
+                Ok(true) => Response::Ok,
+                Ok(false) => Response::NotFound,
+                Err(e) => response_from_error(e),
+            }
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kblockdblib::{Value, World};
+    use crate::state::{Databases, WorldShape};
+    use kblockdblib::Value;
     use std::collections::HashMap;
     use std::sync::Arc;
     use tokio::io::AsyncWriteExt;
@@ -334,11 +452,16 @@ mod tests {
 
     const ADMIN_PASSWORD: &str = "admin-pw";
     const VIEWER_PASSWORD: &str = "viewer-pw";
+    /// The database every `spawn_test_server` pre-creates, so existing data
+    /// tests don't each need their own `CreateDatabase` round trip -- tests
+    /// that exercise the "no database selected"/bootstrap flow itself use a
+    /// name that was deliberately never created instead.
+    const DB: &str = "db";
 
     /// Spawns a real binary-protocol listener on an OS-assigned port,
-    /// backed by a fresh temp world (`axes`, `world_dim` as given, two
-    /// accounts: `admin` full access, `viewer` read-only), and returns the
-    /// address to connect to. The temp directory is removed when the
+    /// backed by a fresh temp data dir with one pre-created database (`DB`,
+    /// shaped `axes`/`world_dim` as given), two accounts: `admin` full
+    /// access, `viewer` read-only. The temp directory is removed when the
     /// returned guard drops.
     struct TestServer {
         addr: std::net::SocketAddr,
@@ -370,7 +493,13 @@ mod tests {
             "kblockdbserver-binary-test-{n}-{}",
             std::process::id()
         ));
-        let world = World::create(&dir, axes, world_dim, 32).unwrap();
+        let shape = WorldShape {
+            axes,
+            world_dim,
+            chunk_dim: 32,
+        };
+        let databases = Databases::new(&dir, shape);
+        databases.create(DB, None).unwrap();
 
         let mut credentials = HashMap::new();
         credentials.insert(
@@ -387,7 +516,7 @@ mod tests {
                 read_only: true,
             },
         );
-        let mut state = AppState::new(world, Arc::new(credentials));
+        let mut state = AppState::new(databases, Arc::new(credentials));
         if let Some(hostname) = hostname {
             state = state.with_hostname(hostname);
         }
@@ -411,12 +540,24 @@ mod tests {
         wire::decode_response(&payload).unwrap()
     }
 
+    /// `Hello` against `DB` -- the database every `spawn_test_server`
+    /// pre-creates -- the shape almost every test below needs.
     async fn hello(stream: &mut ClientStream, username: &str, password: &str) -> Response {
+        hello_db(stream, username, password, DB).await
+    }
+
+    async fn hello_db(
+        stream: &mut ClientStream,
+        username: &str,
+        password: &str,
+        database: &str,
+    ) -> Response {
         roundtrip(
             stream,
             &Request::Hello {
                 username: username.to_string(),
                 password: password.to_string(),
+                database: database.to_string(),
             },
         )
         .await
@@ -434,7 +575,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_with_correct_credentials_returns_the_worlds_shape() {
+    async fn hello_with_correct_credentials_returns_the_databases_shape() {
         let server = spawn_test_server(3, 10_000).await;
         let mut stream = connect(&server).await;
 
@@ -442,9 +583,12 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
-                axes: 3,
-                world_dim: 10_000,
                 read_only: false,
+                database: Some(DatabaseShape {
+                    axes: 3,
+                    world_dim: 10_000,
+                    chunk_dim: 32,
+                }),
             }
         );
     }
@@ -458,9 +602,12 @@ mod tests {
         assert_eq!(
             response,
             Response::HelloOk {
-                axes: 3,
-                world_dim: 10_000,
                 read_only: true,
+                database: Some(DatabaseShape {
+                    axes: 3,
+                    world_dim: 10_000,
+                    chunk_dim: 32,
+                }),
             }
         );
     }
@@ -472,6 +619,107 @@ mod tests {
 
         let response = hello(&mut stream, "admin", "wrong").await;
         assert!(matches!(response, Response::Unauthorized(_)));
+    }
+
+    #[tokio::test]
+    async fn hello_against_an_unknown_database_still_authenticates_but_selects_nothing() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        let response = hello_db(&mut stream, "admin", ADMIN_PASSWORD, "nope").await;
+        assert_eq!(
+            response,
+            Response::HelloOk {
+                read_only: false,
+                database: None,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn data_ops_on_a_connection_with_no_database_selected_are_bad_requests() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello_db(&mut stream, "admin", ADMIN_PASSWORD, "nope").await;
+
+        for request in [
+            Request::Get {
+                coord: vec![1, 2, 3],
+                key: "material".to_string(),
+            },
+            Request::Set {
+                coord: vec![1, 2, 3],
+                key: "material".to_string(),
+                value: Value::I64(1),
+            },
+            Request::Stats,
+            Request::ListColumns,
+            Request::Query {
+                query: "SELECT *".to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(
+                matches!(response, Response::BadRequest(_)),
+                "got {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn creating_the_selected_database_then_re_hello_selects_it() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        assert_eq!(
+            hello_db(&mut stream, "admin", ADMIN_PASSWORD, "fresh").await,
+            Response::HelloOk {
+                read_only: false,
+                database: None,
+            }
+        );
+
+        let create = roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: "fresh".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(create, Response::Ok);
+
+        // Data ops still fail until Hello re-selects it.
+        let too_soon = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: vec![0, 0, 0],
+                key: "k".to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(too_soon, Response::BadRequest(_)));
+
+        let response = hello_db(&mut stream, "admin", ADMIN_PASSWORD, "fresh").await;
+        assert_eq!(
+            response,
+            Response::HelloOk {
+                read_only: false,
+                database: Some(DatabaseShape {
+                    axes: 3,
+                    world_dim: 10_000,
+                    chunk_dim: 32,
+                }),
+            }
+        );
+        let get = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: vec![0, 0, 0],
+                key: "k".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(get, Response::NotFound);
     }
 
     #[tokio::test]
@@ -511,21 +759,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_reports_the_worlds_shape_and_this_instances_hostname() {
+    async fn health_reports_the_database_count_and_this_instances_hostname() {
         let server = spawn_test_server(3, 10_000).await;
         let mut stream = connect(&server).await;
 
         match roundtrip(&mut stream, &Request::Health).await {
             Response::Health {
-                axes,
-                world_dim,
-                chunk_dim,
+                database_count,
                 hostname,
                 ..
             } => {
-                assert_eq!(axes, 3);
-                assert_eq!(world_dim, 10_000);
-                assert_eq!(chunk_dim, 32);
+                // `spawn_test_server` pre-creates exactly one database.
+                assert_eq!(database_count, 1);
                 // Which hostname the test machine has isn't knowable
                 // here; that one was reported at all is.
                 assert!(!hostname.is_empty());
@@ -1052,5 +1297,204 @@ mod tests {
                 "got {response:?}"
             );
         }
+    }
+
+    // --- Database management ---
+
+    #[tokio::test]
+    async fn list_databases_reports_the_pre_created_database() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let response = roundtrip(&mut stream, &Request::ListDatabases).await;
+        assert_eq!(response, Response::Databases(vec![DB.to_string()]));
+    }
+
+    #[tokio::test]
+    async fn create_then_list_then_remove_a_database_round_trips() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let create = roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: "extra".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(create, Response::Ok);
+
+        let Response::Databases(mut names) =
+            roundtrip(&mut stream, &Request::ListDatabases).await
+        else {
+            panic!("expected Response::Databases");
+        };
+        names.sort();
+        assert_eq!(names, vec![DB.to_string(), "extra".to_string()]);
+
+        let remove = roundtrip(
+            &mut stream,
+            &Request::RemoveDatabase {
+                name: "extra".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(remove, Response::Ok);
+        assert_eq!(
+            roundtrip(&mut stream, &Request::ListDatabases).await,
+            Response::Databases(vec![DB.to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn creating_a_database_that_already_exists_is_a_conflict() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: DB.to_string(),
+            },
+        )
+        .await;
+        assert!(matches!(response, Response::Conflict(_)), "{response:?}");
+    }
+
+    #[tokio::test]
+    async fn removing_an_unknown_database_is_not_found() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+
+        let response = roundtrip(
+            &mut stream,
+            &Request::RemoveDatabase {
+                name: "nope".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(response, Response::NotFound);
+    }
+
+    #[tokio::test]
+    async fn database_management_requests_require_hello_first() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+
+        for request in [
+            Request::ListDatabases,
+            Request::CreateDatabase {
+                name: "x".to_string(),
+            },
+            Request::RemoveDatabase {
+                name: "x".to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(
+                matches!(response, Response::Unauthorized(_)),
+                "got {response:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_only_account_can_list_but_not_create_or_remove_databases() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "viewer", VIEWER_PASSWORD).await;
+
+        assert_eq!(
+            roundtrip(&mut stream, &Request::ListDatabases).await,
+            Response::Databases(vec![DB.to_string()])
+        );
+
+        for request in [
+            Request::CreateDatabase {
+                name: "extra".to_string(),
+            },
+            Request::RemoveDatabase {
+                name: DB.to_string(),
+            },
+        ] {
+            let response = roundtrip(&mut stream, &request).await;
+            assert!(
+                matches!(response, Response::Forbidden(_)),
+                "got {response:?}"
+            );
+        }
+    }
+
+    /// A connection selecting database management requests works
+    /// regardless of whether `Hello` selected a database -- the whole point
+    /// of decoupling the two (see this module's doc comment).
+    #[tokio::test]
+    async fn database_management_works_without_a_selected_database() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello_db(&mut stream, "admin", ADMIN_PASSWORD, "not-created-yet").await;
+
+        let create = roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: "not-created-yet".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(create, Response::Ok);
+    }
+
+    #[tokio::test]
+    async fn two_databases_are_isolated_over_one_connection() {
+        let server = spawn_test_server(3, 10_000).await;
+        let mut stream = connect(&server).await;
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+        roundtrip(
+            &mut stream,
+            &Request::CreateDatabase {
+                name: "other".to_string(),
+            },
+        )
+        .await;
+
+        // Write to `DB` on this connection.
+        roundtrip(
+            &mut stream,
+            &Request::Set {
+                coord: vec![0, 0, 0],
+                key: "k".to_string(),
+                value: Value::I64(1),
+            },
+        )
+        .await;
+
+        // Switch this same connection to `other` and confirm it sees
+        // nothing there.
+        hello_db(&mut stream, "admin", ADMIN_PASSWORD, "other").await;
+        let get_other = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: vec![0, 0, 0],
+                key: "k".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(get_other, Response::NotFound);
+
+        // Switching back to `DB` still sees the original write.
+        hello(&mut stream, "admin", ADMIN_PASSWORD).await;
+        let get_db = roundtrip(
+            &mut stream,
+            &Request::Get {
+                coord: vec![0, 0, 0],
+                key: "k".to_string(),
+            },
+        )
+        .await;
+        assert_eq!(expect_value(get_db), Value::I64(1));
     }
 }

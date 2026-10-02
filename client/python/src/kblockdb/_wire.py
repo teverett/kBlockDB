@@ -68,8 +68,13 @@ def _pack_value(value: Value) -> bytes:
     raise TypeError(f"unsupported value type: {type(value).__name__}")
 
 
-def encode_hello(username: str, password: str) -> bytes:
-    return b"\x00" + _pack_short_string(username) + _pack_short_string(password)
+def encode_hello(username: str, password: str, database: str) -> bytes:
+    return (
+        b"\x00"
+        + _pack_short_string(username)
+        + _pack_short_string(password)
+        + _pack_short_string(database)
+    )
 
 
 def encode_get(coord: tuple[int, ...], key: str) -> bytes:
@@ -140,6 +145,22 @@ def encode_remove_column(key: str) -> bytes:
     return b"\x0c" + _pack_key(key)
 
 
+def encode_list_databases() -> bytes:
+    return b"\x0d"
+
+
+def encode_create_database(name: str) -> bytes:
+    """Always uses the server's configured default shape for a new database
+    -- this protocol has no way to override it (see ``docs/kblockdbserver.md``
+    or ``PUT /rest/databases/{name}`` for an API that can).
+    """
+    return b"\x0e" + _pack_key(name)
+
+
+def encode_remove_database(name: str) -> bytes:
+    return b"\x0f" + _pack_key(name)
+
+
 def _recv_exact(sock: socket.socket, length: int, context: str) -> bytes:
     chunks = bytearray()
     while len(chunks) < length:
@@ -175,10 +196,19 @@ def read_frame(sock: socket.socket) -> bytes:
 
 
 @dataclass(frozen=True, slots=True)
-class HelloOk:
+class DatabaseShape:
     axes: int
     world_dim: int
+    chunk_dim: int
+
+
+@dataclass(frozen=True, slots=True)
+class HelloOk:
     read_only: bool
+    # `None` if `Hello`'s named database doesn't exist yet -- the account
+    # still authenticated, but no database is selected (see
+    # `client.KBlockDBClient.use_database`).
+    database: DatabaseShape | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +258,11 @@ class ColumnsResponse:
     columns: tuple[Column, ...]
 
 
+@dataclass(frozen=True, slots=True)
+class DatabasesResponse:
+    databases: tuple[str, ...]
+
+
 Response: TypeAlias = (
     HelloOk
     | Ok
@@ -239,6 +274,7 @@ Response: TypeAlias = (
     | RegionValues
     | QueryResponse
     | ColumnsResponse
+    | DatabasesResponse
 )
 
 
@@ -342,25 +378,37 @@ def _read_value_type(reader: "_Reader") -> ValueType:
 
 
 def _read_health(reader: "_Reader") -> Health:
-    """``[u8 axes][u32 LE world_dim][u32 LE chunk_dim][u64 LE ts]<hostname>``.
+    """``[u64 LE timestamp][u32 LE database_count]<hostname>``.
 
     Read field by field rather than inline: ``Health``'s fields are in a
     different order than the wire puts them in, and Python evaluates
     constructor arguments left to right, so building it inline would read
     the frame out of order.
     """
+    timestamp = reader.u64()
+    database_count = reader.u32()
+    return Health(reader.key(), database_count, timestamp)
+
+
+def _read_hello_ok(reader: "_Reader") -> HelloOk:
+    read_only = reader.u8() != 0
+    if reader.u8() == 0:
+        return HelloOk(read_only, None)
     axes = reader.u8()
     world_dim = reader.u32()
     chunk_dim = reader.u32()
-    timestamp = reader.u64()
-    return Health(reader.key(), axes, world_dim, chunk_dim, timestamp)
+    return HelloOk(read_only, DatabaseShape(axes, world_dim, chunk_dim))
+
+
+def _read_databases(reader: "_Reader") -> DatabasesResponse:
+    return DatabasesResponse(tuple(reader.key() for _ in range(reader.u32())))
 
 
 def decode_response(payload: bytes) -> Response:
     reader = _Reader(payload)
     status = reader.u8()
     if status == 0x00:
-        return HelloOk(reader.u8(), reader.u32(), reader.u8() != 0)
+        return _read_hello_ok(reader)
     if status == 0x01:
         return Ok()
     if status == 0x02:
@@ -379,4 +427,6 @@ def decode_response(payload: bytes) -> Response:
         return QueryResponse(reader.query_result())
     if status == 0x0C:
         return ColumnsResponse(_read_columns(reader))
+    if status == 0x0E:
+        return _read_databases(reader)
     raise ProtocolError(f"unknown status 0x{status:x}")

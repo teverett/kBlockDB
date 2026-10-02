@@ -91,19 +91,17 @@ class ValueWithMeta:
 
 @dataclass(frozen=True, slots=True)
 class Health:
-    """The server's identity, world shape, and clock.
+    """The server's identity, how many databases it manages, and its clock.
 
     ``hostname`` is which instance answered -- its OS hostname, or
     whatever the server's ``hostname`` config key overrides it to. Never
     empty: a server that can't determine its own hostname reports
-    ``"unknown"``. ``chunk_dim`` is cells per axis in one chunk file, the
-    world's on-disk granularity, fixed when the world was created.
+    ``"unknown"``. ``database_count`` is a live count, not cached -- see
+    :meth:`KBlockDBClient.list_databases` for the actual names.
     """
 
     hostname: str
-    axes: int
-    world_dim: int
-    chunk_dim: int
+    database_count: int
     timestamp: int
 
 

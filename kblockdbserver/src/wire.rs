@@ -28,6 +28,20 @@
 //! find the start of the *next* frame regardless of whether it understood
 //! this one, so one bad request doesn't have to end the connection.
 //!
+//! **Databases.** kBlockDB manages any number of independent databases
+//! under one `--data-dir`, each one its own `kblockdblib::World` (see
+//! `state::Databases`). `Hello` authenticates an account *and* selects one
+//! database for the connection's whole life -- every data request after it
+//! (`Get`/`Set`/`Query`/`ListColumns`/...) operates on whichever database
+//! `Hello` selected. If the named database doesn't exist yet, `Hello` still
+//! succeeds (the account is authenticated) but selects no database --
+//! `HelloOk.database` comes back `None`, and every data request on that
+//! connection gets `BadRequest` until the client creates the database
+//! (`CreateDatabase`, which needs only an authenticated account, not a
+//! selected database) and sends `Hello` again to select it.
+//! `ListDatabases`/`CreateDatabase`/`RemoveDatabase` work the same way
+//! regardless of whether a database is currently selected.
+//!
 //! **Requests** (client -> server), as `payload`:
 //!
 //! ```text
@@ -35,6 +49,7 @@
 //!
 //! 0x00 Hello:  [u8 username_len][username bytes]
 //!              [u8 password_len][password bytes]
+//!              [u8 database_len][database bytes]
 //! 0x01 Get:    <coord> <key>
 //! 0x02 Set:    <coord> <key> <value>
 //! 0x03 Remove: <coord> <key>
@@ -48,6 +63,12 @@
 //! 0x0a ListColumns:  (no fields)
 //! 0x0b AddColumn:    <key> [u8 value type tag]
 //! 0x0c RemoveColumn: <key>
+//! 0x0d ListDatabases:  (no fields)
+//! 0x0e CreateDatabase: <key as database name>  -- always uses the server's
+//!                      configured default shape; a caller that needs a
+//!                      custom shape uses `PUT /rest/databases/{name}`
+//!                      instead.
+//! 0x0f RemoveDatabase: <key as database name>
 //! ```
 //!
 //! `<coord>` is `[u8 axes][axes * i32 LE]` (signed -- kBlockDB's coordinate
@@ -65,7 +86,8 @@
 //! ```text
 //! [u8 status] <status-specific fields>
 //!
-//! 0x00 HelloOk:      [u8 axes][u32 LE world_dim][u8 read_only (0/1)]
+//! 0x00 HelloOk:      [u8 read_only (0/1)][u8 database_selected (0/1)]
+//!                    (if database_selected: [u8 axes][u32 LE world_dim][u32 LE chunk_dim])
 //! 0x01 Ok:           (Set/Remove succeeded)
 //! 0x02 Value:        <value> <meta>
 //! 0x03 NotFound:     (Get found nothing)
@@ -73,13 +95,14 @@
 //! 0x05 Unauthorized: <message>
 //! 0x06 Forbidden:    <message>
 //! 0x07 Internal:     <message>
-//! 0x08 Health:       [u8 axes][u32 LE world_dim][u32 LE chunk_dim]
-//!                    [u64 LE timestamp_seconds] <hostname as a message>
+//! 0x08 Health:       [u64 LE timestamp_seconds][u32 LE database_count]
+//!                    <hostname as a message>
 //! 0x09 Stats:        [u64 LE total_chunks][u64 LE total_bytes][u64 LE total_blocks]
 //! 0x0a RegionValues: [u32 LE count][count * ([u8 present] [<value> if present])]
 //! 0x0b Query:        [u8 kind] <query-specific fields>
 //! 0x0c Columns:      [u32 LE count][count * (<key> [u8 value type tag])]
 //! 0x0d Conflict:     <message>
+//! 0x0e Databases:    [u32 LE count][count * <message as a database name>]
 //! ```
 //!
 //! `<message>` is `[u16 LE len][len bytes utf8]`. `<meta>` is
@@ -110,6 +133,7 @@ pub enum Request {
     Hello {
         username: String,
         password: String,
+        database: String,
     },
     Get {
         coord: Vec<i32>,
@@ -153,6 +177,23 @@ pub enum Request {
     RemoveColumn {
         key: String,
     },
+    ListDatabases,
+    CreateDatabase {
+        name: String,
+    },
+    RemoveDatabase {
+        name: String,
+    },
+}
+
+/// The shape of a selected database, as carried by a successful
+/// `Response::HelloOk` -- see `kblockdblib::World::axes`/`world_dim`/
+/// `chunk_dim`, which this mirrors field-for-field.
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub struct DatabaseShape {
+    pub axes: u8,
+    pub world_dim: u32,
+    pub chunk_dim: u32,
 }
 
 /// One column in the world's schema, as carried by `Response::Columns`.
@@ -186,9 +227,10 @@ pub enum QueryResult {
 #[derive(Debug, PartialEq)]
 pub enum Response {
     HelloOk {
-        axes: u8,
-        world_dim: u32,
         read_only: bool,
+        /// `None` if `Hello`'s named database doesn't exist yet -- see this
+        /// module's doc comment on the bootstrap flow that follows.
+        database: Option<DatabaseShape>,
     },
     Ok,
     Value {
@@ -203,10 +245,8 @@ pub enum Response {
     Forbidden(String),
     Internal(String),
     Health {
-        axes: u8,
-        world_dim: u32,
-        chunk_dim: u32,
         timestamp: u64,
+        database_count: u32,
         hostname: String,
     },
     Stats {
@@ -218,6 +258,7 @@ pub enum Response {
     Query(QueryResult),
     Columns(Vec<Column>),
     Conflict(String),
+    Databases(Vec<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -270,10 +311,15 @@ impl std::error::Error for DecodeError {}
 pub fn encode_request(req: &Request) -> Vec<u8> {
     let mut buf = Vec::new();
     match req {
-        Request::Hello { username, password } => {
+        Request::Hello {
+            username,
+            password,
+            database,
+        } => {
             buf.push(0x00);
             put_short_string(&mut buf, username);
             put_short_string(&mut buf, password);
+            put_short_string(&mut buf, database);
         }
         Request::Get { coord, key } => {
             buf.push(0x01);
@@ -342,6 +388,15 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
             buf.push(0x0c);
             put_key(&mut buf, key);
         }
+        Request::ListDatabases => buf.push(0x0d),
+        Request::CreateDatabase { name } => {
+            buf.push(0x0e);
+            put_key(&mut buf, name);
+        }
+        Request::RemoveDatabase { name } => {
+            buf.push(0x0f);
+            put_key(&mut buf, name);
+        }
     }
     buf
 }
@@ -349,15 +404,18 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
 pub fn encode_response(resp: &Response) -> Vec<u8> {
     let mut buf = Vec::new();
     match resp {
-        Response::HelloOk {
-            axes,
-            world_dim,
-            read_only,
-        } => {
+        Response::HelloOk { read_only, database } => {
             buf.push(0x00);
-            buf.push(*axes);
-            buf.extend_from_slice(&world_dim.to_le_bytes());
             buf.push(u8::from(*read_only));
+            match database {
+                Some(shape) => {
+                    buf.push(1);
+                    buf.push(shape.axes);
+                    buf.extend_from_slice(&shape.world_dim.to_le_bytes());
+                    buf.extend_from_slice(&shape.chunk_dim.to_le_bytes());
+                }
+                None => buf.push(0),
+            }
         }
         Response::Ok => buf.push(0x01),
         Response::Value {
@@ -388,17 +446,13 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
             put_message(&mut buf, m);
         }
         Response::Health {
-            axes,
-            world_dim,
-            chunk_dim,
             timestamp,
+            database_count,
             hostname,
         } => {
             buf.push(0x08);
-            buf.push(*axes);
-            buf.extend_from_slice(&world_dim.to_le_bytes());
-            buf.extend_from_slice(&chunk_dim.to_le_bytes());
             buf.extend_from_slice(&timestamp.to_le_bytes());
+            buf.extend_from_slice(&database_count.to_le_bytes());
             put_message(&mut buf, hostname);
         }
         Response::Stats {
@@ -462,6 +516,13 @@ pub fn encode_response(resp: &Response) -> Vec<u8> {
         Response::Conflict(m) => {
             buf.push(0x0d);
             put_message(&mut buf, m);
+        }
+        Response::Databases(names) => {
+            buf.push(0x0e);
+            buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+            for name in names {
+                put_message(&mut buf, name);
+            }
         }
     }
     buf
@@ -639,6 +700,7 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
         0x00 => Ok(Request::Hello {
             username: r.short_string()?,
             password: r.short_string()?,
+            database: r.short_string()?,
         }),
         0x01 => Ok(Request::Get {
             coord: r.coord()?,
@@ -691,6 +753,9 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
         0x09 => Ok(Request::Query {
             query: r.long_string()?,
         }),
+        0x0d => Ok(Request::ListDatabases),
+        0x0e => Ok(Request::CreateDatabase { name: r.key()? }),
+        0x0f => Ok(Request::RemoveDatabase { name: r.key()? }),
         other => Err(DecodeError::UnknownOpcode(other)),
     }
 }
@@ -700,11 +765,18 @@ pub fn decode_request(payload: &[u8]) -> Result<Request, DecodeError> {
 pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
     let mut r = Reader::new(payload);
     match r.u8()? {
-        0x00 => Ok(Response::HelloOk {
-            axes: r.u8()?,
-            world_dim: r.u32()?,
-            read_only: r.u8()? != 0,
-        }),
+        0x00 => {
+            let read_only = r.u8()? != 0;
+            let database = match r.u8()? {
+                0 => None,
+                _ => Some(DatabaseShape {
+                    axes: r.u8()?,
+                    world_dim: r.u32()?,
+                    chunk_dim: r.u32()?,
+                }),
+            };
+            Ok(Response::HelloOk { read_only, database })
+        }
         0x01 => Ok(Response::Ok),
         0x02 => {
             let value = r.value()?;
@@ -722,10 +794,8 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
         0x06 => Ok(Response::Forbidden(r.message()?)),
         0x07 => Ok(Response::Internal(r.message()?)),
         0x08 => Ok(Response::Health {
-            axes: r.u8()?,
-            world_dim: r.u32()?,
-            chunk_dim: r.u32()?,
             timestamp: r.u64()?,
+            database_count: r.u32()?,
             hostname: r.message()?,
         }),
         0x09 => Ok(Response::Stats {
@@ -784,6 +854,13 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
             Ok(Response::Columns(columns))
         }
         0x0d => Ok(Response::Conflict(r.message()?)),
+        0x0e => {
+            let count = r.u32()? as usize;
+            let names = (0..count)
+                .map(|_| r.message())
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(Response::Databases(names))
+        }
         other => Err(DecodeError::UnknownStatus(other)),
     }
 }
@@ -865,10 +942,12 @@ mod tests {
         roundtrip_request(Request::Hello {
             username: "admin".into(),
             password: "hunter2".into(),
+            database: "mydb".into(),
         });
         roundtrip_request(Request::Hello {
             username: String::new(),
             password: String::new(),
+            database: String::new(),
         });
     }
 
@@ -936,6 +1015,13 @@ mod tests {
             Request::Query {
                 query: "SELECT *".into(),
             },
+            Request::ListDatabases,
+            Request::CreateDatabase {
+                name: "mydb".into(),
+            },
+            Request::RemoveDatabase {
+                name: "mydb".into(),
+            },
         ] {
             roundtrip_request(request);
         }
@@ -957,36 +1043,46 @@ mod tests {
     #[test]
     fn hello_ok_response_round_trips() {
         roundtrip_response(Response::HelloOk {
-            axes: 3,
-            world_dim: 10_000,
             read_only: false,
+            database: Some(DatabaseShape {
+                axes: 3,
+                world_dim: 10_000,
+                chunk_dim: 32,
+            }),
         });
         roundtrip_response(Response::HelloOk {
-            axes: 4,
-            world_dim: 1,
             read_only: true,
+            database: Some(DatabaseShape {
+                axes: 4,
+                world_dim: 1,
+                chunk_dim: 1,
+            }),
+        });
+        // No database selected (Hello named one that doesn't exist yet) --
+        // see this module's doc comment on the bootstrap flow.
+        roundtrip_response(Response::HelloOk {
+            read_only: false,
+            database: None,
         });
     }
 
     #[test]
     fn every_extended_response_round_trips() {
         roundtrip_response(Response::Health {
-            axes: 3,
-            world_dim: 10_000,
-            chunk_dim: 32,
             timestamp: 123,
+            database_count: 2,
             hostname: "db-1.example.com".into(),
         });
         // An empty hostname is still a well-formed frame -- the server
         // substitutes "unknown" rather than sending one, but decoding
         // must not depend on that.
         roundtrip_response(Response::Health {
-            axes: 1,
-            world_dim: 1,
-            chunk_dim: 1,
             timestamp: 0,
+            database_count: 0,
             hostname: String::new(),
         });
+        roundtrip_response(Response::Databases(vec![]));
+        roundtrip_response(Response::Databases(vec!["a".into(), "b".into()]));
         roundtrip_response(Response::Stats {
             total_chunks: 2,
             total_bytes: 3,

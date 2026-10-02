@@ -1,18 +1,25 @@
-//! The REST API surface, mounted under the `/rest` context path: two
-//! resources, `/rest/cells/...` (a single cell) and `/rest/regions/...`
-//! (an axis-aligned box of cells), each with GET (read), PUT (write) and
-//! DELETE (remove) -- plus read-only `/rest/stats` and `/rest/health`.
+//! The REST API surface, mounted under the `/rest` context path:
+//! `/rest/databases` (and `/rest/databases/{name}`) manage which databases
+//! exist, and every per-database resource -- `/rest/db/{db}/cells/...`
+//! (a single cell), `/rest/db/{db}/regions/...` (an axis-aligned box of
+//! cells), `/rest/db/{db}/stats`, `/rest/db/{db}/columns`, and
+//! `/rest/db/{db}/query` -- is scoped under a `{db}` path segment naming
+//! which one to operate on. Every one of those routes 404s if `{db}` names
+//! a database that doesn't exist -- there's no implicit creation; create it
+//! first via `PUT /rest/databases/{name}`.
 //!
 //! Coordinates and region origin/extent are comma-separated path segments
-//! (`/rest/cells/1,2,3/material`, `/rest/regions/0,0,0/8,8,8/material`),
-//! matching however many axes the world was created with -- there's
-//! nothing 3-axis-specific here, same as in `kblockdblib` itself.
+//! (`/rest/db/{db}/cells/1,2,3/material`,
+//! `/rest/db/{db}/regions/0,0,0/8,8,8/material`), matching however many axes
+//! that database was created with -- there's nothing 3-axis-specific here,
+//! same as in `kblockdblib` itself.
 //!
 //! Every route below requires HTTP Basic Auth (see `auth.rs`) except
 //! `/rest/health`, left open so load balancers/orchestrators can poll
 //! liveness without credentials -- it exposes nothing more sensitive than
-//! the world's shape and this server's clock. `/rest/stats` is a `GET`, so
-//! a `read_only` account can use it same as any other account.
+//! this server's clock and how many databases it's managing. `GET
+//! /rest/databases` and `GET /rest/db/{db}/stats` are `GET`s, so a
+//! `read_only` account can use them same as any other account.
 //!
 //! Every handler below carries a `#[utoipa::path(...)]` annotation, which
 //! is how `openapi.rs`'s spec (served at `/rest/api-docs/openapi.json` and
@@ -26,15 +33,15 @@
 //! it only ever sees the literal string given.
 //!
 //! `router()` also mounts `browser::router` at the top level (`/` and
-//! `/rows`, see that module) -- a read-only data browser over this same
-//! world, deliberately kept outside `/rest` since it isn't part of the
-//! versioned REST API surface.
+//! `/db/{name}/...`, see that module) -- a read-only data browser over
+//! these same databases, deliberately kept outside `/rest` since it isn't
+//! part of the versioned REST API surface.
 //!
-//! `POST /rest/query` (see `run_query` below) is the one route here that
-//! doesn't use `require_auth`: that middleware's `read_only` check is
+//! `POST /rest/db/{db}/query` (see `run_query` below) is the one route here
+//! that doesn't use `require_auth`: that middleware's `read_only` check is
 //! purely a function of HTTP method (`GET` = read, anything else = write),
-//! but one `POST /rest/query` can be *either* depending on the query text
-//! itself (`SELECT` vs `SET`/`UPDATE`/`DELETE` -- see `query.rs`'s
+//! but one query can be *either* depending on the query text itself
+//! (`SELECT` vs `SET`/`UPDATE`/`DELETE` -- see `query.rs`'s
 //! `Statement::is_write`). `run_query` authenticates the same way
 //! `require_auth` does (`auth::account_from_headers`) and only then checks
 //! `read_only` against the parsed statement, not the HTTP method.
@@ -45,7 +52,7 @@ use crate::coords::parse_coords;
 use crate::error::{ApiError, ErrorBody};
 use crate::openapi::ApiDoc;
 use crate::query;
-use crate::state::AppState;
+use crate::state::{AppState, WorldShape};
 use crate::value_json::{ValueJson, ValueTypeJson};
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -60,22 +67,30 @@ use utoipa_swagger_ui::SwaggerUi;
 
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
+        .route("/databases", get(list_databases))
         .route(
-            "/cells/{coords}/{key}",
+            "/databases/{name}",
+            put(create_database).delete(remove_database),
+        )
+        .route(
+            "/db/{db}/cells/{coords}/{key}",
             get(get_cell).put(set_cell).delete(remove_cell),
         )
         .route(
-            "/regions/{origin}/{extent}/{key}",
+            "/db/{db}/regions/{origin}/{extent}/{key}",
             get(get_region).put(set_region).delete(remove_region),
         )
-        .route("/stats", get(stats))
-        .route("/columns", get(list_columns))
-        .route("/columns/{key}", put(add_column).delete(remove_column))
+        .route("/db/{db}/stats", get(stats))
+        .route("/db/{db}/columns", get(list_columns))
+        .route(
+            "/db/{db}/columns/{key}",
+            put(add_column).delete(remove_column),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Not under `protected` -- see this module's doc comment on why
-    // `/query` needs its own auth check instead of `require_auth`'s.
-    let query_route = Router::new().route("/query", post(run_query));
+    // `/db/{db}/query` needs its own auth check instead of `require_auth`'s.
+    let query_route = Router::new().route("/db/{db}/query", post(run_query));
 
     let rest = Router::new()
         .route("/health", get(health))
@@ -107,12 +122,9 @@ pub struct HealthResponse {
     /// balancer, where the point of polling `/rest/health` is often to
     /// find out *which* backend is unhealthy.
     hostname: String,
-    axes: usize,
-    world_dim: u32,
-    /// Cells per axis in one chunk file -- the world's on-disk
-    /// granularity, fixed when the world was created (see
-    /// `kblockdblib::World::chunk_dim`).
-    chunk_dim: u32,
+    /// How many databases this server currently manages -- a live count
+    /// (see `GET /rest/databases`), not a cached one.
+    database_count: usize,
     /// Seconds since the Unix epoch, per this server's own clock -- lets a
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
@@ -127,18 +139,14 @@ pub struct HealthResponse {
         (status = 200, description = "The server is up", body = HealthResponse),
     ),
 )]
-async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
-    // No lock needed at all: World::axes/world_dim/chunk_dim are plain
-    // field reads via &self, and state.world is a bare Arc<World> now
-    // (see state.rs).
-    Json(HealthResponse {
+async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
+    let database_count = state.list_databases().await?.len();
+    Ok(Json(HealthResponse {
         status: "ok".to_string(),
         hostname: state.hostname.to_string(),
-        axes: state.world.axes(),
-        world_dim: state.world.world_dim(),
-        chunk_dim: state.world.chunk_dim(),
+        database_count,
         timestamp: unix_timestamp(),
-    })
+    }))
 }
 
 pub(crate) fn unix_timestamp() -> u64 {
@@ -148,33 +156,95 @@ pub(crate) fn unix_timestamp() -> u64 {
         .as_secs()
 }
 
-/// On-disk statistics for the world's data -- see `kblockdblib::Stats`'s doc
-/// comment for what each field means and how `total_blocks` differs from
-/// `total_bytes / 512` for a mostly-empty (sparse) world.
+/// Every database this server currently manages, sorted by name.
 #[derive(Serialize, ToSchema)]
-pub struct StatsResponse {
-    total_chunks: u64,
-    total_bytes: u64,
-    total_blocks: u64,
+pub struct DatabasesResponse {
+    databases: Vec<String>,
 }
 
 #[utoipa::path(
     get,
-    path = "/rest/stats",
-    tag = "stats",
+    path = "/rest/databases",
+    tag = "databases",
     responses(
-        (status = 200, description = "On-disk statistics for the world's data", body = StatsResponse),
+        (status = 200, description = "Every database this server manages", body = DatabasesResponse),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
-async fn stats(State(state): State<AppState>) -> Result<Json<StatsResponse>, ApiError> {
-    let stats = state.with_world(kblockdblib::World::stats).await?;
-    Ok(Json(StatsResponse {
-        total_chunks: stats.total_chunks,
-        total_bytes: stats.total_bytes,
-        total_blocks: stats.total_blocks,
-    }))
+async fn list_databases(State(state): State<AppState>) -> Result<Json<DatabasesResponse>, ApiError> {
+    let databases = state.list_databases().await?;
+    Ok(Json(DatabasesResponse { databases }))
+}
+
+/// The body of `PUT /rest/databases/{name}`: every field optional, each
+/// defaulting to the server's own configured shape (`[worldparameters]`/
+/// the matching CLI flags) when omitted -- `{}` is a valid body, meaning
+/// "use the defaults".
+#[derive(Deserialize, ToSchema, Default)]
+pub struct CreateDatabaseBody {
+    axes: Option<usize>,
+    world_dim: Option<u32>,
+    chunk_size: Option<u32>,
+}
+
+#[utoipa::path(
+    put,
+    path = "/rest/databases/{name}",
+    tag = "databases",
+    params(
+        ("name" = String, Path, description = "The database to create"),
+    ),
+    request_body = CreateDatabaseBody,
+    responses(
+        (status = 204, description = "The database was created"),
+        (status = 400, description = "An invalid database name", body = ErrorBody),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 409, description = "A database with this name already exists", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn create_database(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(body): Json<CreateDatabaseBody>,
+) -> Result<StatusCode, ApiError> {
+    let default_shape = state.databases.default_shape();
+    let shape = WorldShape {
+        axes: body.axes.unwrap_or(default_shape.axes),
+        world_dim: body.world_dim.unwrap_or(default_shape.world_dim),
+        chunk_dim: body.chunk_size.unwrap_or(default_shape.chunk_dim),
+    };
+    state.create_database(&name, Some(shape)).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/rest/databases/{name}",
+    tag = "databases",
+    params(
+        ("name" = String, Path, description = "The database to delete, with all of its data"),
+    ),
+    responses(
+        (status = 204, description = "The database, and every byte of data in it, was removed"),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn remove_database(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<StatusCode, ApiError> {
+    let removed = state.remove_database(&name).await?;
+    if removed {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("no such database '{name}'")))
+    }
 }
 
 /// One column in the world's schema: a key, and the value type fixed for
@@ -192,8 +262,8 @@ pub struct ColumnsResponse {
     columns: Vec<ColumnResponse>,
 }
 
-/// The body of `PUT /rest/columns/{key}`: the type to fix the new column
-/// to, e.g. `{"type": "str"}`.
+/// The body of `PUT /rest/db/{db}/columns/{key}`: the type to fix the new
+/// column to, e.g. `{"type": "str"}`.
 #[derive(Deserialize, ToSchema)]
 pub struct AddColumnBody {
     #[serde(rename = "type")]
@@ -202,16 +272,23 @@ pub struct AddColumnBody {
 
 #[utoipa::path(
     get,
-    path = "/rest/columns",
+    path = "/rest/db/{db}/columns",
     tag = "columns",
+    params(
+        ("db" = String, Path, description = "The database to read"),
+    ),
     responses(
-        (status = 200, description = "Every column in the world's schema", body = ColumnsResponse),
+        (status = 200, description = "Every column in the database's schema", body = ColumnsResponse),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
-async fn list_columns(State(state): State<AppState>) -> Result<Json<ColumnsResponse>, ApiError> {
-    let columns = state.with_world(|w| Ok(w.columns())).await?;
+async fn list_columns(
+    State(state): State<AppState>,
+    Path(db): Path<String>,
+) -> Result<Json<ColumnsResponse>, ApiError> {
+    let columns = state.with_database(&db, |w| Ok(w.columns())).await?;
     Ok(Json(ColumnsResponse {
         columns: columns
             .into_iter()
@@ -225,9 +302,10 @@ async fn list_columns(State(state): State<AppState>) -> Result<Json<ColumnsRespo
 
 #[utoipa::path(
     put,
-    path = "/rest/columns/{key}",
+    path = "/rest/db/{db}/columns/{key}",
     tag = "columns",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("key" = String, Path, description = "The column/key to create"),
     ),
     request_body = AddColumnBody,
@@ -236,44 +314,46 @@ async fn list_columns(State(state): State<AppState>) -> Result<Json<ColumnsRespo
         (status = 400, description = "Malformed body, or a key the schema can't store", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
         (status = 409, description = "A column with this key already exists", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn add_column(
     State(state): State<AppState>,
-    Path(key): Path<String>,
+    Path((db, key)): Path<(String, String)>,
     Json(body): Json<AddColumnBody>,
 ) -> Result<StatusCode, ApiError> {
     let value_type: kblockdblib::ValueType = body.value_type.into();
     state
-        .with_world(move |w| w.add_column(&key, value_type))
+        .with_database(&db, move |w| w.add_column(&key, value_type))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
     delete,
-    path = "/rest/columns/{key}",
+    path = "/rest/db/{db}/columns/{key}",
     tag = "columns",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("key" = String, Path, description = "The column/key to drop"),
     ),
     responses(
         (status = 204, description = "The column, and every value ever written for it, was removed"),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
-        (status = 404, description = "No such column", body = ErrorBody),
+        (status = 404, description = "No such database, or no such column", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn remove_column(
     State(state): State<AppState>,
-    Path(key): Path<String>,
+    Path((db, key)): Path<(String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let lookup_key = key.clone();
     let removed = state
-        .with_world(move |w| w.remove_column(&lookup_key))
+        .with_database(&db, move |w| w.remove_column(&lookup_key))
         .await?;
     if removed {
         Ok(StatusCode::NO_CONTENT)
@@ -301,9 +381,10 @@ pub struct CellResponse {
 
 #[utoipa::path(
     get,
-    path = "/rest/cells/{coords}/{key}",
+    path = "/rest/db/{db}/cells/{coords}/{key}",
     tag = "cells",
     params(
+        ("db" = String, Path, description = "The database to read"),
         ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to read"),
     ),
@@ -311,18 +392,18 @@ pub struct CellResponse {
         (status = 200, description = "The cell's value for this key", body = CellResponse),
         (status = 400, description = "Malformed or out-of-range coordinate", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
-        (status = 404, description = "No value set for this key at this cell", body = ErrorBody),
+        (status = 404, description = "No such database, or no value set for this key at this cell", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn get_cell(
     State(state): State<AppState>,
-    Path((coords, key)): Path<(String, String)>,
+    Path((db, coords, key)): Path<(String, String, String)>,
 ) -> Result<Json<CellResponse>, ApiError> {
     let coord = parse_coords(&coords)?;
     let lookup_key = key.clone();
     let found = state
-        .with_world(move |w| w.get_with_meta(&coord, &lookup_key))
+        .with_database(&db, move |w| w.get_with_meta(&coord, &lookup_key))
         .await?;
     match found {
         Some((v, meta)) => Ok(Json(CellResponse {
@@ -339,9 +420,10 @@ async fn get_cell(
 
 #[utoipa::path(
     put,
-    path = "/rest/cells/{coords}/{key}",
+    path = "/rest/db/{db}/cells/{coords}/{key}",
     tag = "cells",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to write"),
     ),
@@ -351,27 +433,29 @@ async fn get_cell(
         (status = 400, description = "Malformed or out-of-range coordinate, or malformed body", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn set_cell(
     State(state): State<AppState>,
-    Path((coords, key)): Path<(String, String)>,
+    Path((db, coords, key)): Path<(String, String, String)>,
     Json(body): Json<ValueJson>,
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
     let value: kblockdblib::Value = body.into();
     state
-        .with_world(move |w| w.set(&coord, &key, value))
+        .with_database(&db, move |w| w.set(&coord, &key, value))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
     delete,
-    path = "/rest/cells/{coords}/{key}",
+    path = "/rest/db/{db}/cells/{coords}/{key}",
     tag = "cells",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("coords" = String, Path, description = "Comma-separated coordinate, one i32 per axis (e.g. `1,2,3`)"),
         ("key" = String, Path, description = "The column/key to clear"),
     ),
@@ -380,15 +464,18 @@ async fn set_cell(
         (status = 400, description = "Malformed or out-of-range coordinate", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn remove_cell(
     State(state): State<AppState>,
-    Path((coords, key)): Path<(String, String)>,
+    Path((db, coords, key)): Path<(String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
-    state.with_world(move |w| w.remove(&coord, &key)).await?;
+    state
+        .with_database(&db, move |w| w.remove(&coord, &key))
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -402,9 +489,10 @@ pub struct RegionValuesResponse {
 
 #[utoipa::path(
     get,
-    path = "/rest/regions/{origin}/{extent}/{key}",
+    path = "/rest/db/{db}/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
+        ("db" = String, Path, description = "The database to read"),
         ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
         ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to read"),
@@ -413,28 +501,29 @@ pub struct RegionValuesResponse {
         (status = 200, description = "One value (or null) per cell in the region", body = RegionValuesResponse),
         (status = 400, description = "Malformed/out-of-range coordinate, or mismatched axis counts", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn get_region(
     State(state): State<AppState>,
-    Path((origin, extent, key)): Path<(String, String, String)>,
+    Path((db, origin, extent, key)): Path<(String, String, String, String)>,
 ) -> Result<Json<RegionValuesResponse>, ApiError> {
     let origin = parse_coords(&origin)?;
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
     let values = state
-        .with_world(move |w| w.get_region(&region, &key))
+        .with_database(&db, move |w| w.get_region(&region, &key))
         .await?;
     let values: Vec<Option<ValueJson>> =
         values.into_iter().map(|v| v.map(ValueJson::from)).collect();
     Ok(Json(RegionValuesResponse { values }))
 }
 
-/// `PUT /regions/.../.../<key>` body: one value per cell, in the same
-/// axis-0-fastest order `GET` returns them in. Its length must equal the
-/// region's volume exactly -- `World::set_region` itself enforces that and
-/// this surfaces as `400 Bad Request` via `ApiError::from(io::Error)`.
+/// `PUT /db/{db}/regions/.../.../<key>` body: one value per cell, in the
+/// same axis-0-fastest order `GET` returns them in. Its length must equal
+/// the region's volume exactly -- `World::set_region` itself enforces that
+/// and this surfaces as `400 Bad Request` via `ApiError::from(io::Error)`.
 #[derive(Deserialize, ToSchema)]
 pub struct SetRegionBody {
     values: Vec<ValueJson>,
@@ -442,9 +531,10 @@ pub struct SetRegionBody {
 
 #[utoipa::path(
     put,
-    path = "/rest/regions/{origin}/{extent}/{key}",
+    path = "/rest/db/{db}/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
         ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to write"),
@@ -455,12 +545,13 @@ pub struct SetRegionBody {
         (status = 400, description = "Malformed/out-of-range coordinate, mismatched axis counts, or wrong number of values", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn set_region(
     State(state): State<AppState>,
-    Path((origin, extent, key)): Path<(String, String, String)>,
+    Path((db, origin, extent, key)): Path<(String, String, String, String)>,
     Json(body): Json<SetRegionBody>,
 ) -> Result<StatusCode, ApiError> {
     let origin = parse_coords(&origin)?;
@@ -468,16 +559,17 @@ async fn set_region(
     let region = kblockdblib::Region::new(origin, extent);
     let values: Vec<kblockdblib::Value> = body.values.into_iter().map(Into::into).collect();
     state
-        .with_world(move |w| w.set_region(&region, &key, &values))
+        .with_database(&db, move |w| w.set_region(&region, &key, &values))
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 #[utoipa::path(
     delete,
-    path = "/rest/regions/{origin}/{extent}/{key}",
+    path = "/rest/db/{db}/regions/{origin}/{extent}/{key}",
     tag = "regions",
     params(
+        ("db" = String, Path, description = "The database to write"),
         ("origin" = String, Path, description = "Comma-separated region origin, one i32 per axis"),
         ("extent" = String, Path, description = "Comma-separated region extent, one i32 per axis"),
         ("key" = String, Path, description = "The column/key to clear"),
@@ -487,20 +579,54 @@ async fn set_region(
         (status = 400, description = "Malformed/out-of-range coordinate, or mismatched axis counts", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn remove_region(
     State(state): State<AppState>,
-    Path((origin, extent, key)): Path<(String, String, String)>,
+    Path((db, origin, extent, key)): Path<(String, String, String, String)>,
 ) -> Result<StatusCode, ApiError> {
     let origin = parse_coords(&origin)?;
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
     state
-        .with_world(move |w| w.remove_region(&region, &key))
+        .with_database(&db, move |w| w.remove_region(&region, &key))
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct StatsResponse {
+    total_chunks: u64,
+    total_bytes: u64,
+    total_blocks: u64,
+}
+
+#[utoipa::path(
+    get,
+    path = "/rest/db/{db}/stats",
+    tag = "stats",
+    params(
+        ("db" = String, Path, description = "The database to inspect"),
+    ),
+    responses(
+        (status = 200, description = "On-disk statistics for this database's data", body = StatsResponse),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn stats(
+    State(state): State<AppState>,
+    Path(db): Path<String>,
+) -> Result<Json<StatsResponse>, ApiError> {
+    let stats = state.with_database(&db, kblockdblib::World::stats).await?;
+    Ok(Json(StatsResponse {
+        total_chunks: stats.total_chunks,
+        total_bytes: stats.total_bytes,
+        total_blocks: stats.total_blocks,
+    }))
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -568,26 +694,31 @@ impl QueryResponse {
 
 #[utoipa::path(
     post,
-    path = "/rest/query",
+    path = "/rest/db/{db}/query",
     tag = "query",
+    params(
+        ("db" = String, Path, description = "The database to query"),
+    ),
     request_body = QueryRequest,
     responses(
         (status = 200, description = "SELECT: the matching rows. SET/UPDATE/DELETE: how many cells were affected", body = QueryResponse),
-        (status = 400, description = "Malformed query, or a range whose axis count doesn't match the world's", body = ErrorBody),
+        (status = 400, description = "Malformed query, or a range whose axis count doesn't match the database's", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
         (status = 403, description = "A read-only account attempted a SET, UPDATE, or DELETE", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn run_query(
     State(state): State<AppState>,
+    Path(db): Path<String>,
     headers: HeaderMap,
     Json(body): Json<QueryRequest>,
 ) -> Response {
     let Some(account) = crate::auth::account_from_headers(&headers, &state) else {
         return crate::auth::unauthorized_response();
     };
-    match execute_query(&state, &account, &body.query).await {
+    match execute_query(&state, &db, &account, &body.query).await {
         Ok(resp) => Json(resp).into_response(),
         Err(e) => e.into_response(),
     }
@@ -595,6 +726,7 @@ async fn run_query(
 
 pub(crate) async fn execute_query(
     state: &AppState,
+    db: &str,
     account: &crate::state::Account,
     query_text: &str,
 ) -> Result<QueryResponse, ApiError> {
@@ -606,7 +738,8 @@ pub(crate) async fn execute_query(
     if stmt.is_write() && account.read_only {
         return Err(ApiError::Forbidden("this account is read-only".to_string()));
     }
-    check_range_axes(&stmt, state.world.axes())?;
+    let axes = state.with_database(db, |w| Ok(w.axes())).await?;
+    check_range_axes(&stmt, axes)?;
 
     match stmt {
         query::Statement::Select {
@@ -614,7 +747,9 @@ pub(crate) async fn execute_query(
             range,
             where_clause,
         } => {
-            let cells = state.with_world(kblockdblib::World::list_cells).await?;
+            let cells = state
+                .with_database(db, kblockdblib::World::list_cells)
+                .await?;
             let rows = cells
                 .iter()
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
@@ -626,15 +761,17 @@ pub(crate) async fn execute_query(
             assignments,
             where_clause,
             range,
-        } => execute_set(state, assignments, where_clause, range).await,
+        } => execute_set(state, db, assignments, where_clause, range).await,
         query::Statement::Update {
             assignments,
             where_clause,
             range,
         } => {
-            let cells = state.with_world(kblockdblib::World::list_cells).await?;
-            // Snapshotted here, then mutated in a second `with_world` call
-            // below -- not atomic with respect to a concurrent writer
+            let cells = state
+                .with_database(db, kblockdblib::World::list_cells)
+                .await?;
+            // Snapshotted here, then mutated in a second `with_database`
+            // call below -- not atomic with respect to a concurrent writer
             // touching the same cells in between (a classic find-then-
             // mutate race), same honest caveat as any bulk operation built
             // on a point-in-time `list_cells` scan rather than a
@@ -646,7 +783,7 @@ pub(crate) async fn execute_query(
                 .collect();
             let affected = matching.len();
             state
-                .with_world(move |w| {
+                .with_database(db, move |w| {
                     for coord in &matching {
                         for (key, literal) in &assignments {
                             w.set(coord, key, literal.to_value())?;
@@ -661,7 +798,9 @@ pub(crate) async fn execute_query(
             where_clause,
             range,
         } => {
-            let cells = state.with_world(kblockdblib::World::list_cells).await?;
+            let cells = state
+                .with_database(db, kblockdblib::World::list_cells)
+                .await?;
             let matching: Vec<(Vec<i32>, Vec<String>)> = cells
                 .iter()
                 .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
@@ -674,7 +813,7 @@ pub(crate) async fn execute_query(
                 .collect();
             let affected = matching.len();
             state
-                .with_world(move |w| {
+                .with_database(db, move |w| {
                     for (coord, keys) in &matching {
                         for key in keys {
                             w.remove(coord, key)?;
@@ -695,7 +834,7 @@ pub(crate) async fn execute_query(
 /// Two paths, chosen for cost, not just convenience:
 /// - **No `WHERE`**: every coordinate in `range` matches unconditionally,
 ///   so this is exactly `World::set_region` once per assignment -- the
-///   same primitive the `/rest/regions` endpoints use, and just as
+///   same primitive the `/rest/db/{db}/regions` endpoints use, and just as
 ///   efficient (no per-coordinate work in this handler at all).
 /// - **With a `WHERE`**: which coordinates match can depend on a cell's
 ///   *existing* values, so each candidate coordinate needs to be checked
@@ -712,6 +851,7 @@ pub(crate) async fn execute_query(
 /// snapshot-then-mutate approach.
 async fn execute_set(
     state: &AppState,
+    db: &str,
     assignments: Vec<(String, query::Literal)>,
     where_clause: Option<query::Expr>,
     range: query::Range,
@@ -725,7 +865,7 @@ async fn execute_set(
             .map(|(key, literal)| (key, literal.to_value()))
             .collect();
         state
-            .with_world(move |w| {
+            .with_database(db, move |w| {
                 for (key, value) in &values {
                     w.set_region(&region, key, &vec![value.clone(); volume])?;
                 }
@@ -735,7 +875,9 @@ async fn execute_set(
         return Ok(QueryResponse::affected(volume));
     };
 
-    let cells = state.with_world(kblockdblib::World::list_cells).await?;
+    let cells = state
+        .with_database(db, kblockdblib::World::list_cells)
+        .await?;
     let existing: HashMap<Vec<i32>, &kblockdblib::CellEntry> =
         cells.iter().map(|c| (c.coord.to_vec(), c)).collect();
 
@@ -756,7 +898,7 @@ async fn execute_set(
 
     let affected = targets.len();
     state
-        .with_world(move |w| {
+        .with_database(db, move |w| {
             for coord in &targets {
                 for (key, literal) in &assignments {
                     w.set(coord, key, literal.to_value())?;
@@ -779,7 +921,7 @@ fn range_to_region(range: &query::Range) -> kblockdblib::Region {
 }
 
 /// A query's optional `FROM`/`IN` range must name exactly as many axes as
-/// the target world has -- `query.rs` itself can't check this (it has no
+/// the target database has -- `query.rs` itself can't check this (it has no
 /// `World` to check against), so `execute_query` does, before running
 /// anything, the same "reject up front, don't touch any data" policy
 /// `check_region` (used by the region endpoints above) follows.
@@ -792,7 +934,7 @@ fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError
     };
     match range {
         Some(r) if r.from.len() != axes => Err(ApiError::BadRequest(format!(
-            "range has {} axes but this world has {axes}",
+            "range has {} axes but this database has {axes}",
             r.from.len()
         ))),
         _ => Ok(()),

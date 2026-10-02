@@ -16,9 +16,9 @@ to go looking up paths and port numbers:
 
 ```
 kblockdbserver listening on http://10.0.0.7:8080
-  data browser  http://10.0.0.7:8080/
-  health API    http://10.0.0.7:8080/rest/health
-  stats API     http://10.0.0.7:8080/rest/stats
+  data browser    http://10.0.0.7:8080/
+  health API      http://10.0.0.7:8080/rest/health
+  databases API   http://10.0.0.7:8080/rest/databases
 ```
 
 Only a **port** is configurable, never a bind host: the server always
@@ -57,10 +57,14 @@ OPTIONS:
                                     and a [worldparameters] table (each overridden by the
                                     matching CLI flag below, if given; compression is
                                     config-file-only)
-    --data-dir <path>              World data directory (default: ./data)
-    --axes <n>                     Axis count for a brand-new world (default: 3)
-    --world-dim <n>                Cells per axis for a brand-new world (default: 10000)
-    --chunk-size <n>               Cells per axis within a chunk, for a brand-new world
+    --data-dir <path>              Data directory; each database is its own subdirectory
+                                    of this one (default: ./data). No database exists
+                                    until you create one -- see "Databases" below
+    --axes <n>                     Axis count for a database created without an explicit
+                                    shape of its own (default: 3)
+    --world-dim <n>                Cells per axis for a database created without an
+                                    explicit shape (default: 10000)
+    --chunk-size <n>               Cells per axis within a chunk, same default-only rule
                                     (default: 32 -- see kblockdblib's chunking design;
                                     bigger means fewer/larger chunk files, smaller
                                     means the opposite trade)
@@ -80,9 +84,13 @@ OPTIONS:
     -h, --help                     Print help
 ```
 
-`--axes`/`--world-dim`/`--chunk-size` only matter the *first* time a world
-is created at `--data-dir` (via `World::create`); reopening an existing one
-reads its real shape back from its `world.txt` and ignores these flags.
+`--axes`/`--world-dim`/`--chunk-size` only matter for a database created
+*without* an explicit shape of its own (an empty `PUT /rest/databases/{name}`
+body, or the binary protocol's `CreateDatabase`, which has no way to
+override them at all); reopening an existing database reads its real shape
+back from its own `world.txt` and ignores these flags, and creating one
+with an explicit shape (`PUT /rest/databases/{name}` with a body) ignores
+them too.
 
 **Run exactly one `kblockdbserver` process per `--data-dir`.** `kblockdblib`'s
 locking is in-process only now (see its
@@ -110,11 +118,11 @@ hostname = "db-1.example.com" # optional; what /rest/health reports as this
                              # instance's name (defaults to the OS hostname)
 admin_password = "change-me" # required
 
-# Only matters the first time a world is created at data_dir above --
-# reopening an existing one reads its real shape from its world.txt and
-# ignores these (World::open does, not create). Each field, and the whole
-# table, is optional; any missing field falls back to the matching CLI
-# flag, then to kblockdblib's own default.
+# Only matters for a database created without an explicit shape of its own
+# (see "Databases" below) -- reopening an existing database, or creating one
+# with an explicit shape, ignores these. Each field, and the whole table,
+# is optional; any missing field falls back to the matching CLI flag, then
+# to kblockdblib's own default.
 [worldparameters]
 axes = 3
 world_dim = 10000
@@ -139,28 +147,66 @@ entry defaults to full read/write access, same as `admin`; set
 ## Compression
 
 `compression` (config file only, default `false`) zstd-compresses every
-chunk file the server writes. It trades CPU on each write and each
-cache-missing read for a smaller world on disk; how much smaller depends
-entirely on the data, since the chunk format is already compact and
-sparse (see [kblockdblib](kblockdblib.md)).
+chunk file the server writes, for every database. It trades CPU on each
+write and each cache-missing read for a smaller database on disk; how much
+smaller depends entirely on the data, since the chunk format is already
+compact and sparse (see [kblockdblib](kblockdblib.md)).
 
-It is safe to turn on or off at any time, on an existing world as well
+It is safe to turn on or off at any time, on an existing database as well
 as a new one:
 
 - The setting governs *writes* only. Reads detect each file's encoding
-  from its own leading bytes, so a world may hold a mix of compressed and
-  uncompressed chunks and stays fully readable either way.
+  from its own leading bytes, so a database may hold a mix of compressed
+  and uncompressed chunks and stays fully readable either way.
 - Flipping it rewrites nothing by itself. An existing chunk file is
   re-encoded the next time something writes to that chunk.
 - It is not recorded in `world.txt`: unlike `axes`/`world_dim`/
-  `chunk_dim`, it isn't part of a world's fixed shape.
+  `chunk_dim`, it isn't part of a database's fixed shape.
 
 The library exposes the same switch as
 `kblockdblib::World::with_compression(bool)`.
 
+## Databases
+
+One `kblockdbserver` process manages any number of independent databases
+under one `--data-dir`, each one its own directory (`<data-dir>/<name>/`,
+with its own `world.txt`/`schema.txt`/chunk tree -- exactly what used to be
+the whole `--data-dir` before multi-database support existed). Nothing is
+created automatically -- there's no implicit default -- so every database
+must be created explicitly before anything can be read or written in it.
+
+| Method | Path | Body | Response |
+|---|---|---|---|
+| `GET` | `/rest/databases` | | `200 {"databases": ["demo", "other"]}` |
+| `PUT` | `/rest/databases/{name}` | `{"axes"?, "world_dim"?, "chunk_size"?}` | `204`, or `409` if it exists, `400` for a bad name |
+| `DELETE` | `/rest/databases/{name}` | | `204`, or `404` if there's no such database |
+
+`PUT`'s body is a JSON object whose three fields are all optional --
+`{}` is valid and means "use the server's configured default shape" (see
+`--axes`/`--world-dim`/`--chunk-size`/`[worldparameters]` above). Once
+created, a database's shape is fixed for its lifetime, same as before.
+
+`DELETE` removes the database's directory and **every byte of data in
+it**, immediately and irreversibly -- there is no confirmation step or
+trash. Both `PUT` and `DELETE` are writes, so a `read_only` account gets
+`403`; `GET /rest/databases` is readable by any account.
+
+```sh
+curl -u admin:change-me -X PUT -H 'content-type: application/json' \
+     -d '{}' http://127.0.0.1:8080/rest/databases/demo
+
+curl -u admin:change-me http://127.0.0.1:8080/rest/databases
+# {"databases":["demo"]}
+
+curl -u admin:change-me -X DELETE http://127.0.0.1:8080/rest/databases/demo
+```
+
 ## REST API
 
-Every route below is mounted under the `/rest` context path (`/rest/cells/...`,
+Every per-database route below is scoped under `/rest/db/{db}/...`, naming
+which database it operates on -- `{db}` must already exist (see
+"Databases" above) or the route 404s. Routes are mounted under the `/rest`
+context path generally (`/rest/db/{db}/cells/...`, `/rest/databases`,
 `/rest/health`, ...) -- kept separate from the binary protocol's own
 listener (see "Binary protocol" below) and from whatever else might one
 day share this HTTP server.
@@ -182,15 +228,15 @@ against one of the config file's accounts (`admin`/`admin_password`, or a
 username, or the wrong password gets `401`. A `read_only` account gets
 `403` on anything but `GET` (`PUT`/`DELETE` are writes). `/rest/health` is
 left open so load balancers/orchestrators can poll liveness without
-credentials; it exposes nothing more sensitive than the world's shape and
-this server's clock.
+credentials; it exposes nothing more sensitive than this server's clock and
+how many databases it's managing.
 
 Every coordinate, and every region origin/extent, is a comma-separated
-list of `i32`s in the URL, one per axis (`1,2,3` for a 3-axis world, or
+list of `i32`s in the URL, one per axis (`1,2,3` for a 3-axis database, or
 `-1,2,-3` -- a negative component needs no special URL encoding, `-` is a
 plain path character) -- there's nothing 3-axis-specific about the API; it
-works the same way for whatever axis count the world was created with. See
-"Coordinate space" above for a world's valid range per axis.
+works the same way for whatever axis count the target database was created
+with. See "Coordinate space" above for a database's valid range per axis.
 
 A cell value on the wire is a small tagged JSON object:
 
@@ -203,17 +249,19 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","axes":3,"world_dim":10000,"chunk_dim":32,"timestamp":1735689600}` |
-| `GET` | `/rest/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset |
-| `PUT` | `/rest/cells/{coords}/{key}` | `<value>` | `204` |
-| `DELETE` | `/rest/cells/{coords}/{key}` | | `204` |
-| `GET` | `/rest/regions/{origin}/{extent}/{key}` | | `200 {"values": [<value or null>, ...]}` |
-| `PUT` | `/rest/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
-| `DELETE` | `/rest/regions/{origin}/{extent}/{key}` | | `204` |
-| `GET` | `/rest/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
-| `GET` | `/rest/columns` | | `200 {"columns": [{"key": "material", "type": "str"}, ...]}` |
-| `PUT` | `/rest/columns/{key}` | `{"type": "str"}` | `204`, or `409` if the column exists |
-| `DELETE` | `/rest/columns/{key}` | | `204`, or `404` if there's no such column |
+| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600}` |
+| `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
+| `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
+| `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
+| `GET` | `/rest/db/{db}/regions/{origin}/{extent}/{key}` | | `200 {"values": [<value or null>, ...]}` |
+| `PUT` | `/rest/db/{db}/regions/{origin}/{extent}/{key}` | `{"values": [<value>, ...]}` | `204` |
+| `DELETE` | `/rest/db/{db}/regions/{origin}/{extent}/{key}` | | `204` |
+| `GET` | `/rest/db/{db}/stats` | | `200` `{"total_chunks":2,"total_bytes":8227,"total_blocks":32}` |
+| `GET` | `/rest/db/{db}/columns` | | `200 {"columns": [{"key": "material", "type": "str"}, ...]}` |
+| `PUT` | `/rest/db/{db}/columns/{key}` | `{"type": "str"}` | `204`, or `409` if the column exists |
+| `DELETE` | `/rest/db/{db}/columns/{key}` | | `204`, or `404` if there's no such column |
+
+(See "Databases" above for `GET/PUT/DELETE /rest/databases[/{name}]`.)
 
 `/rest/health`'s `hostname` identifies *which* instance answered, which is
 what makes it useful behind a load balancer: without it, polling a pool
@@ -222,24 +270,26 @@ default, or the config file's `hostname` key when set (useful when the OS
 name isn't the name you route by). It's never empty -- a server that
 can't determine its own hostname reports `"unknown"` rather than failing
 the health check, since an unnameable host is still a serving one.
-`chunk_dim` is the world's on-disk granularity, cells per axis in one
-chunk file, fixed when the world was created; together with `axes` and
-`world_dim` it's the whole shape, so a client can size its region reads
-to chunk boundaries without a separate call.
+`database_count` is a live count of how many databases this server
+currently manages (same number `GET /rest/databases` would list) -- health
+is server-wide, not scoped to any one database, so it has no per-database
+shape to report the way the old single-world `/rest/health` once did; ask
+`GET /rest/db/{db}/stats` or a binary-protocol `Hello` for a specific
+database's shape.
 
-`/rest/stats` walks the on-disk chunk files under `--data-dir` and reports:
-`total_chunks` (chunk files currently on disk -- see `kblockdblib`'s "Layout on
-disk" doc comment, a chunk with no cells set in it is never written and an
-emptied one is deleted, not left behind empty), `total_bytes` (their
-combined size), and `total_blocks` (their combined actual disk-block
-allocation -- smaller than `total_bytes / 512` for chunks with large
-never-written, and so sparse, regions; on Windows this is instead
-`total_bytes` rounded up to whole 512-byte blocks, an upper bound rather
-than a real sparse-file measurement). It's a live filesystem walk each
-call, not a running counter, so it costs time proportional to how many
-chunks currently exist. Like the cell/region endpoints (and unlike
-`/rest/health`), it requires auth, but being a `GET` it's available to
-`read_only` accounts too.
+`/rest/db/{db}/stats` walks the on-disk chunk files under that database's
+directory and reports: `total_chunks` (chunk files currently on disk --
+see `kblockdblib`'s "Layout on disk" doc comment, a chunk with no cells set
+in it is never written and an emptied one is deleted, not left behind
+empty), `total_bytes` (their combined size), and `total_blocks` (their
+combined actual disk-block allocation -- smaller than `total_bytes / 512`
+for chunks with large never-written, and so sparse, regions; on Windows
+this is instead `total_bytes` rounded up to whole 512-byte blocks, an
+upper bound rather than a real sparse-file measurement). It's a live
+filesystem walk each call, not a running counter, so it costs time
+proportional to how many chunks currently exist in that database. Like the
+cell/region endpoints (and unlike `/rest/health`), it requires auth, but
+being a `GET` it's available to `read_only` accounts too.
 
 Region `values` arrays are in axis-0-fastest order (matching
 `kblockdblib::World::get_region`/`set_region`): index `i` is offset
@@ -249,11 +299,13 @@ to a region must supply exactly one value per cell (`extent[0] * extent[1]
 
 Errors are `{"error": "<message>"}`, with the status code reflecting the
 cause: `400` for a malformed/out-of-range coordinate, a region whose axis
-count doesn't match the world's, or a `values` array of the wrong length
-(all of these are `kblockdblib`'s own validation surfacing through); `401` for
+count doesn't match the database's, a bad database name, or a `values`
+array of the wrong length (all of these are `kblockdblib`'s own validation,
+or `state::validate_database_name`, surfacing through); `401` for
 missing/invalid credentials; `403` for a `read_only` account attempting a
-write; `404` for a `GET` that found nothing; `500` for anything on the
-server's side (disk I/O, ...).
+write; `404` for a `GET` that found nothing, or for `{db}` naming a
+database that doesn't exist; `409` for creating a database that already
+exists; `500` for anything on the server's side (disk I/O, ...).
 
 A single-cell `GET` reports three extra fields alongside the value itself
 (see `kblockdblib::CellMeta`): `created_at_ms`/`modified_at_ms`
@@ -265,47 +317,47 @@ it's a new history, not a continuation of the old one. Region reads don't
 currently report per-cell metadata, only the single-cell endpoint does.
 
 ```sh
-# set a cell
-curl -u admin:change-me -X PUT localhost:8080/rest/cells/1,2,3/material \
+# set a cell in database "demo"
+curl -u admin:change-me -X PUT localhost:8080/rest/db/demo/cells/1,2,3/material \
   -H 'content-type: application/json' -d '{"type":"str","value":"stone"}'
 
 # read it back
-curl -u admin:change-me localhost:8080/rest/cells/1,2,3/material
+curl -u admin:change-me localhost:8080/rest/db/demo/cells/1,2,3/material
 # {"value":{"type":"str","value":"stone"},"created_at_ms":1735689600000,
 #  "modified_at_ms":1735689600000,"version":0}
 
 # fill an 8x8x8 region with distinct per-cell values (512 of them, omitted here)
-curl -u admin:change-me -X PUT localhost:8080/rest/regions/0,0,0/8,8,8/material \
+curl -u admin:change-me -X PUT localhost:8080/rest/db/demo/regions/0,0,0/8,8,8/material \
   -H 'content-type: application/json' -d '{"values":[...]}'
 
 # read the whole region back
-curl -u admin:change-me localhost:8080/rest/regions/0,0,0/8,8,8/material
+curl -u admin:change-me localhost:8080/rest/db/demo/regions/0,0,0/8,8,8/material
 
 # clear a cell / a region
-curl -u admin:change-me -X DELETE localhost:8080/rest/cells/1,2,3/material
-curl -u admin:change-me -X DELETE localhost:8080/rest/regions/0,0,0/8,8,8/material
+curl -u admin:change-me -X DELETE localhost:8080/rest/db/demo/cells/1,2,3/material
+curl -u admin:change-me -X DELETE localhost:8080/rest/db/demo/regions/0,0,0/8,8,8/material
 
 # on-disk stats
-curl -u admin:change-me localhost:8080/rest/stats
+curl -u admin:change-me localhost:8080/rest/db/demo/stats
 # {"total_chunks":2,"total_bytes":8227,"total_blocks":32}
 ```
 
 ### Columns
 
-`/rest/columns` is the world's schema: every key it has ever stored, each
-fixed to one of the four value types. Most columns get created
-implicitly -- the first `PUT` of a cell value interns its key and pins its
-type -- so `GET /rest/columns` lists those alongside any declared with
-`PUT /rest/columns/{key}`, sorted by key.
+`/rest/db/{db}/columns` is that database's schema: every key it has ever
+stored, each fixed to one of the four value types. Most columns get
+created implicitly -- the first `PUT` of a cell value interns its key and
+pins its type -- so `GET /rest/db/{db}/columns` lists those alongside any
+declared with `PUT /rest/db/{db}/columns/{key}`, sorted by key.
 
 ```sh
-curl -u admin:change-me http://127.0.0.1:8080/rest/columns
+curl -u admin:change-me http://127.0.0.1:8080/rest/db/demo/columns
 # {"columns":[{"key":"hardness","type":"f64"},{"key":"material","type":"str"}]}
 
-curl -u admin:change-me -X PUT http://127.0.0.1:8080/rest/columns/hardness \
+curl -u admin:change-me -X PUT http://127.0.0.1:8080/rest/db/demo/columns/hardness \
      -H 'content-type: application/json' -d '{"type": "f64"}'
 
-curl -u admin:change-me -X DELETE http://127.0.0.1:8080/rest/columns/hardness
+curl -u admin:change-me -X DELETE http://127.0.0.1:8080/rest/db/demo/columns/hardness
 ```
 
 `PUT` only ever *creates*: a key that already has a column gets `409`,
@@ -314,15 +366,15 @@ never a silent type change. To change a column's type, `DELETE` it and
 different type.
 
 `DELETE` drops the column and **every value ever written for it**, across
-the whole world, and is not reversible. It's a write, so a `read_only`
-account gets `403`; `GET /rest/columns` is readable by any account. See
-the [storage engine's notes](kblockdblib.md#columns) for how removal
-interacts with the append-only `schema.txt`.
+the whole database, and is not reversible. It's a write, so a `read_only`
+account gets `403`; `GET /rest/db/{db}/columns` is readable by any
+account. See the [storage engine's notes](kblockdblib.md#columns) for how
+removal interacts with the append-only `schema.txt`.
 
 ## Query language
 
-`POST /rest/query` runs a small SQL-like query language over the world's
-cells, parsed with a [pest](https://pest.rs) grammar
+`POST /rest/db/{db}/query` runs a small SQL-like query language over that
+database's cells, parsed with a [pest](https://pest.rs) grammar
 (`kblockdbserver/src/query.pest`/`query.rs`). Four statement kinds:
 
 ```text
@@ -336,9 +388,9 @@ DELETE [WHERE <criteria>] [IN <range>]
 - `<range>` is `(o0,o1,...) TO (e0,e1,...)` -- an axis-aligned box, `o`
   inclusive/`e` exclusive on every axis, same convention as
   `kblockdblib::Region` (origin + extent), just written as two corners.
-  Each component is a signed integer (a world's valid range is centered on
-  zero -- see "Coordinate space" above), e.g. `(-10,-10,-10) TO (10,10,10)`.
-  Its axis count must match the world's, or the query is rejected with
+  Each component is a signed integer (a database's valid range is centered
+  on zero -- see "Coordinate space" above), e.g. `(-10,-10,-10) TO (10,10,10)`.
+  Its axis count must match the database's, or the query is rejected with
   `400` before touching any data.
 - `<criteria>` is a boolean expression: comparisons (`=`, `!=`, `<`, `<=`,
   `>`, `>=`) combined with `AND`/`OR`/`NOT` and parentheses, standard
@@ -370,14 +422,14 @@ compares axis coordinates (`x<N>`), where `SET` can genuinely bring new
 cells into existence.
 
 `SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes. All four are behind
-the same `POST /rest/query`, so this is the one route in the whole REST API
-where `read_only` isn't decided by HTTP method the way it is everywhere
-else (see `routes.rs`'s doc comment) -- it's decided by which kind of
-statement was actually sent, checked after parsing, before touching
-anything.
+the same `POST /rest/db/{db}/query`, so this is the one route in the whole
+REST API where `read_only` isn't decided by HTTP method the way it is
+everywhere else (see `routes.rs`'s doc comment) -- it's decided by which
+kind of statement was actually sent, checked after parsing, before
+touching anything.
 
 ```sh
-curl -u admin:change-me -X POST localhost:8080/rest/query \
+curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "SELECT material, density WHERE x0 >= 10 AND x0 < 20 AND material = '"'"'stone'"'"'"}'
 # {"total_rows":1,"rows":[{"coord":[15,3,7],"values":[
@@ -388,19 +440,19 @@ curl -u admin:change-me -X POST localhost:8080/rest/query \
 
 # upsert: fills every cell in the box with material='stone', creating any
 # that don't already exist.
-curl -u admin:change-me -X POST localhost:8080/rest/query \
+curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "SET (material='"'"'stone'"'"') IN (0,0,0) TO (20,20,20)"}'
 # {"affected_cells":8000}
 
 # update: only changes cells that already have material='stone' -- never
 # creates one, whether or not IN is given.
-curl -u admin:change-me -X POST localhost:8080/rest/query \
+curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "UPDATE (material='"'"'basalt'"'"', hardness=9) WHERE material = '"'"'stone'"'"' IN (0,0,0) TO (20,20,20)"}'
 # {"affected_cells":1}
 
-curl -u admin:change-me -X POST localhost:8080/rest/query \
+curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
   -H 'content-type: application/json' \
   -d '{"query": "DELETE WHERE material = '"'"'air'"'"'"}'
 # {"affected_cells":1}
@@ -415,45 +467,54 @@ clears *every* key set at each matching cell -- there's no column list to
 delete only some of them.
 
 `SELECT`/`UPDATE`/`DELETE` run on `kblockdblib::World::list_cells` under
-the hood (the same full-chunk-decode walk the `/` data browser below uses)
--- `SELECT` filters and projects it directly; `UPDATE`/`DELETE` use it to
+the hood (the same full-chunk-decode walk the data browser below uses) --
+`SELECT` filters and projects it directly; `UPDATE`/`DELETE` use it to
 find matching coordinates, then apply the write in a second pass. `SET`
 without a `WHERE` skips `list_cells` entirely and goes straight to
-`World::set_region` (the same primitive `/rest/regions` uses) -- one call
-per assignment, as efficient as the region endpoints; `SET` *with* a
-`WHERE` falls back to a `list_cells`-plus-per-coordinate-`Region::iter`
-scan, since which coordinates match can depend on a cell's existing
-values. None of this is atomic with respect to a concurrent writer
-touching the same range in between the scan and the write -- a real (if
-narrow) race, same honest trade-off `list_cells`'s own doc comment already
-makes for reads. Fine for the occasional bulk edit; not meant for a world
-with millions of populated cells or for these write statements racing each
-other at high frequency.
+`World::set_region` (the same primitive `/rest/db/{db}/regions` uses) --
+one call per assignment, as efficient as the region endpoints; `SET`
+*with* a `WHERE` falls back to a `list_cells`-plus-per-coordinate-
+`Region::iter` scan, since which coordinates match can depend on a cell's
+existing values. None of this is atomic with respect to a concurrent
+writer touching the same range in between the scan and the write -- a real
+(if narrow) race, same honest trade-off `list_cells`'s own doc comment
+already makes for reads. Fine for the occasional bulk edit; not meant for
+a database with millions of populated cells or for these write statements
+racing each other at high frequency.
 
 ## Data browser
 
-`GET /` (note: *not* under `/rest` -- see below) serves a small
-self-contained HTML/JS page listing every populated cell in the world, one
-row per cell, sorted ascending by coordinate, with a search bar and paging
-controls. Clicking a row opens a modal with that cell's full keys, values,
-and metadata (`created_at_ms`/`modified_at_ms`/`version` per key -- see
-"REST API" above). It's read-only (there's no way to edit anything from
-here) and requires the same HTTP Basic Auth as the REST API -- a
-`read_only` account can browse same as any other, since it's all `GET`.
-The browser's own credential prompt (triggered by `/`'s `401`) is what a
-plain HTML page gets for free from the browser itself; the page's own JS
-never handles a password.
+`GET /` (note: *not* under `/rest`) serves one small self-contained
+HTML/JS page with a database dropdown (populated from `GET
+/rest/databases`, called directly by the page's own JS) and a table
+listing every populated cell in whichever database is selected, one row
+per cell, sorted ascending by coordinate, with a search bar and paging
+controls. Switching the dropdown reloads the table against the newly
+selected database -- there's no separate page per database. Clicking a
+row opens a modal with that cell's full keys, values, and metadata
+(`created_at_ms`/`modified_at_ms`/`version` per key -- see "REST API"
+above). It's read-only (there's no way to edit anything from here) and
+requires the same HTTP Basic Auth as the REST API -- a `read_only` account
+can browse same as any other, since it's all `GET`. The browser's own
+credential prompt (triggered by a `401`) is what a plain HTML page gets
+for free from the browser itself; the page's own JS never handles a
+password. If no databases exist yet, the dropdown is empty and the page
+says so instead of trying to list rows for nothing.
 
-`GET /rows?page=&page_size=&search=` is the JSON endpoint the page's JS
-calls (1-based `page`, default 50/max 500 `page_size`, an optional
+`GET /rows?db={name}&page=&page_size=&search=` is the JSON endpoint the
+page's JS calls (`db` is required -- no default, matching the rest of the
+server's "every request names its database explicitly" rule, and a
+request missing it gets a plain `400` from the `Query` extractor itself;
+1-based `page`, default 50/max 500 `page_size`, an optional
 case-insensitive `search` matched against a cell's coordinate, any key
 name, or any value's rendered text) -- each row already carries its full
-per-key breakdown, so opening a modal needs no second request. Built on
-`kblockdblib::World::list_cells`, which -- like `/rest/stats` above, but
-heavier, since it decodes whole chunk files rather than just reading their
-sizes -- is a live, uncached filesystem walk redone on every call. Fine
-for a world browsed occasionally; not meant for a world with millions of
-populated cells polled repeatedly.
+per-key breakdown, so opening a modal needs no second request. `404`s if
+`db` names a database that doesn't exist. Built on
+`kblockdblib::World::list_cells`, which -- like `/rest/db/{db}/stats`
+above, but heavier, since it decodes whole chunk files rather than just
+reading their sizes -- is a live, uncached filesystem walk redone on every
+call. Fine for a database browsed occasionally; not meant for one with
+millions of populated cells polled repeatedly.
 
 Deliberately kept outside `/rest`: this is a convenience UI over the same
 data, not part of the versioned REST API surface -- it has no OpenAPI
@@ -461,39 +522,49 @@ annotation and doesn't appear in `/rest/api-docs/openapi.json`.
 
 ## Binary protocol
 
-A binary protocol covering the full REST API surface above -- health,
-stats, single-cell and region operations, schema columns, and queries --
-as a *peer* to
-that API, not a replacement for it. It uses the same `World`, accounts,
-and semantics, just without HTTP/JSON's per-call overhead (see the
+A binary protocol covering the full REST API surface above -- database
+management, health, stats, single-cell and region operations, schema
+columns, and queries -- as a *peer* to that API, not a replacement for it.
+It uses the same databases, accounts, and semantics, just without
+HTTP/JSON's per-call overhead (see the
 [storage engine's cache measurements](kblockdblib.md#concurrency) for why
 that overhead is worth caring about in the first place: on a cache-hit
 `get`, roughly three-quarters of the total call time measured there was
 HTTP/transport, not the actual work). Disabled by default -- enable it
 with `--binary-port <port>` (or `binary_port` in the config file)
 alongside the REST API's own `--http-port`; both can run at once, against
-the same `World`.
+the same databases.
 
-Authentication here is per-*connection*, not per-request the way HTTP
-Basic Auth is: a client sends one `Hello` right after connecting
-(username/password), and every request after that on the same connection
-is treated as that account until the connection closes (or a later
-`Hello` re-authenticates as someone else -- allowed, not required). One
-request, one response, strictly in order -- this minimal version doesn't
-pipeline multiple in-flight requests on one connection; a client that
-wants more throughput than one connection's round-trip latency allows
-should open more connections, the same way it would against the REST
-API.
+Authentication *and database selection* here are per-*connection*, not
+per-request the way HTTP Basic Auth plus a `/db/{name}/` path segment are:
+a client sends one `Hello` right after connecting (username, password,
+*and* the database to select), and every request after that on the same
+connection is treated as that account against that database until the
+connection closes (or a later `Hello` re-selects either -- allowed, not
+required). If `Hello`'s named database doesn't exist yet, the account
+still authenticates -- so `ListDatabases`/`CreateDatabase`/
+`RemoveDatabase` work regardless -- but no database is selected, and every
+data request (`Get`/`Set`/`Query`/...) gets a `BadRequest` until the
+client creates that database and sends `Hello` again on the same
+connection to actually select it. (The REST API has no equivalent
+wrinkle: Basic Auth is already per-request, so `PUT /rest/databases/{name}`
+needs nothing more than valid credentials.) One request, one response,
+strictly in order -- this minimal version doesn't pipeline multiple
+in-flight requests on one connection; a client that wants more throughput
+than one connection's round-trip latency allows should open more
+connections, the same way it would against the REST API.
 
 Every message, either direction, is a length-prefixed frame
 (`[u32 LE payload_len][payload_len bytes]`) -- see
 `kblockdbserver/src/wire.rs`'s doc comment for the exact byte-level format
 of every request (`Hello`, health/stats, cell/region operations, column
-add/remove/list, and queries) and response kind. The `Health` response
-carries the same five fields as `/rest/health` -- hostname, axes,
-world_dim, chunk_dim, timestamp -- read from the same server state, so
+add/remove/list, database list/create/remove, and queries) and response
+kind. The `Health` response carries the same fields as `/rest/health` --
+hostname, database count, timestamp -- read from the same server state, so
 the two transports can never disagree about what this instance is. A
-successful `Get`'s `Value` response carries the cell's metadata alongside
+successful `Hello` (one that selected a database) reports that database's
+axes/world_dim/chunk_dim, the same shape a `/rest/db/{db}/stats` call's
+target database has. A successful `Get`'s `Value` response carries the cell's metadata alongside
 its value -- `created_at_ms`/`modified_at_ms`/`version`, the same three
 fields the REST API's single-cell `GET` reports (see "Cells and regions"
 above) -- read from the same server-side snapshot, so the two can never
@@ -510,19 +581,21 @@ respective runtimes.
 ## Layout
 
 - `kblockdbserver/src/main.rs`       -- CLI arg parsing, loads the config file,
-  opens the world, starts the server (with graceful shutdown on Ctrl+C).
+  builds the `Databases` manager (no database is opened yet), starts the
+  server (with graceful shutdown on Ctrl+C).
 - `kblockdbserver/src/config.rs`     -- `Config`, the `--config` TOML file
   (http_port/binary_port/data_dir/max_concurrent_disk_ops/max_cached_chunks/
   compression, hostname,
-  admin_password, `[[users]]`, and a `[worldparameters]` table for
-  axes/world_dim/chunk_size) and its validation.
+  admin_password, `[[users]]`, and a `[worldparameters]` table for the
+  default axes/world_dim/chunk_size a new database gets when none is given
+  explicitly) and its validation.
 - `kblockdbserver/src/auth.rs`       -- the HTTP Basic Auth middleware applied
   to every route except `/rest/health`, including the `read_only` write
   check; also `account_from_headers`, the same check factored out for
-  `/rest/query`'s handler, which can't use the middleware itself (see
-  `routes.rs`'s doc comment).
+  `/rest/db/{db}/query`'s handler, which can't use the middleware itself
+  (see `routes.rs`'s doc comment).
 - `kblockdbserver/src/routes.rs`     -- the router (mounted under `/rest`,
-  see "REST API" above), all HTTP handlers, and each one's
+  see "Databases"/"REST API" above), all HTTP handlers, and each one's
   `#[utoipa::path(...)]` OpenAPI annotation.
 - `kblockdbserver/src/query.pest`/`query.rs` -- the query language (see
   "Query language" above): grammar, AST, parsing, and in-memory evaluation
@@ -532,16 +605,22 @@ respective runtimes.
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,
   plus the `basic_auth` security scheme those annotations reference.
-- `kblockdbserver/src/browser.rs`    -- the `/` data browser (see "Data
-  browser" above): `GET /` (the page) and `GET /rows` (its JSON backend,
-  built on `kblockdblib::World::list_cells`).
-- `kblockdbserver/src/browser.html`  -- the browser's self-contained
+- `kblockdbserver/src/browser.rs`    -- the data browser (see "Data
+  browser" above): `GET /` (the one page) and `GET /rows?db={name}` (its
+  JSON backend, built on `kblockdblib::World::list_cells`).
+- `kblockdbserver/src/browser.html`  -- the browser page's self-contained
   HTML/CSS/JS, embedded into the binary via `include_str!` (no external
-  scripts/styles, no build step).
-- `kblockdbserver/src/state.rs`      -- `AppState` (the shared, mutex-guarded
-  `World`, plus the configured accounts) and `with_world`, which runs each
-  `World` call on a `spawn_blocking` thread so `World`'s synchronous file
-  I/O never blocks the async runtime.
+  scripts/styles, no build step) -- its database dropdown calls `GET
+  /rest/databases` directly rather than this crate duplicating that
+  listing logic in a second place.
+- `kblockdbserver/src/state.rs`      -- `AppState` (the configured accounts)
+  and `Databases` (every database this process manages, each an
+  independent `kblockdblib::World` opened lazily on first touch and cached
+  thereafter -- see its own doc comment for the create/get/list/remove API
+  and the locking that keeps two threads from racing a database's first
+  open); `with_database`, which resolves a database by name and runs a
+  call against it on a `spawn_blocking` thread so `World`'s synchronous
+  file I/O never blocks the async runtime.
 - `kblockdbserver/src/value_json.rs` -- `ValueJson`, the JSON wire format for
   `kblockdblib::Value` (kept in this crate, not `kblockdblib`, since `kblockdblib` itself doesn't
   depend on `serde`), also `ToSchema` for its OpenAPI schema.

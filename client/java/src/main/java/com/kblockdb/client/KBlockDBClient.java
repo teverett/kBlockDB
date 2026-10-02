@@ -34,8 +34,17 @@ import java.util.Optional;
  * <p><b>Not thread-safe.</b> A single instance must not be used
  * concurrently from more than one thread.
  *
+ * <p><b>Databases.</b> {@link #connect} authenticates an account *and*
+ * selects one database for the connection's whole life -- every data
+ * request after it (get/set/query/...) operates on whichever database was
+ * selected. If the named database doesn't exist yet, the account still
+ * authenticates (so {@link #createDatabase} can be called), but no database
+ * is selected: {@link #databaseSelected()} is {@code false}, and any data
+ * request throws {@link BadRequestException} until {@link #createDatabase}
+ * succeeds and {@link #useDatabase} selects it.
+ *
  * <pre>{@code
- * try (KBlockDBClient client = KBlockDBClient.connect("localhost", 8081, "admin", "change-me")) {
+ * try (KBlockDBClient client = KBlockDBClient.connect("localhost", 8081, "admin", "change-me", "mydb")) {
  *     client.set(new int[] {1, 2, 3}, "material", new Value.Str("stone"));
  *     Optional<Value> v = client.get(new int[] {1, 2, 3}, "material");
  * }
@@ -46,37 +55,54 @@ public final class KBlockDBClient implements Closeable {
     private final Socket socket;
     private final InputStream in;
     private final OutputStream out;
+    private String username;
+    private String password;
+    private String database;
     private int axes;
     private long worldDim;
+    private long chunkDim;
     private boolean readOnly;
+    private boolean databaseSelected;
 
-    private KBlockDBClient(Socket socket, InputStream in, OutputStream out, Wire.HelloOk hello) {
+    private KBlockDBClient(
+            Socket socket, InputStream in, OutputStream out, String username, String password, String database,
+            Wire.HelloOk hello) {
         this.socket = socket;
         this.in = in;
         this.out = out;
+        this.username = username;
+        this.password = password;
+        this.database = database;
         applyHello(hello);
     }
 
     private void applyHello(Wire.HelloOk hello) {
-        this.axes = hello.axes();
-        this.worldDim = hello.worldDim();
         this.readOnly = hello.readOnly();
+        this.databaseSelected = hello.database().isPresent();
+        Wire.DatabaseShape shape = hello.database().orElse(null);
+        this.axes = shape != null ? shape.axes() : 0;
+        this.worldDim = shape != null ? shape.worldDim() : 0;
+        this.chunkDim = shape != null ? shape.chunkDim() : 0;
     }
 
     /**
-     * Connects to {@code host:port} and authenticates as
-     * {@code username}/{@code password} in one step -- there's no useful
-     * "connected but not authenticated" state to hand back separately,
+     * Connects to {@code host:port}, authenticates as {@code username}/
+     * {@code password}, and selects {@code database} -- all in one step,
      * since every other request needs an authenticated connection anyway.
+     * If {@code database} doesn't exist yet, the connection still comes
+     * back successfully (the account is authenticated), but
+     * {@link #databaseSelected()} is {@code false} -- see this class's own
+     * doc comment for the bootstrap flow to create and then select it.
      *
      * @throws UnauthorizedException if the credentials are rejected
      * @throws IOException           on any connection or framing failure
      */
-    public static KBlockDBClient connect(String host, int port, String username, String password)
+    public static KBlockDBClient connect(String host, int port, String username, String password, String database)
             throws IOException {
         Objects.requireNonNull(host, "host");
         Objects.requireNonNull(username, "username");
         Objects.requireNonNull(password, "password");
+        Objects.requireNonNull(database, "database");
 
         Socket socket = new Socket();
         try {
@@ -88,10 +114,10 @@ public final class KBlockDBClient implements Closeable {
             InputStream in = new BufferedInputStream(socket.getInputStream());
             OutputStream out = new BufferedOutputStream(socket.getOutputStream());
 
-            Wire.writeFrame(out, Wire.encodeHello(username, password));
+            Wire.writeFrame(out, Wire.encodeHello(username, password, database));
             Wire.Response response = Wire.decodeResponse(requireFrame(in));
             if (response instanceof Wire.HelloOk hello) {
-                return new KBlockDBClient(socket, in, out, hello);
+                return new KBlockDBClient(socket, in, out, username, password, database, hello);
             }
             throw toException(response);
         } catch (IOException e) {
@@ -100,14 +126,40 @@ public final class KBlockDBClient implements Closeable {
         }
     }
 
-    /** The world's axis count, as reported by the most recent {@code Hello}. */
+    /**
+     * The selected database's axis count, as reported by the most recent
+     * {@code Hello}. Meaningless (always 0) when {@link #databaseSelected()}
+     * is {@code false}.
+     */
     public int axes() {
         return axes;
     }
 
-    /** The world's cells-per-axis extent, as reported by the most recent {@code Hello}. */
+    /**
+     * The selected database's cells-per-axis extent, as reported by the
+     * most recent {@code Hello}. Meaningless (always 0) when
+     * {@link #databaseSelected()} is {@code false}.
+     */
     public long worldDim() {
         return worldDim;
+    }
+
+    /**
+     * Cells per axis in one chunk file, for the selected database.
+     * Meaningless (always 0) when {@link #databaseSelected()} is
+     * {@code false}.
+     */
+    public long chunkDim() {
+        return chunkDim;
+    }
+
+    /**
+     * Whether this connection currently has a database selected -- see
+     * this class's own doc comment. {@code false} right after connecting to
+     * a database that doesn't exist yet.
+     */
+    public boolean databaseSelected() {
+        return databaseSelected;
     }
 
     /** Whether the currently authenticated account is read-only. */
@@ -117,8 +169,8 @@ public final class KBlockDBClient implements Closeable {
 
     /**
      * Re-authenticates this same connection as {@code username}/
-     * {@code password} -- every request after this one is treated as the
-     * new account. Allowed, not required; most callers only ever
+     * {@code password}, keeping the currently selected (or not-yet-selected)
+     * database name. Allowed, not required; most callers only ever
      * authenticate once, at {@link #connect}.
      *
      * @throws UnauthorizedException if the credentials are rejected
@@ -126,9 +178,36 @@ public final class KBlockDBClient implements Closeable {
     public void reauthenticate(String username, String password) throws IOException {
         Objects.requireNonNull(username, "username");
         Objects.requireNonNull(password, "password");
-        Wire.writeFrame(out, Wire.encodeHello(username, password));
+        Wire.writeFrame(out, Wire.encodeHello(username, password, database));
         Wire.Response response = Wire.decodeResponse(requireFrame(in));
         if (response instanceof Wire.HelloOk hello) {
+            this.username = username;
+            this.password = password;
+            applyHello(hello);
+            return;
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Re-sends {@code Hello} on this same connection with the credentials
+     * already given to {@link #connect}, naming {@code name} as the
+     * database to select instead. The ergonomic fix for the bootstrap
+     * wrinkle described in this class's own doc comment: after
+     * {@link #createDatabase} creates the database {@link #connect} named,
+     * call {@code useDatabase} with that same name to actually select it,
+     * without needing to open a new connection or remember the original
+     * password yourself.
+     *
+     * @throws UnauthorizedException if the cached credentials are somehow
+     *                               no longer valid
+     */
+    public void useDatabase(String name) throws IOException {
+        Objects.requireNonNull(name, "name");
+        Wire.writeFrame(out, Wire.encodeHello(username, password, name));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.HelloOk hello) {
+            this.database = name;
             applyHello(hello);
             return;
         }
@@ -217,7 +296,7 @@ public final class KBlockDBClient implements Closeable {
         throw toException(response);
     }
 
-    /** Returns the server's current world shape and clock. */
+    /** Returns the server's identity, database count, and clock. */
     public Health health() throws IOException {
         Wire.writeFrame(out, Wire.encodeHealth());
         Wire.Response response = Wire.decodeResponse(requireFrame(in));
@@ -233,6 +312,71 @@ public final class KBlockDBClient implements Closeable {
         Wire.Response response = Wire.decodeResponse(requireFrame(in));
         if (response instanceof Wire.StatsResp stats) {
             return stats.stats();
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Every database this server currently manages, sorted by name. Unlike
+     * most requests, this doesn't need a selected database -- it works even
+     * when {@link #databaseSelected()} is {@code false}.
+     */
+    public List<String> listDatabases() throws IOException {
+        Wire.writeFrame(out, Wire.encodeListDatabases());
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Databases databases) {
+            return databases.names();
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Creates a new database named {@code name}, using the server's
+     * configured default shape -- there's no way to override axes/
+     * world_dim/chunk_size over this protocol (use the REST API's
+     * {@code PUT /rest/databases/{name}} for that). Doesn't need a selected
+     * database, so this works even when {@link #databaseSelected()} is
+     * {@code false} -- the usual way to bootstrap a brand-new database (see
+     * this class's own doc comment): create it, then call
+     * {@link #useDatabase} to select it.
+     *
+     * @throws ConflictException     if a database named {@code name}
+     *                               already exists
+     * @throws ForbiddenException    if this connection's account is
+     *                               read-only
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public void createDatabase(String name) throws IOException {
+        Objects.requireNonNull(name, "name");
+        Wire.writeFrame(out, Wire.encodeCreateDatabase(name));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return;
+        }
+        throw toException(response);
+    }
+
+    /**
+     * Deletes database {@code name} -- its directory and every byte of data
+     * in it. Returns {@code false}, having changed nothing, if there was no
+     * such database. Doesn't need a selected database, same as
+     * {@link #listDatabases}/{@link #createDatabase}.
+     *
+     * <p>Irreversible, same as {@link #removeColumn}.
+     *
+     * @throws ForbiddenException    if this connection's account is
+     *                               read-only
+     * @throws UnauthorizedException if this connection hasn't authenticated
+     */
+    public boolean removeDatabase(String name) throws IOException {
+        Objects.requireNonNull(name, "name");
+        Wire.writeFrame(out, Wire.encodeRemoveDatabase(name));
+        Wire.Response response = Wire.decodeResponse(requireFrame(in));
+        if (response instanceof Wire.Ok) {
+            return true;
+        }
+        if (response instanceof Wire.NotFound) {
+            return false;
         }
         throw toException(response);
     }

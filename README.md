@@ -9,39 +9,49 @@ A database for a huge simulation grid, where every cell of the grid is its
 own key/value store -- string keys, with string, f64, i64, or bool values.
 It's sized for worlds like 10,000 x 10,000 x 10,000 cells (a trillion
 cells), which is far too many for one file per cell or one RDBMS row per
-cell. The axis count, world size, and chunk size are all per-world
-settings, so a world can be 2-dimensional, 4-dimensional, or larger.
+cell. One server manages any number of independent **databases**, each its
+own directory under `--data-dir`; the axis count, world size, and chunk
+size are all per-database settings fixed when that database is created, so
+one database can be 2-dimensional, another 4-dimensional, or larger.
 
-Storage is chunked: the world is divided into fixed-size blocks of cells,
-each at most one file, and chunks that hold no data are never written at
-all -- so a mostly-empty world costs disk proportional to what's actually
-in it. Every value carries metadata (creation time, modification time,
-and a version counter).
+Storage is chunked: each database is divided into fixed-size blocks of
+cells, each at most one file, and chunks that hold no data are never
+written at all -- so a mostly-empty database costs disk proportional to
+what's actually in it. Every value carries metadata (creation time,
+modification time, and a version counter).
 
 ## Quick start
 
 ```sh
 cargo build --release
-cargo run -p kblockdbserver          # re ads ./kblockdbserver.toml
+cargo run -p kblockdbserver          # reads ./kblockdbserver.toml
 ```
 
 The checked-in `kblockdbserver.toml` is a local-development placeholder
 (admin / `changeme`) so this runs out of the box. **Change
 `admin_password` before exposing the server to anyone you don't trust.**
 
+No database exists until you create one -- there's no implicit default:
+
 ```sh
-# a single cell, over REST
+# create a database named "demo" (4 axes, using the server's configured
+# default shape -- see kblockdbserver.toml's [worldparameters])
+curl -u admin:changeme -X PUT -H 'Content-Type: application/json' \
+    -d '{}' 'http://127.0.0.1:8080/rest/databases/demo'
+
+# a single cell in it, over REST
 curl -u admin:changeme -X PUT -H 'Content-Type: application/json' \
     -d '{"type":"str","value":"stone"}' \
-    'http://127.0.0.1:8080/rest/cells/1,2,3,0/material'
-curl -u admin:changeme 'http://127.0.0.1:8080/rest/cells/1,2,3,0/material'
+    'http://127.0.0.1:8080/rest/db/demo/cells/1,2,3,0/material'
+curl -u admin:changeme 'http://127.0.0.1:8080/rest/db/demo/cells/1,2,3,0/material'
 
 # or a query, from the command line
-./target/release/kblockdbcli --password changeme query \
+./target/release/kblockdbcli --password changeme create-database demo
+./target/release/kblockdbcli --password changeme --db demo query \
     "SELECT * FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'"
 ```
 
-A read-only web browser for the data is served at
+A read-only web browser for every database is served at
 <http://127.0.0.1:8080/>; it prompts for the same credentials.
 
 ## What's here
@@ -56,22 +66,26 @@ A Cargo workspace of four Rust crates, plus two standalone clients:
 - **`kblockdbserver`** -- embeds `kblockdblib` and serves it over a REST
   HTTP API, a read-only web data browser, and (optionally, as a peer to
   REST rather than a replacement) a compact binary protocol with less
-  per-call overhead. Supports single cells and axis-aligned regions, a
-  SQL-like query language (`SELECT`/`SET`/`UPDATE`/`DELETE`), schema
-  column management, and HTTP Basic Auth with per-account read-only
-  access. Unlike `kblockdblib` it
-  uses the usual modern Rust web stack (axum, tokio, serde, pest) --
-  the near-dependency-free constraint applies to the storage format, not
-  to everything built on top of it.
+  per-call overhead. Manages any number of independent databases under one
+  data directory (`/rest/databases` to list/create/delete); every
+  per-database route is scoped under `/rest/db/{name}/...` and supports
+  single cells and axis-aligned regions, a SQL-like query language
+  (`SELECT`/`SET`/`UPDATE`/`DELETE`), and schema column management, all
+  behind HTTP Basic Auth with per-account read-only access. Unlike
+  `kblockdblib` it uses the usual modern Rust web stack (axum, tokio,
+  serde, pest) -- the near-dependency-free constraint applies to the
+  storage format, not to everything built on top of it.
 - **`kblockdbperf`** -- drives a real server over real HTTP and measures
   it: single-cell and region throughput and latency, concurrency scaling,
   and lock contention.
 - **`kblockdbcli`** -- a command-line client for the REST API: get, set,
-  or remove one cell, run a query, or list/add/drop schema columns,
-  authenticating the way `curl -u` would.
+  or remove one cell, run a query, list/add/drop schema columns, or
+  list/create/delete databases, authenticating the way `curl -u` would.
 - **Java and Python clients** (`client/java`, `client/python`) -- each
-  dependency-free, each covering the complete binary API: health, stats,
-  single cells, regions, schema columns, and queries.
+  dependency-free, each covering the complete binary API: database
+  management, health, stats, single cells, regions, schema columns, and
+  queries. Connecting selects both an account and a database for the
+  connection's life, same as the binary protocol itself.
 
 ```
 kblockdblib/      the storage engine (library + demo binary `kblockdblib`)

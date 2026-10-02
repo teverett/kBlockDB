@@ -11,6 +11,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const TEST_PASSWORD: &str = "kblockdbcli-test-password";
+/// The database every `test_fixture` pre-creates, so existing data tests
+/// don't each need their own `create-database` round trip -- tests that
+/// exercise multi-database behavior itself create additional, differently
+/// named databases on top of this one.
+const TEST_DB: &str = "testdb";
 
 /// A `kblockdbserver` child process, killed (and its temp config file removed)
 /// on drop -- mirrors `kblockdbperf/src/server.rs`'s `ManagedServer`, just
@@ -125,8 +130,10 @@ fn temp_data_dir(tag: &str) -> PathBuf {
     dir
 }
 
-/// Spawns a test server plus locates the `kblockdbcli` binary under test, or
-/// `None` (the test should skip, not fail) if either hasn't been built.
+/// Spawns a test server, locates the `kblockdbcli` binary under test, and
+/// pre-creates `TEST_DB` on that server (so `run_kblockdbcli`'s `--db
+/// TEST_DB` always has somewhere to land) -- or `None` (the test should
+/// skip, not fail) if either binary hasn't been built.
 fn test_fixture(tag: &str) -> Option<(ManagedServer, PathBuf, PathBuf)> {
     let kblockdbserver_bin = find_bin("kblockdbserver");
     if !kblockdbserver_bin.exists() {
@@ -147,9 +154,33 @@ fn test_fixture(tag: &str) -> Option<(ManagedServer, PathBuf, PathBuf)> {
 
     let dir = temp_data_dir(tag);
     let server = ManagedServer::spawn(&kblockdbserver_bin, &dir, next_port());
+
+    let create = Command::new(&kblockdbcli_bin)
+        .args([
+            "--url",
+            &server.url,
+            "--user",
+            "admin",
+            "--password",
+            TEST_PASSWORD,
+            "create-database",
+            TEST_DB,
+        ])
+        .output()
+        .expect("failed to run kblockdbcli to create the test database");
+    assert!(
+        create.status.success(),
+        "failed to create test database '{TEST_DB}': {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
     Some((server, dir, kblockdbcli_bin))
 }
 
+/// Runs `kblockdbcli` against `TEST_DB` on `server` -- the database
+/// `test_fixture` already created. Tests that need a *different* database
+/// (to prove isolation, say) build their own `Command` directly instead of
+/// going through this helper.
 fn run_kblockdbcli(kblockdbcli_bin: &Path, server: &ManagedServer, rest: &[&str]) -> Output {
     let mut args = vec![
         "--url",
@@ -158,6 +189,8 @@ fn run_kblockdbcli(kblockdbcli_bin: &Path, server: &ManagedServer, rest: &[&str]
         "admin",
         "--password",
         TEST_PASSWORD,
+        "--db",
+        TEST_DB,
     ];
     args.extend_from_slice(rest);
     Command::new(kblockdbcli_bin)
@@ -328,6 +361,8 @@ fn the_wrong_password_is_rejected() {
             "admin",
             "--password",
             "not-the-real-password",
+            "--db",
+            TEST_DB,
             "get",
             "1,2,3",
             "material",
@@ -504,6 +539,136 @@ fn an_invalid_value_type_is_rejected_before_any_request_is_sent() {
     );
     assert!(!output.status.success());
     assert!(stderr(&output).contains("complex"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// --- Multi-database support ---
+
+#[test]
+fn omitting_db_on_a_data_command_is_rejected_before_any_request_is_sent() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("missing-db") else {
+        return;
+    };
+
+    let output = Command::new(&kblockdbcli_bin)
+        .args([
+            "--url",
+            &server.url,
+            "--user",
+            "admin",
+            "--password",
+            TEST_PASSWORD,
+            "get",
+            "1,2,3",
+            "material",
+        ])
+        .output()
+        .expect("failed to run kblockdbcli");
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("--db"),
+        "expected a --db error, got: {}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn databases_create_database_and_remove_database_round_trip_through_a_real_server() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("db-management") else {
+        return;
+    };
+
+    // `test_fixture` already created `TEST_DB` -- `databases` should report
+    // exactly that.
+    let list = run_kblockdbcli(&kblockdbcli_bin, &server, &["databases"]);
+    assert!(list.status.success(), "databases failed: {}", stderr(&list));
+    assert_eq!(stdout(&list), format!("{TEST_DB}\n1 database(s)"));
+
+    let create = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["create-database", "extra", "--axes", "2", "--world-dim", "50"],
+    );
+    assert!(create.status.success(), "create failed: {}", stderr(&create));
+
+    let list_after_create = run_kblockdbcli(&kblockdbcli_bin, &server, &["databases"]);
+    let out = stdout(&list_after_create);
+    assert!(out.contains("extra"), "unexpected databases output: {out}");
+    assert!(out.ends_with("2 database(s)"), "unexpected databases output: {out}");
+
+    let remove = run_kblockdbcli(&kblockdbcli_bin, &server, &["remove-database", "extra"]);
+    assert!(remove.status.success(), "remove failed: {}", stderr(&remove));
+
+    let list_after_remove = run_kblockdbcli(&kblockdbcli_bin, &server, &["databases"]);
+    assert_eq!(stdout(&list_after_remove), format!("{TEST_DB}\n1 database(s)"));
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn creating_a_database_that_already_exists_is_a_conflict() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("db-conflict") else {
+        return;
+    };
+
+    let output = run_kblockdbcli(&kblockdbcli_bin, &server, &["create-database", TEST_DB]);
+    assert!(!output.status.success());
+    assert!(
+        stderr(&output).contains("409"),
+        "expected a 409 in stderr, got: {}",
+        stderr(&output)
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn two_databases_are_isolated_through_the_cli() {
+    let Some((server, dir, kblockdbcli_bin)) = test_fixture("db-isolation") else {
+        return;
+    };
+
+    let create = run_kblockdbcli(&kblockdbcli_bin, &server, &["create-database", "other"]);
+    assert!(create.status.success(), "create failed: {}", stderr(&create));
+
+    let set = run_kblockdbcli(
+        &kblockdbcli_bin,
+        &server,
+        &["set", "1,2,3", "material", "str", "stone"],
+    );
+    assert!(set.status.success(), "set failed: {}", stderr(&set));
+
+    // The same coordinate/key in the *other* database must not see it.
+    let get_other = Command::new(&kblockdbcli_bin)
+        .args([
+            "--url",
+            &server.url,
+            "--user",
+            "admin",
+            "--password",
+            TEST_PASSWORD,
+            "--db",
+            "other",
+            "get",
+            "1,2,3",
+            "material",
+        ])
+        .output()
+        .expect("failed to run kblockdbcli");
+    assert!(!get_other.status.success());
+    assert!(
+        stderr(&get_other).contains("404"),
+        "expected a 404 in stderr, got: {}",
+        stderr(&get_other)
+    );
+
+    // TEST_DB still has it.
+    let get_test_db = run_kblockdbcli(&kblockdbcli_bin, &server, &["get", "1,2,3", "material"]);
+    assert!(get_test_db.status.success());
+    assert!(stdout(&get_test_db).starts_with("str stone (created="));
 
     let _ = std::fs::remove_dir_all(&dir);
 }

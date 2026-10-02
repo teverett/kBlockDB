@@ -1,22 +1,26 @@
-//! The `/` data browser: a small self-contained HTML/JS page (see
-//! `browser.html`) that lists every populated cell in the world -- one row
-//! per cell -- paged and searchable, sorted ascending by coordinate, with
-//! a modal showing a cell's full keys/values/metadata on click.
+//! The data browser: one self-contained HTML/JS page (see `browser.html`)
+//! at `/`, with a dropdown (populated from `GET /rest/databases`) to pick
+//! which database to browse. Once one's selected, it lists every populated
+//! cell in it, one row per cell, paged and searchable, sorted ascending by
+//! coordinate, with a modal showing a cell's full keys/values/metadata on
+//! click.
 //!
 //! Read-only (there's no way to edit anything from here), so it's mounted
 //! behind the same auth as the REST API's `GET` endpoints -- a `read_only`
 //! account can use it same as any other. Deliberately kept outside `/rest`
 //! (see `routes.rs`): this isn't part of the versioned REST API surface
 //! (it has no OpenAPI annotation, and isn't in `openapi.rs`'s spec), just a
-//! convenience UI on top of the same data.
+//! convenience UI on top of the same data -- it even reuses `GET
+//! /rest/databases` directly from its own JS rather than duplicating that
+//! listing logic here.
 //!
-//! `GET /rows` backs the page: it calls `kblockdblib::World::list_cells`,
-//! which -- like `World::stats` -- is a live, full filesystem walk (here,
-//! a full *decode* of every chunk file, heavier than `stats`' file-size-only
-//! walk), redone on every call rather than cached. That's the right
-//! trade-off for a small-to-moderate world browsed occasionally, not for a
-//! world with millions of populated cells polled repeatedly -- see
-//! `list_cells`'s own doc comment.
+//! `GET /rows?db=<name>&...` backs the page: it calls
+//! `kblockdblib::World::list_cells`, which -- like `World::stats` -- is a
+//! live, full filesystem walk (here, a full *decode* of every chunk file,
+//! heavier than `stats`' file-size-only walk), redone on every call rather
+//! than cached. That's the right trade-off for a small-to-moderate database
+//! browsed occasionally, not for one with millions of populated cells
+//! polled repeatedly -- see `list_cells`'s own doc comment.
 
 use crate::auth::require_auth;
 use crate::error::ApiError;
@@ -61,6 +65,15 @@ const MAX_PAGE_SIZE: usize = 500;
 
 #[derive(Deserialize)]
 struct RowsQuery {
+    /// Which database to list rows from -- required, no default, matching
+    /// the rest of the server's "every request names its database
+    /// explicitly" rule. The page's own JS always sends this once it's
+    /// populated its database dropdown from `GET /rest/databases`; a
+    /// request missing it is almost certainly a stale/hand-built URL, not a
+    /// legitimate use of this endpoint, so it's rejected by the `Query`
+    /// extractor itself (a plain `400`) rather than treated as "no
+    /// database" some other way.
+    db: String,
     #[serde(default = "default_page")]
     page: usize,
     #[serde(default = "default_page_size")]
@@ -119,7 +132,9 @@ async fn rows(
     }
     let search = query.search.trim().to_lowercase();
 
-    let cells = state.with_world(kblockdblib::World::list_cells).await?;
+    let cells = state
+        .with_database(&query.db, kblockdblib::World::list_cells)
+        .await?;
     let filtered: Vec<&CellEntry> = cells
         .iter()
         .filter(|cell| search.is_empty() || cell_matches(cell, &search))

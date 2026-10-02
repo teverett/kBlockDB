@@ -33,6 +33,7 @@ def _free_port() -> int:
 class ClientIntegrationTest(unittest.TestCase):
     server: subprocess.Popen[bytes]
     binary_port: int
+    database: str
     password = "kblockdb-python-client-test-password"
 
     @classmethod
@@ -78,10 +79,10 @@ class ClientIntegrationTest(unittest.TestCase):
                 str(binary),
                 "--data-dir",
                 str(root / "data"),
-                "--http-addr",
-                f"127.0.0.1:{_free_port()}",
-                "--binary-addr",
-                f"127.0.0.1:{cls.binary_port}",
+                "--http-port",
+                str(_free_port()),
+                "--binary-port",
+                str(cls.binary_port),
                 "--config",
                 str(config),
             ],
@@ -89,16 +90,28 @@ class ClientIntegrationTest(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
         deadline = time.monotonic() + 10
+        ready = False
         while time.monotonic() < deadline:
             try:
                 with socket.create_connection(("127.0.0.1", cls.binary_port), 0.2):
-                    return
+                    ready = True
+                    break
             except OSError:
                 time.sleep(0.05)
-        cls.server.kill()
-        cls.server.wait()
-        cls.temp_dir.cleanup()
-        raise RuntimeError("kblockdbserver did not become ready")
+        if not ready:
+            cls.server.kill()
+            cls.server.wait()
+            cls.temp_dir.cleanup()
+            raise RuntimeError("kblockdbserver did not become ready")
+
+        # The server manages no databases until one is explicitly created --
+        # `cls.database` is the one almost every test below operates
+        # against, created once here rather than per test.
+        cls.database = "db"
+        with KBlockDBClient.connect(
+            "127.0.0.1", cls.binary_port, "admin", cls.password, cls.database
+        ) as bootstrap:
+            bootstrap.create_database(cls.database)
 
     @classmethod
     def tearDownClass(cls) -> None:
@@ -112,17 +125,19 @@ class ClientIntegrationTest(unittest.TestCase):
 
     def connect(self) -> KBlockDBClient:
         return KBlockDBClient.connect(
-            "127.0.0.1", self.binary_port, "admin", self.password
+            "127.0.0.1", self.binary_port, "admin", self.password, self.database
         )
 
     def test_connect_and_authentication(self) -> None:
         with self.connect() as client:
+            self.assertTrue(client.database_selected)
             self.assertEqual(3, client.axes)
             self.assertEqual(10_000, client.world_dim)
+            self.assertEqual(32, client.chunk_dim)
             self.assertFalse(client.read_only)
         with self.assertRaises(UnauthorizedError):
             KBlockDBClient.connect(
-                "127.0.0.1", self.binary_port, "admin", "wrong"
+                "127.0.0.1", self.binary_port, "admin", "wrong", self.database
             )
 
     def test_reauthenticate_updates_role_and_enforces_read_only(self) -> None:
@@ -153,7 +168,9 @@ class ClientIntegrationTest(unittest.TestCase):
     def test_health_and_stats(self) -> None:
         with self.connect() as client:
             health = client.health()
-            self.assertEqual((3, 10_000, 32), (health.axes, health.world_dim, health.chunk_dim))
+            # `cls.database` was created in setUpClass -- at least one
+            # database always exists by the time any test runs.
+            self.assertGreaterEqual(health.database_count, 1)
             self.assertGreater(health.timestamp, 0)
             # Which hostname the test machine has isn't knowable here;
             # that one was reported at all is.
@@ -268,6 +285,78 @@ class ClientIntegrationTest(unittest.TestCase):
                 client.add_column("py-client-conflict", ValueType.STR)
             self.assertIsNotNone(client.health())
             self.assertTrue(client.remove_column("py-client-conflict"))
+
+    # --- Multi-database support ---
+
+    def test_connecting_to_an_unknown_database_authenticates_without_selecting_one(
+        self,
+    ) -> None:
+        with KBlockDBClient.connect(
+            "127.0.0.1", self.binary_port, "admin", self.password, "py-bootstrap-db"
+        ) as client:
+            self.assertFalse(client.database_selected)
+            self.assertIsNone(client.axes)
+            self.assertIsNone(client.world_dim)
+            self.assertIsNone(client.chunk_dim)
+            with self.assertRaises(ProtocolError):
+                client.get((0, 0, 0), "k")
+
+            client.create_database("py-bootstrap-db")
+            # Still not selected until Hello runs again.
+            with self.assertRaises(ProtocolError):
+                client.get((0, 0, 0), "k")
+
+            client.use_database("py-bootstrap-db")
+            self.assertTrue(client.database_selected)
+            self.assertEqual(3, client.axes)
+            self.assertIsNone(client.get((0, 0, 0), "k"))
+
+            self.assertTrue(client.remove_database("py-bootstrap-db"))
+
+    def test_create_database_rejects_a_shape_override(self) -> None:
+        with self.connect() as client:
+            with self.assertRaises(ValueError):
+                client.create_database("py-shape-override", axes=1)
+
+    def test_list_databases_includes_the_shared_test_database(self) -> None:
+        with self.connect() as client:
+            self.assertIn(self.database, client.list_databases())
+
+    def test_removing_an_unknown_database_returns_false(self) -> None:
+        with self.connect() as client:
+            self.assertFalse(client.remove_database("py-no-such-database"))
+
+    def test_two_databases_are_isolated(self) -> None:
+        with self.connect() as client:
+            client.create_database("py-other-db")
+        try:
+            with KBlockDBClient.connect(
+                "127.0.0.1",
+                self.binary_port,
+                "admin",
+                self.password,
+                "py-other-db",
+            ) as other:
+                self.assertIsNone(other.get((1, 1, 1), "py-isolation-key"))
+                other.set((1, 1, 1), "py-isolation-key", Str("other"))
+
+            with self.connect() as client:
+                self.assertIsNone(client.get((1, 1, 1), "py-isolation-key"))
+        finally:
+            with self.connect() as client:
+                self.assertTrue(client.remove_database("py-other-db"))
+
+    def test_a_read_only_account_can_list_but_not_create_or_remove_databases(
+        self,
+    ) -> None:
+        with self.connect() as client:
+            client.reauthenticate("viewer", "viewer-password")
+            self.assertIn(self.database, client.list_databases())
+            with self.assertRaises(ForbiddenError):
+                client.create_database("py-read-only-attempt")
+            with self.assertRaises(ForbiddenError):
+                client.remove_database(self.database)
+            client.reauthenticate("admin", self.password)
 
 
 if __name__ == "__main__":

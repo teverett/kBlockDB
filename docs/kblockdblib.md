@@ -1,5 +1,14 @@
 # `kblockdblib`: the storage engine
 
+A `World` is one self-contained storage root: its own `world.txt`/
+`schema.txt`/chunk tree under whatever directory it's pointed at. This
+crate knows nothing about "databases" or multiple `World`s sharing a
+parent directory -- that's `kblockdbserver`'s job (see its
+[`Databases` manager](kblockdbserver.md#databases)), which manages any
+number of independent `World`s, one per database, each rooted at its own
+subdirectory of `--data-dir`. Everything below describes a single `World`
+in isolation, same as if it were the only one on disk.
+
 ## Design
 
 - **Chunking, not one file per cell.** The world is split into
@@ -391,11 +400,11 @@ packed value array. That costs two different things:
   malformed coordinate is always rejected the same way rather than
   sometimes being silently absorbed by an unrelated short-circuit. Also
   `stats()` -- a live filesystem walk totaling chunk count, size, and
-  disk-block usage into a `Stats`, which `kblockdbserver` exposes as
-  `/rest/stats` -- and `list_cells()`, a heavier live walk that decodes
-  every chunk file into a sorted `Vec<CellEntry>` (every populated cell's
-  full keys/values/metadata), which `kblockdbserver`'s `/` data browser
-  (see below) is built on.
+  disk-block usage into a `Stats`, which `kblockdbserver` exposes per
+  database as `/rest/db/{db}/stats` -- and `list_cells()`, a heavier live
+  walk that decodes every chunk file into a sorted `Vec<CellEntry>` (every
+  populated cell's full keys/values/metadata), which `kblockdbserver`'s
+  data browser (`/`, with a database dropdown) is built on.
 - `kblockdblib/src/logger.rs` -- minimal dependency-free logger, appends to
   `kblockdblib.log` in the working directory.
 - `kblockdblib/src/main.rs`   -- demo/benchmark driver (the `kblockdblib` binary).

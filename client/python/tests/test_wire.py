@@ -23,7 +23,7 @@ from kblockdb import _wire
 class WireEncodingTest(unittest.TestCase):
     def test_encodes_hello(self) -> None:
         self.assertEqual(
-            b"\x00\x05admin\x02hi", _wire.encode_hello("admin", "hi")
+            b"\x00\x05admin\x02hi\x02db", _wire.encode_hello("admin", "hi", "db")
         )
 
     def test_encodes_cell_operations(self) -> None:
@@ -75,9 +75,18 @@ class WireEncodingTest(unittest.TestCase):
             b"\x09\x08\x00\x00\x00SELECT *", _wire.encode_query("SELECT *")
         )
 
+    def test_encodes_database_management_requests(self) -> None:
+        self.assertEqual(b"\x0d", _wire.encode_list_databases())
+        self.assertEqual(
+            b"\x0e\x02\x00db", _wire.encode_create_database("db")
+        )
+        self.assertEqual(
+            b"\x0f\x02\x00db", _wire.encode_remove_database("db")
+        )
+
     def test_rejects_out_of_range_fields(self) -> None:
         with self.assertRaises(ValueError):
-            _wire.encode_hello("u" * 256, "pw")
+            _wire.encode_hello("u" * 256, "pw", "db")
         with self.assertRaises(ValueError):
             _wire.encode_get(tuple(range(256)), "k")
         with self.assertRaises(ValueError):
@@ -88,24 +97,37 @@ class WireEncodingTest(unittest.TestCase):
 
 class WireDecodingTest(unittest.TestCase):
     def test_decoding_a_health_response_without_a_hostname_is_an_error(self) -> None:
-        # Exactly what a pre-hostname server would send: the frame ends
-        # where the hostname should start.
+        # Exactly what a truncated server response would send: the frame
+        # ends where the hostname should start.
         with self.assertRaises(ProtocolError):
             _wire.decode_response(
-                b"\x08\x03" + struct.pack("<II", 10_000, 32) + struct.pack("<Q", 123)
+                b"\x08" + struct.pack("<Q", 123) + struct.pack("<I", 1)
             )
 
-    def test_decodes_hello_health_and_stats(self) -> None:
+    def test_decodes_hello_with_a_selected_database(self) -> None:
         self.assertEqual(
-            _wire.HelloOk(3, 10_000, False),
-            _wire.decode_response(b"\x00\x03" + struct.pack("<I", 10_000) + b"\x00"),
-        )
-        self.assertEqual(
-            _wire.HealthResponse(Health("db-1.example.com", 3, 10_000, 32, 123)),
+            _wire.HelloOk(
+                read_only=False,
+                database=_wire.DatabaseShape(axes=3, world_dim=10_000, chunk_dim=32),
+            ),
             _wire.decode_response(
-                b"\x08\x03"
-                + struct.pack("<II", 10_000, 32)
+                b"\x00\x00\x01\x03" + struct.pack("<II", 10_000, 32)
+            ),
+        )
+
+    def test_decodes_hello_with_no_database_selected(self) -> None:
+        self.assertEqual(
+            _wire.HelloOk(read_only=True, database=None),
+            _wire.decode_response(b"\x00\x01\x00"),
+        )
+
+    def test_decodes_health_and_stats(self) -> None:
+        self.assertEqual(
+            _wire.HealthResponse(Health("db-1.example.com", 2, 123)),
+            _wire.decode_response(
+                b"\x08"
                 + struct.pack("<Q", 123)
+                + struct.pack("<I", 2)
                 + struct.pack("<H", 16)
                 + b"db-1.example.com"
             ),
@@ -113,6 +135,25 @@ class WireDecodingTest(unittest.TestCase):
         self.assertEqual(
             _wire.StatsResponse(Stats(2, 3, 4)),
             _wire.decode_response(b"\x09" + struct.pack("<QQQ", 2, 3, 4)),
+        )
+
+    def test_decodes_databases_response(self) -> None:
+        payload = (
+            b"\x0e"
+            + struct.pack("<I", 2)
+            + struct.pack("<H", 1)
+            + b"a"
+            + struct.pack("<H", 1)
+            + b"b"
+        )
+        self.assertEqual(
+            _wire.DatabasesResponse(("a", "b")), _wire.decode_response(payload)
+        )
+
+    def test_decodes_an_empty_databases_response(self) -> None:
+        self.assertEqual(
+            _wire.DatabasesResponse(()),
+            _wire.decode_response(b"\x0e" + struct.pack("<I", 0)),
         )
 
     def test_decodes_value_with_metadata(self) -> None:

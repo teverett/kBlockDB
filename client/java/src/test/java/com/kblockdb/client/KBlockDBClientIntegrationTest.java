@@ -29,6 +29,11 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
  * client against the real server rather than just {@link Wire}'s encoding
  * in isolation (see {@link WireTest} for that).
  *
+ * <p>The server manages any number of databases now, none created
+ * automatically -- {@link #DB} is the one database most tests below share
+ * (created once in {@link #startServer}), the same way they used to share
+ * the server's one implicit world.
+ *
  * <p>Skips (rather than fails) if the {@code kblockdbserver} binary hasn't
  * been built yet, since running this module's tests doesn't imply the
  * Rust workspace was built first.
@@ -36,6 +41,9 @@ import static org.junit.jupiter.api.Assumptions.assumeTrue;
 class KBlockDBClientIntegrationTest {
 
     private static final String ADMIN_PASSWORD = "kblockdb-java-client-test-password";
+    private static final String VIEWER_PASSWORD = "kblockdb-java-client-test-viewer-password";
+    /** The database every test below shares, pre-created in {@link #startServer}. */
+    private static final String DB = "db";
 
     private static Path dataDir;
     private static Path configPath;
@@ -50,7 +58,12 @@ class KBlockDBClientIntegrationTest {
 
         dataDir = Files.createTempDirectory("kblockdb-java-client-test-data-");
         configPath = Files.createTempFile("kblockdb-java-client-test-config-", ".toml");
-        Files.writeString(configPath, "admin_password = \"" + ADMIN_PASSWORD + "\"\n");
+        Files.writeString(configPath,
+                "admin_password = \"" + ADMIN_PASSWORD + "\"\n"
+                        + "[[users]]\n"
+                        + "username = \"viewer\"\n"
+                        + "password = \"" + VIEWER_PASSWORD + "\"\n"
+                        + "read_only = true\n");
 
         int httpPort = freePort();
         binaryPort = freePort();
@@ -58,14 +71,20 @@ class KBlockDBClientIntegrationTest {
         server = new ProcessBuilder(
                 binary.toString(),
                 "--data-dir", dataDir.toString(),
-                "--http-addr", "127.0.0.1:" + httpPort,
-                "--binary-addr", "127.0.0.1:" + binaryPort,
+                "--http-port", Integer.toString(httpPort),
+                "--binary-port", Integer.toString(binaryPort),
                 "--config", configPath.toString())
                 .redirectOutput(ProcessBuilder.Redirect.DISCARD)
                 .redirectError(ProcessBuilder.Redirect.INHERIT)
                 .start();
 
         waitUntilReady(binaryPort);
+
+        // The server auto-creates nothing: every test below needs at least
+        // one database to exist first.
+        try (KBlockDBClient bootstrap = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD, DB)) {
+            bootstrap.createDatabase(DB);
+        }
     }
 
     @AfterAll
@@ -84,11 +103,17 @@ class KBlockDBClientIntegrationTest {
         }
     }
 
+    private static KBlockDBClient connect() throws IOException {
+        return KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD, DB);
+    }
+
     @Test
-    void connectReportsTheWorldsShape() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+    void connectReportsTheDatabasesShape() throws IOException {
+        try (KBlockDBClient client = connect()) {
+            assertTrue(client.databaseSelected());
             assertEquals(3, client.axes());
             assertEquals(10_000L, client.worldDim());
+            assertEquals(32L, client.chunkDim());
             assertFalse(client.isReadOnly());
         }
     }
@@ -96,12 +121,46 @@ class KBlockDBClientIntegrationTest {
     @Test
     void connectWithTheWrongPasswordIsUnauthorized() {
         assertThrows(UnauthorizedException.class,
-                () -> KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", "wrong"));
+                () -> KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", "wrong", DB));
+    }
+
+    @Test
+    void connectingToAnUnknownDatabaseStillAuthenticatesButSelectsNothing() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect(
+                "127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD, "no-such-database-yet")) {
+            assertFalse(client.databaseSelected());
+            assertEquals(0, client.axes());
+            assertEquals(0L, client.worldDim());
+
+            // Data ops fail until a database is actually selected.
+            assertThrows(BadRequestException.class, () -> client.get(new int[] {0, 0, 0}, "k"));
+
+            // But database management doesn't need one.
+            assertTrue(client.listDatabases().contains(DB));
+        }
+    }
+
+    @Test
+    void creatingAnUnknownDatabaseThenUseDatabaseSelectsIt() throws IOException {
+        String name = "java-client-bootstrap-" + System.nanoTime();
+        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD, name)) {
+            assertFalse(client.databaseSelected());
+
+            client.createDatabase(name);
+            // Still not selected until a fresh Hello actually picks it.
+            assertThrows(BadRequestException.class, () -> client.get(new int[] {0, 0, 0}, "k"));
+
+            client.useDatabase(name);
+            assertTrue(client.databaseSelected());
+            assertEquals(Optional.empty(), client.get(new int[] {0, 0, 0}, "k"));
+
+            assertTrue(client.removeDatabase(name));
+        }
     }
 
     @Test
     void setThenGetThenRemoveRoundTripsThroughARealConnection() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] coord = {1, 2, 3};
 
             client.set(coord, "material", new Value.Str("stone"));
@@ -114,7 +173,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void negativeCoordinatesRoundTripThroughARealConnection() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] coord = {-1, -2, -3};
 
             client.set(coord, "material", new Value.Str("stone"));
@@ -127,7 +186,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void everyValueTypeRoundTrips() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             client.set(new int[] {5, 5, 5}, "str-key", new Value.Str("air"));
             client.set(new int[] {5, 5, 6}, "i64-key", new Value.I64(-42));
             client.set(new int[] {5, 5, 7}, "f64-key", new Value.F64(2.5));
@@ -142,7 +201,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void getWithMetaOfAFreshSetReportsVersionZero() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] coord = {2, 2, 2};
             client.set(coord, "material", new Value.Str("stone"));
 
@@ -156,7 +215,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void getWithMetaReportsAnIncrementingVersionAndStableCreatedAt() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] coord = {3, 3, 3};
             client.set(coord, "material", new Value.Str("stone"));
             ValueWithMeta first = client.getWithMeta(coord, "material").orElseThrow();
@@ -173,14 +232,14 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void getWithMetaOfANeverSetCellIsEmpty() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             assertEquals(Optional.empty(), client.getWithMeta(new int[] {9, 9, 9}, "never-set"));
         }
     }
 
     @Test
     void aWrongAxisCountCoordinateIsABadRequestNotAClosedConnection() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             assertThrows(BadRequestException.class, () -> client.get(new int[] {1, 2}, "material"));
 
             // The connection must still be usable after that.
@@ -189,12 +248,10 @@ class KBlockDBClientIntegrationTest {
     }
 
     @Test
-    void healthReportsTheWorldShapeAndServerTime() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+    void healthReportsTheDatabaseCountAndServerTime() throws IOException {
+        try (KBlockDBClient client = connect()) {
             Health health = client.health();
-            assertEquals(3, health.axes());
-            assertEquals(10_000, health.worldDim());
-            assertEquals(32, health.chunkDim());
+            assertTrue(health.databaseCount() >= 1);
             assertTrue(health.timestamp() > 0);
             // Which hostname the test machine has isn't knowable here;
             // that one was reported at all is.
@@ -204,7 +261,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void statsReportsPersistedData() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             client.set(new int[] {30, 30, 30}, "stats-key", new Value.I64(1));
             Stats stats = client.stats();
             assertTrue(stats.totalChunks() > 0);
@@ -214,7 +271,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void regionApisSetGetAndRemoveValues() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] origin = {40, 40, 40};
             int[] extent = {2, 1, 1};
             client.setRegion(origin, extent, "region-key", List.of(new Value.I64(1), new Value.I64(2)));
@@ -231,7 +288,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void queryReturnsRowsAndAffectedCellCounts() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             assertEquals(
                     new QueryResult.Affected(2),
                     client.query("SET (query_key = 7) IN (50,50,50) TO (52,51,51)"));
@@ -241,6 +298,56 @@ class KBlockDBClientIntegrationTest {
             assertEquals(2, rows.totalRows());
             assertEquals(List.of(50, 50, 50), rows.rows().get(0).coord());
             assertEquals(new Value.I64(7), rows.rows().get(0).values().get(0).value());
+        }
+    }
+
+    // --- Database management ---
+
+    @Test
+    void createListAndRemoveDatabaseRoundTripThroughARealConnection() throws IOException {
+        String name = "java-client-db-" + System.nanoTime();
+        try (KBlockDBClient client = connect()) {
+            client.createDatabase(name);
+            assertTrue(client.listDatabases().contains(name));
+
+            assertThrows(ConflictException.class, () -> client.createDatabase(name));
+
+            assertTrue(client.removeDatabase(name));
+            assertFalse(client.listDatabases().contains(name));
+        }
+    }
+
+    @Test
+    void removingAnUnknownDatabaseReturnsFalse() throws IOException {
+        try (KBlockDBClient client = connect()) {
+            assertFalse(client.removeDatabase("java-client-no-such-database"));
+        }
+    }
+
+    @Test
+    void twoDatabasesAreIsolatedFromEachOther() throws IOException {
+        String other = "java-client-isolated-" + System.nanoTime();
+        try (KBlockDBClient client = connect()) {
+            client.createDatabase(other);
+            client.set(new int[] {0, 0, 0}, "iso-key", new Value.I64(1));
+
+            client.useDatabase(other);
+            assertEquals(Optional.empty(), client.get(new int[] {0, 0, 0}, "iso-key"));
+
+            client.useDatabase(DB);
+            assertEquals(Optional.of(new Value.I64(1)), client.get(new int[] {0, 0, 0}, "iso-key"));
+
+            client.removeDatabase(other);
+        }
+    }
+
+    @Test
+    void aReadOnlyAccountCanListButNotCreateOrRemoveDatabases() throws IOException {
+        try (KBlockDBClient client = KBlockDBClient.connect(
+                "127.0.0.1", binaryPort, "viewer", VIEWER_PASSWORD, DB)) {
+            assertTrue(client.listDatabases().contains(DB));
+            assertThrows(ForbiddenException.class, () -> client.createDatabase("java-client-ro-" + System.nanoTime()));
+            assertThrows(ForbiddenException.class, () -> client.removeDatabase(DB));
         }
     }
 
@@ -297,7 +404,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void addListAndRemoveColumnsRoundTripThroughARealConnection() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             client.addColumn("java-client-column", ValueType.I64);
             assertTrue(client.columns().contains(new Column("java-client-column", ValueType.I64)));
 
@@ -313,14 +420,14 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void removingAColumnThatDoesntExistReturnsFalse() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             assertFalse(client.removeColumn("java-client-no-such-column"));
         }
     }
 
     @Test
     void writingACellCreatesItsColumnAndRemovingTheColumnDropsItsValues() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             int[] coord = {7, 7, 7};
             client.set(coord, "java-client-implicit", new Value.Str("stone"));
             assertTrue(client.columns().contains(new Column("java-client-implicit", ValueType.STR)));
@@ -332,7 +439,7 @@ class KBlockDBClientIntegrationTest {
 
     @Test
     void aRemovedColumnCanComeBackWithADifferentType() throws IOException {
-        try (KBlockDBClient client = KBlockDBClient.connect("127.0.0.1", binaryPort, "admin", ADMIN_PASSWORD)) {
+        try (KBlockDBClient client = connect()) {
             client.addColumn("java-client-retyped", ValueType.STR);
             assertTrue(client.removeColumn("java-client-retyped"));
 

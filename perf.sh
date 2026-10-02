@@ -1,2 +1,1 @@
-
-target/release/kblockdbperf
+target/release/kblockdbperf --db perf

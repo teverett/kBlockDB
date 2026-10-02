@@ -33,7 +33,27 @@ struct Args {
     keep_data_dir: bool,
     user: String,
     password: Option<String>,
+    /// The one database this run targets -- created (or reused, if it
+    /// already exists) before any scenario runs, since kblockdbserver never
+    /// creates a database implicitly. Required: there's deliberately no
+    /// default, matching the server's "every request must name a database"
+    /// model.
+    db: Option<String>,
 }
+
+/// The shape this tool creates its target database with, when it doesn't
+/// already exist -- mirrors `kblockdblib::AXES`/`WORLD_DIM`/
+/// `DEFAULT_CHUNK_DIM`, duplicated as literals (not a dependency) since
+/// kblockdbperf deliberately treats kblockdbserver as a black box over
+/// HTTP/the binary protocol, never linking `kblockdblib` directly. Also
+/// used directly as the `axes`/`world_dim` scenarios build coordinates
+/// against, since a database's shape is no longer reported back by
+/// `/rest/health` (a server can manage many databases, each its own
+/// shape) -- this tool already knows it, because it's the one that chose
+/// it.
+const TARGET_AXES: usize = 3;
+const TARGET_WORLD_DIM: u32 = 10_000;
+const TARGET_CHUNK_SIZE: u32 = 32;
 
 impl Default for Args {
     fn default() -> Args {
@@ -53,6 +73,7 @@ impl Default for Args {
             keep_data_dir: false,
             user: "admin".to_string(),
             password: None,
+            db: None,
         }
     }
 }
@@ -102,6 +123,7 @@ fn parse_args() -> Args {
             "--keep-data-dir" => args.keep_data_dir = true,
             "--user" => args.user = expect_value(&mut it, "--user"),
             "--password" => args.password = Some(expect_value(&mut it, "--password")),
+            "--db" => args.db = Some(expect_value(&mut it, "--db")),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -112,6 +134,11 @@ fn parse_args() -> Args {
                 std::process::exit(1);
             }
         }
+    }
+    if args.db.is_none() {
+        eprintln!("--db is required -- every kblockdbserver request must name a database\n");
+        print_help();
+        std::process::exit(1);
     }
     args
 }
@@ -181,6 +208,10 @@ fn print_help() {
          --password <pw>          Password for --user. Required with --url (kblockdbserver\n                              \
          requires login). When spawning an instance, defaults to a random\n                              \
          per-run password used for both the spawned config and the client\n    \
+         --db <name>              Required. The database this run targets -- created\n                              \
+         (shaped axes={}, world_dim={}, chunk_size={}) if it doesn't\n                              \
+         already exist, reused otherwise. Same database name for\n                              \
+         repeat runs reuses whatever data they left behind.\n    \
          -h, --help               Print this help",
         default.port,
         fmt_list(&default.concurrency),
@@ -189,6 +220,9 @@ fn print_help() {
         fmt_list(&default.region_edges),
         default.region_reps,
         SCENARIO_NAMES.join(", "),
+        TARGET_AXES,
+        TARGET_WORLD_DIM,
+        TARGET_CHUNK_SIZE,
     );
 }
 
@@ -230,6 +264,8 @@ async fn main() {
     let binary_target_addr: Option<String>;
     let binary_user: String;
     let binary_password: String;
+    // Checked by `parse_args` already -- `args.db` is always `Some` here.
+    let db = args.db.clone().expect("--db is required");
 
     if let Some(url) = args.url.clone() {
         let password = args.password.clone().unwrap_or_else(|| {
@@ -241,7 +277,7 @@ async fn main() {
         binary_target_addr = args.binary_addr.clone();
         binary_user = args.user.clone();
         binary_password = password.clone();
-        client = Client::new(url, args.user.clone(), password);
+        client = Client::new(url, args.user.clone(), password, db.clone());
         println!("targeting existing instance\n");
     } else {
         let bin = args
@@ -292,7 +328,7 @@ async fn main() {
         binary_target_addr = server.binary_addr.clone();
         binary_user = "admin".to_string();
         binary_password = admin_password.clone();
-        client = Client::new(server.url.clone(), "admin", admin_password);
+        client = Client::new(server.url.clone(), "admin", admin_password, db.clone());
         _server = Some(server);
         _data_dir = Some(TempDataDir {
             path: data_dir,
@@ -301,14 +337,24 @@ async fn main() {
     }
 
     let primary = &client;
-    let health = primary.health().await.unwrap_or_else(|| {
-        eprintln!("failed to query /rest/health on the target server");
-        std::process::exit(1);
-    });
-    println!(
-        "target world: axes={}, world_dim={}\n",
-        health.axes, health.world_dim
-    );
+    primary
+        .ensure_database(TARGET_AXES, TARGET_WORLD_DIM, TARGET_CHUNK_SIZE)
+        .await
+        .unwrap_or_else(|e| {
+            eprintln!("failed to create/confirm database '{db}': {e}");
+            std::process::exit(1);
+        });
+    let axes = TARGET_AXES;
+    let world_dim = TARGET_WORLD_DIM;
+    println!("target database '{db}': axes={axes}, world_dim={world_dim}");
+    if let Some(health) = primary.health().await {
+        println!(
+            "target server: hostname={}, {} database(s) total\n",
+            health.hostname, health.database_count
+        );
+    } else {
+        println!();
+    }
 
     let want_binary = SCENARIO_NAMES
         .iter()
@@ -316,7 +362,9 @@ async fn main() {
         .any(|n| args.scenarios.is_empty() || args.scenarios.iter().any(|s| s == n));
     let mut binary_client = if want_binary {
         match &binary_target_addr {
-            Some(addr) => match BinaryClient::connect(addr, &binary_user, &binary_password).await {
+            Some(addr) => match BinaryClient::connect(addr, &binary_user, &binary_password, &db)
+                .await
+            {
                 Some((client, bh)) => {
                     println!(
                         "binary protocol reachable at {addr} (axes={}, world_dim={})\n",
@@ -356,18 +404,18 @@ async fn main() {
     let want = |name: &str| run_all || args.scenarios.iter().any(|s| s == name);
 
     if want("set_cell") {
-        results.push(scenarios::set_cell(primary, health.axes, health.world_dim, args.cells).await);
+        results.push(scenarios::set_cell(primary, axes, world_dim, args.cells).await);
     }
     if want("get_cell") {
-        results.push(scenarios::get_cell(primary, health.axes, health.world_dim, args.cells).await);
+        results.push(scenarios::get_cell(primary, axes, world_dim, args.cells).await);
     }
     if want("remove_cell") {
         results
-            .push(scenarios::remove_cell(primary, health.axes, health.world_dim, args.cells).await);
+            .push(scenarios::remove_cell(primary, axes, world_dim, args.cells).await);
     }
     if want("region") {
         results.extend(
-            scenarios::region_sweep(primary, health.axes, &args.region_edges, args.region_reps)
+            scenarios::region_sweep(primary, axes, &args.region_edges, args.region_reps)
                 .await,
         );
     }
@@ -375,8 +423,8 @@ async fn main() {
         results.extend(
             scenarios::concurrency_scan(
                 primary,
-                health.axes,
-                health.world_dim,
+                axes,
+                world_dim,
                 &args.concurrency,
                 args.ops_per_client,
             )
@@ -385,24 +433,24 @@ async fn main() {
     }
     if want("contended_cell") {
         results.extend(
-            scenarios::contended_cell(primary, health.axes, &args.concurrency, args.ops_per_client)
+            scenarios::contended_cell(primary, axes, &args.concurrency, args.ops_per_client)
                 .await,
         );
     }
     if let Some(bc) = binary_client.as_mut() {
         if want("binary_set_cell") {
             results.push(
-                scenarios::binary_set_cell(bc, health.axes, health.world_dim, args.cells).await,
+                scenarios::binary_set_cell(bc, axes, world_dim, args.cells).await,
             );
         }
         if want("binary_get_cell") {
             results.push(
-                scenarios::binary_get_cell(bc, health.axes, health.world_dim, args.cells).await,
+                scenarios::binary_get_cell(bc, axes, world_dim, args.cells).await,
             );
         }
         if want("binary_remove_cell") {
             results.push(
-                scenarios::binary_remove_cell(bc, health.axes, health.world_dim, args.cells).await,
+                scenarios::binary_remove_cell(bc, axes, world_dim, args.cells).await,
             );
         }
     }

@@ -1,9 +1,10 @@
 //! `kblockdbcli` -- a command-line client for kblockdbserver's REST API: get, set,
 //! and remove a single cell's value for a key, plus `query` for the
-//! `SELECT`/`SET`/`UPDATE`/`DELETE` query language over `POST /rest/query`.
-//! A thin wrapper over HTTP Basic Auth and those two endpoints, nothing
-//! more (see kblockdbserver's README section for the fuller API this could
-//! grow into covering, e.g. `/rest/regions`).
+//! `SELECT`/`SET`/`UPDATE`/`DELETE` query language over `POST
+//! /rest/db/{db}/query`, plus managing which databases exist on the server.
+//! A thin wrapper over HTTP Basic Auth and those endpoints, nothing more
+//! (see kblockdbserver's README section for the fuller API this could grow
+//! into covering, e.g. `/rest/db/{db}/regions`).
 
 #[cfg(test)]
 mod tests;
@@ -14,12 +15,19 @@ use std::process::ExitCode;
 /// Every command name `parse_args` accepts, for the two "expected one of"
 /// messages -- kept in one place so adding a command can't leave one of
 /// them listing a stale set.
-const COMMAND_LIST: &str = "get, set, remove, query, columns, add-column, remove-column";
+const COMMAND_LIST: &str = "get, set, remove, query, columns, add-column, remove-column, \
+     databases, create-database, remove-database";
 
 struct Args {
     url: String,
     user: String,
     password: String,
+    /// Required (and validated by `parse_args`) for every command that
+    /// operates on a specific database's data; unused by `databases`/
+    /// `create-database`/`remove-database`, which name their database
+    /// positionally instead -- see this module's doc comment and
+    /// `COMMAND_LIST`.
+    db: Option<String>,
     command: Command,
 }
 
@@ -49,6 +57,28 @@ enum Command {
     RemoveColumn {
         key: String,
     },
+    Databases,
+    CreateDatabase {
+        name: String,
+        axes: Option<usize>,
+        world_dim: Option<u32>,
+        chunk_size: Option<u32>,
+    },
+    RemoveDatabase {
+        name: String,
+    },
+}
+
+/// Every `Command` that operates on one specific database's data, and so
+/// needs `Args.db` to already be `Some` -- `parse_args` enforces this
+/// before `main` ever sees the parsed `Args`. `Databases`/`CreateDatabase`/
+/// `RemoveDatabase` aren't here: they name their database positionally
+/// instead (see this module's doc comment).
+fn command_needs_db(command: &Command) -> bool {
+    !matches!(
+        command,
+        Command::Databases | Command::CreateDatabase { .. } | Command::RemoveDatabase { .. }
+    )
 }
 
 fn main() -> ExitCode {
@@ -68,6 +98,14 @@ fn main() -> ExitCode {
         Command::Columns => run_columns(&client, &args),
         Command::AddColumn { key, value_type } => run_add_column(&client, &args, key, value_type),
         Command::RemoveColumn { key } => run_remove_column(&client, &args, key),
+        Command::Databases => run_databases(&client, &args),
+        Command::CreateDatabase {
+            name,
+            axes,
+            world_dim,
+            chunk_size,
+        } => run_create_database(&client, &args, name, *axes, *world_dim, *chunk_size),
+        Command::RemoveDatabase { name } => run_remove_database(&client, &args, name),
     };
 
     match result {
@@ -83,6 +121,10 @@ fn parse_args() -> Args {
     let mut url = "http://127.0.0.1:8080".to_string();
     let mut user = "admin".to_string();
     let mut password = std::env::var("KBLOCKDBCLI_PASSWORD").ok();
+    let mut db: Option<String> = None;
+    let mut shape_axes: Option<usize> = None;
+    let mut shape_world_dim: Option<u32> = None;
+    let mut shape_chunk_size: Option<u32> = None;
     let mut command_name: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
 
@@ -92,6 +134,13 @@ fn parse_args() -> Args {
             "--url" => url = expect_value(&mut args, "--url"),
             "--user" => user = expect_value(&mut args, "--user"),
             "--password" => password = Some(expect_value(&mut args, "--password")),
+            "--db" => db = Some(expect_value(&mut args, "--db")),
+            // Only meaningful for `create-database`; parsed globally here
+            // same as every other flag, rather than hand-rolled inside that
+            // one command's own branch below.
+            "--axes" => shape_axes = Some(expect_parsed(&mut args, "--axes")),
+            "--world-dim" => shape_world_dim = Some(expect_parsed(&mut args, "--world-dim")),
+            "--chunk-size" => shape_chunk_size = Some(expect_parsed(&mut args, "--chunk-size")),
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -155,12 +204,38 @@ fn parse_args() -> Args {
             [key] => Command::RemoveColumn { key: key.clone() },
             _ => usage_error("remove-column <key>", &positional),
         },
+        "databases" => match positional.as_slice() {
+            [] => Command::Databases,
+            _ => usage_error("databases", &positional),
+        },
+        "create-database" => match positional.as_slice() {
+            [name] => Command::CreateDatabase {
+                name: name.clone(),
+                axes: shape_axes,
+                world_dim: shape_world_dim,
+                chunk_size: shape_chunk_size,
+            },
+            _ => usage_error(
+                "create-database <name> [--axes N] [--world-dim N] [--chunk-size N]",
+                &positional,
+            ),
+        },
+        "remove-database" => match positional.as_slice() {
+            [name] => Command::RemoveDatabase { name: name.clone() },
+            _ => usage_error("remove-database <name>", &positional),
+        },
         other => {
             eprintln!("unknown command '{other}' -- expected one of: {COMMAND_LIST}\n");
             print_help();
             std::process::exit(1);
         }
     };
+
+    if command_needs_db(&command) && db.is_none() {
+        eprintln!("--db <name> is required for this command\n");
+        print_help();
+        std::process::exit(1);
+    }
 
     let password = password.unwrap_or_else(|| {
         eprintln!("--password (or the KBLOCKDBCLI_PASSWORD env var) is required\n");
@@ -172,6 +247,7 @@ fn parse_args() -> Args {
         url,
         user,
         password,
+        db,
         command,
     }
 }
@@ -179,6 +255,13 @@ fn parse_args() -> Args {
 fn expect_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
     args.next().unwrap_or_else(|| {
         eprintln!("{flag} requires a value");
+        std::process::exit(1);
+    })
+}
+
+fn expect_parsed<T: std::str::FromStr>(args: &mut impl Iterator<Item = String>, flag: &str) -> T {
+    expect_value(args, flag).parse().unwrap_or_else(|_| {
+        eprintln!("{flag} requires a numeric value");
         std::process::exit(1);
     })
 }
@@ -202,43 +285,70 @@ fn print_help() {
          set <coords> <key> <type> <value>   Set a cell's value (type: str, f64, i64, or bool)\n    \
          remove <coords> <key>               Clear a cell's value\n    \
          query <query-text>                  Run a SELECT/SET/UPDATE/DELETE query (see below)\n    \
-         columns                             List the world's schema, one `<key> <type>` per line\n    \
+         columns                             List the database's schema, one `<key> <type>` per line\n    \
          add-column <key> <type>             Create a column (type: str, f64, i64, or bool)\n    \
-         remove-column <key>                 Drop a column and every value ever written for it\n\n\
+         remove-column <key>                 Drop a column and every value ever written for it\n    \
+         databases                           List every database on the server\n    \
+         create-database <name>              Create a database (see --axes/--world-dim/\n                                              \
+         --chunk-size below to override the server's defaults)\n    \
+         remove-database <name>              Delete a database and every byte of its data\n\n\
          OPTIONS:\n    \
          --url <url>        kblockdbserver base URL (default: http://127.0.0.1:8080)\n    \
          --user <name>      Username (default: admin)\n    \
          --password <pw>    Password (or set the KBLOCKDBCLI_PASSWORD env var, so it\n                        \
          doesn't end up in shell history)\n    \
+         --db <name>        Database to operate on -- required for get/set/remove/query/\n                        \
+         columns/add-column/remove-column; not used by databases/\n                        \
+         create-database/remove-database, which name their database as a\n                        \
+         plain argument instead\n    \
+         --axes <n>         create-database only: axis count, if not the server's default\n    \
+         --world-dim <n>    create-database only: cells per axis, if not the server's default\n    \
+         --chunk-size <n>   create-database only: cells per axis within a chunk, if not the\n                        \
+         server's default\n    \
          -h, --help         Print this help\n\n\
          <coords> is a comma-separated coordinate, one i32 per axis (e.g. 1,2,3\n\
-         or -1,2,-3 -- a world's valid range is centered on zero, see the\n\
-         server's README), matching however many axes the target world was\n\
+         or -1,2,-3 -- a database's valid range is centered on zero, see the\n\
+         server's README), matching however many axes the target database was\n\
          created with.\n\n\
          EXAMPLES:\n    \
-         kblockdbcli --password change-me set 1,2,3 material str stone\n    \
-         kblockdbcli --password change-me get 1,2,3 material\n    \
-         kblockdbcli --password change-me remove 1,2,3 material\n    \
-         kblockdbcli --password change-me query \"SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'\"\n    \
-         kblockdbcli --password change-me query \"SET (material='stone') IN (0,0,0) TO (9,9,9)\"\n    \
-         kblockdbcli --password change-me query \"UPDATE (material='dirt') WHERE material = 'stone'\"\n    \
-         kblockdbcli --password change-me query \"DELETE WHERE material = 'air'\"\n    \
-         kblockdbcli --password change-me columns\n    \
-         kblockdbcli --password change-me add-column hardness f64\n    \
-         kblockdbcli --password change-me remove-column hardness\n\n\
+         kblockdbcli --password change-me create-database myapp\n    \
+         kblockdbcli --password change-me --db myapp set 1,2,3 material str stone\n    \
+         kblockdbcli --password change-me --db myapp get 1,2,3 material\n    \
+         kblockdbcli --password change-me --db myapp remove 1,2,3 material\n    \
+         kblockdbcli --password change-me --db myapp query \"SELECT * FROM (0,0,0) TO (9,9,9) WHERE material = 'stone'\"\n    \
+         kblockdbcli --password change-me --db myapp query \"SET (material='stone') IN (0,0,0) TO (9,9,9)\"\n    \
+         kblockdbcli --password change-me --db myapp query \"UPDATE (material='dirt') WHERE material = 'stone'\"\n    \
+         kblockdbcli --password change-me --db myapp query \"DELETE WHERE material = 'air'\"\n    \
+         kblockdbcli --password change-me --db myapp columns\n    \
+         kblockdbcli --password change-me --db myapp add-column hardness f64\n    \
+         kblockdbcli --password change-me --db myapp remove-column hardness\n    \
+         kblockdbcli --password change-me databases\n    \
+         kblockdbcli --password change-me remove-database myapp\n\n\
          Wrap the whole query in one shell-quoted argument -- it may contain\n\
          spaces and single-quoted string literals of its own. SET is an\n\
          upsert and requires IN <range> (it can create cells; UPDATE only\n\
-         ever changes cells that already exist). SET, UPDATE, and DELETE\n\
-         all require a non-read-only account."
+         ever changes cells that already exist). SET, UPDATE, DELETE,\n\
+         create-database, and remove-database all require a non-read-only\n\
+         account. No database is ever created implicitly -- create-database\n\
+         must run before anything else targets that --db name."
     );
 }
 
 fn cell_url(args: &Args, coords: &str, key: &str) -> String {
     format!(
-        "{}/rest/cells/{coords}/{key}",
-        args.url.trim_end_matches('/')
+        "{}/rest/db/{}/cells/{coords}/{key}",
+        args.url.trim_end_matches('/'),
+        db_name(args)
     )
+}
+
+/// `args.db`, assuming `parse_args`' `command_needs_db` check already
+/// guaranteed it's `Some` for whichever command is calling this -- every
+/// URL builder below is only ever reached by a command that needs it.
+fn db_name(args: &Args) -> &str {
+    args.db
+        .as_deref()
+        .expect("command_needs_db should have required --db before this ran")
 }
 
 fn run_get(
@@ -298,7 +408,15 @@ fn run_remove(
 }
 
 fn columns_url(args: &Args) -> String {
-    format!("{}/rest/columns", args.url.trim_end_matches('/'))
+    format!(
+        "{}/rest/db/{}/columns",
+        args.url.trim_end_matches('/'),
+        db_name(args)
+    )
+}
+
+fn databases_url(args: &Args) -> String {
+    format!("{}/rest/databases", args.url.trim_end_matches('/'))
 }
 
 fn run_columns(client: &reqwest::blocking::Client, args: &Args) -> Result<(), String> {
@@ -367,7 +485,7 @@ fn run_remove_column(
     check_success(resp)
 }
 
-/// The body of `PUT /rest/columns/{key}` (kblockdbserver's
+/// The body of `PUT /rest/db/{db}/columns/{key}` (kblockdbserver's
 /// `AddColumnBody`), validating the type name up front so a typo is a
 /// local error rather than a round trip ending in a 400.
 fn build_column_json(value_type: &str) -> Result<Json, String> {
@@ -379,9 +497,97 @@ fn build_column_json(value_type: &str) -> Result<Json, String> {
     }
 }
 
+fn run_databases(client: &reqwest::blocking::Client, args: &Args) -> Result<(), String> {
+    let resp = client
+        .get(databases_url(args))
+        .basic_auth(&args.user, Some(&args.password))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    let status = resp.status();
+    let body: Json = resp
+        .json()
+        .map_err(|e| format!("couldn't parse the server's response: {e}"))?;
+    if !status.is_success() {
+        return Err(server_error_message(status, &body));
+    }
+    print_databases_response(&body)
+}
+
+/// Renders a `GET /rest/databases` response (kblockdbserver's
+/// `DatabasesResponse`) as one name per line, then a count -- same shape as
+/// `columns`'s listing, so the two read alike.
+fn print_databases_response(body: &Json) -> Result<(), String> {
+    let databases = body
+        .get("databases")
+        .and_then(Json::as_array)
+        .ok_or("response is missing 'databases'")?;
+    for database in databases {
+        let name = database.as_str().ok_or("database entry is not a string")?;
+        println!("{name}");
+    }
+    println!("{} database(s)", databases.len());
+    Ok(())
+}
+
+/// The body of `PUT /rest/databases/{name}` (kblockdbserver's
+/// `CreateDatabaseBody`): every field omitted that wasn't given on the
+/// command line, so the server falls back to its own configured defaults
+/// for whichever ones are missing.
+fn build_create_database_json(
+    axes: Option<usize>,
+    world_dim: Option<u32>,
+    chunk_size: Option<u32>,
+) -> Json {
+    let mut body = json!({});
+    if let Some(axes) = axes {
+        body["axes"] = json!(axes);
+    }
+    if let Some(world_dim) = world_dim {
+        body["world_dim"] = json!(world_dim);
+    }
+    if let Some(chunk_size) = chunk_size {
+        body["chunk_size"] = json!(chunk_size);
+    }
+    body
+}
+
+fn run_create_database(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    name: &str,
+    axes: Option<usize>,
+    world_dim: Option<u32>,
+    chunk_size: Option<u32>,
+) -> Result<(), String> {
+    let resp = client
+        .put(format!("{}/{name}", databases_url(args)))
+        .basic_auth(&args.user, Some(&args.password))
+        .json(&build_create_database_json(axes, world_dim, chunk_size))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_success(resp)
+}
+
+fn run_remove_database(
+    client: &reqwest::blocking::Client,
+    args: &Args,
+    name: &str,
+) -> Result<(), String> {
+    let resp = client
+        .delete(format!("{}/{name}", databases_url(args)))
+        .basic_auth(&args.user, Some(&args.password))
+        .send()
+        .map_err(|e| format!("request failed: {e}"))?;
+    check_success(resp)
+}
+
 fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Result<(), String> {
     let resp = client
-        .post(format!("{}/rest/query", args.url.trim_end_matches('/')))
+        .post(format!(
+            "{}/rest/db/{}/query",
+            args.url.trim_end_matches('/'),
+            db_name(args)
+        ))
         .basic_auth(&args.user, Some(&args.password))
         .json(&json!({"query": query}))
         .send()
@@ -712,5 +918,121 @@ mod unit_tests {
         assert!(print_columns_response(&json!({})).is_err());
         assert!(print_columns_response(&json!({"columns": [{"key": "material"}]})).is_err());
         assert!(print_columns_response(&json!({"columns": [{"type": "str"}]})).is_err());
+    }
+
+    // --- Multi-database support ---
+
+    fn args_with(db: Option<&str>, command: Command) -> Args {
+        Args {
+            url: "http://localhost:8080".to_string(),
+            user: "admin".to_string(),
+            password: "pw".to_string(),
+            db: db.map(str::to_string),
+            command,
+        }
+    }
+
+    #[test]
+    fn cell_url_includes_the_database_segment() {
+        let args = args_with(Some("mydb"), Command::Columns);
+        assert_eq!(
+            cell_url(&args, "1,2,3", "material"),
+            "http://localhost:8080/rest/db/mydb/cells/1,2,3/material"
+        );
+    }
+
+    #[test]
+    fn columns_url_includes_the_database_segment() {
+        let args = args_with(Some("mydb"), Command::Columns);
+        assert_eq!(
+            columns_url(&args),
+            "http://localhost:8080/rest/db/mydb/columns"
+        );
+    }
+
+    #[test]
+    fn databases_url_has_no_database_segment() {
+        let args = args_with(None, Command::Databases);
+        assert_eq!(databases_url(&args), "http://localhost:8080/rest/databases");
+    }
+
+    #[test]
+    #[should_panic(expected = "command_needs_db")]
+    fn db_name_panics_if_called_without_a_selected_database() {
+        let args = args_with(None, Command::Columns);
+        db_name(&args);
+    }
+
+    #[test]
+    fn command_needs_db_is_true_for_every_data_command() {
+        assert!(command_needs_db(&Command::Get {
+            coords: "0".into(),
+            key: "k".into()
+        }));
+        assert!(command_needs_db(&Command::Set {
+            coords: "0".into(),
+            key: "k".into(),
+            value_type: "str".into(),
+            value: "v".into()
+        }));
+        assert!(command_needs_db(&Command::Remove {
+            coords: "0".into(),
+            key: "k".into()
+        }));
+        assert!(command_needs_db(&Command::Query {
+            query: "SELECT *".into()
+        }));
+        assert!(command_needs_db(&Command::Columns));
+        assert!(command_needs_db(&Command::AddColumn {
+            key: "k".into(),
+            value_type: "str".into()
+        }));
+        assert!(command_needs_db(&Command::RemoveColumn { key: "k".into() }));
+    }
+
+    #[test]
+    fn command_needs_db_is_false_for_every_database_management_command() {
+        assert!(!command_needs_db(&Command::Databases));
+        assert!(!command_needs_db(&Command::CreateDatabase {
+            name: "x".into(),
+            axes: None,
+            world_dim: None,
+            chunk_size: None,
+        }));
+        assert!(!command_needs_db(&Command::RemoveDatabase { name: "x".into() }));
+    }
+
+    #[test]
+    fn build_create_database_json_with_no_overrides_is_an_empty_object() {
+        assert_eq!(build_create_database_json(None, None, None), json!({}));
+    }
+
+    #[test]
+    fn build_create_database_json_includes_only_the_given_overrides() {
+        assert_eq!(
+            build_create_database_json(Some(4), None, Some(16)),
+            json!({"axes": 4, "chunk_size": 16})
+        );
+        assert_eq!(
+            build_create_database_json(Some(3), Some(10_000), Some(32)),
+            json!({"axes": 3, "world_dim": 10_000, "chunk_size": 32})
+        );
+    }
+
+    #[test]
+    fn print_databases_response_accepts_a_list_of_names() {
+        let body = json!({"databases": ["a", "b"]});
+        assert!(print_databases_response(&body).is_ok());
+    }
+
+    #[test]
+    fn print_databases_response_accepts_an_empty_list() {
+        assert!(print_databases_response(&json!({"databases": []})).is_ok());
+    }
+
+    #[test]
+    fn print_databases_response_rejects_an_unrecognized_shape() {
+        assert!(print_databases_response(&json!({})).is_err());
+        assert!(print_databases_response(&json!({"databases": [1]})).is_err());
     }
 }

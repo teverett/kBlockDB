@@ -1,13 +1,33 @@
 # Java client
 
 `client/java` contains `KBlockDBClient`, a dependency-free Java 17 client
-for kBlockDB's binary protocol. It covers the full API surface: health,
-stats, single-cell operations, region operations, and
+for kBlockDB's binary protocol. It covers the full API surface: database
+management, health, stats, single-cell operations, region operations, and
 `SELECT`/`SET`/`UPDATE`/`DELETE` queries.
 
-Each client instance owns one authenticated TCP connection. Calls are
-strictly ordered and the client is not thread-safe; use one client per
-concurrent connection.
+Each client instance owns one authenticated TCP connection that selects
+one database for its whole life. Calls are strictly ordered and the client
+is not thread-safe; use one client per concurrent connection.
+
+`connect()` always names a database. If it doesn't exist yet, the
+connection still authenticates (`databaseSelected()` is `false`, and
+`axes()`/`worldDim()`/`chunkDim()` are meaningless `0`s), but every data
+call (`get`, `set`, `query`, ...) gets a `BadRequestException` from the
+server until the database is created (`createDatabase`, which needs no
+selected database) and then selected on this same connection
+(`useDatabase`, which re-sends `Hello` with the credentials `connect` was
+given):
+
+```java
+try (KBlockDBClient db =
+        KBlockDBClient.connect("localhost", 8081, "admin", "change-me", "newdb")) {
+    if (!db.databaseSelected()) {
+        db.createDatabase("newdb");
+        db.useDatabase("newdb");
+    }
+    // ... db.set(...), db.get(...), ...
+}
+```
 
 ## Build
 
@@ -41,7 +61,12 @@ import java.util.List;
 import java.util.Optional;
 
 try (KBlockDBClient db =
-        KBlockDBClient.connect("localhost", 8081, "admin", "change-me")) {
+        KBlockDBClient.connect("localhost", 8081, "admin", "change-me", "demo")) {
+    if (!db.databaseSelected()) {
+        db.createDatabase("demo");
+        db.useDatabase("demo");
+    }
+
     Health health = db.health();
     Stats stats = db.stats();
 
@@ -74,10 +99,15 @@ try (KBlockDBClient db =
 
 | Method | Result | Description |
 |---|---|---|
-| `connect(host, port, username, password)` | `KBlockDBClient` | Connects and authenticates. |
-| `reauthenticate(username, password)` | `void` | Changes the account on the existing connection. |
-| `health()` | `Health` | Returns the server's `hostname`, the world's shape (`axes`, `worldDim`, `chunkDim`), and the server `timestamp`. |
-| `stats()` | `Stats` | Returns live on-disk chunk, byte, and block totals. |
+| `connect(host, port, username, password, database)` | `KBlockDBClient` | Connects, authenticates, and selects `database` (see above if it doesn't exist yet). |
+| `reauthenticate(username, password)` | `void` | Changes the account on the existing connection, keeping the selected database. |
+| `useDatabase(name)` | `void` | Selects a different database on the existing connection, reusing the cached credentials. |
+| `databaseSelected()` | `boolean` | Whether this connection currently has a database selected. |
+| `listDatabases()` | `List<String>` | Every database the server manages, sorted by name. Needs no selected database. |
+| `createDatabase(name)` | `void` | Creates a database with the server's default shape. Needs no selected database. (No way to override the shape over this protocol -- use the REST API's `PUT /rest/databases/{name}` for that.) |
+| `removeDatabase(name)` | `boolean` | Deletes a database and all its data; `false` if it didn't exist. |
+| `health()` | `Health` | Returns the server's `hostname`, `databaseCount`, and `timestamp`. Needs no selected database. |
+| `stats()` | `Stats` | Returns live on-disk chunk, byte, and block totals for the selected database. |
 | `get(coord, key)` | `Optional<Value>` | Reads one value. |
 | `getWithMeta(coord, key)` | `Optional<ValueWithMeta>` | Reads one value with timestamps and version. |
 | `set(coord, key, value)` | `void` | Writes one value. |
@@ -86,16 +116,23 @@ try (KBlockDBClient db =
 | `setRegion(origin, extent, key, values)` | `void` | Writes a region in axis-0-fastest order. |
 | `removeRegion(origin, extent, key)` | `void` | Clears a key throughout a region. |
 | `query(query)` | `QueryResult` | Executes any query-language statement. |
-| `columns()` | `List<Column>` | Lists the world's schema, sorted by key. |
+| `columns()` | `List<Column>` | Lists the selected database's schema, sorted by key. |
 | `addColumn(key, valueType)` | `void` | Creates a column, fixing its type. |
 | `removeColumn(key)` | `boolean` | Drops a column and all its values; false if it didn't exist. |
+
+Every data method (everything but `connect`/`reauthenticate`/
+`useDatabase`/`listDatabases`/`createDatabase`/`removeDatabase`/`health`)
+throws `BadRequestException` from the server if no database is currently
+selected -- see the bootstrap flow above. Unlike the Python client, this
+is a server round trip, not a client-side pre-check; call
+`databaseSelected()` first if you want to avoid it.
 
 `ValueType` names those same four types without a value attached, and is
 what a `Column` carries. `addColumn` only ever creates -- re-adding an
 existing key throws `ConflictException` rather than changing its type --
 and `removeColumn` drops every value ever written for the key, across the
-whole world. See the [server's notes](kblockdbserver.md#columns) for the
-details.
+whole database. See the [server's notes](kblockdbserver.md#columns) for
+the details.
 
 `Value` has `Str`, `F64`, `I64`, and `Bool` variants. A `SELECT` returns
 `QueryResult.Rows`; mutating statements return `QueryResult.Affected`.
@@ -112,7 +149,7 @@ All server and protocol errors extend `IOException`:
 - `ForbiddenException` reports a write attempted through a read-only
   account.
 - `ConflictException` reports an `addColumn` for a key that already has a
-  column.
+  column, or a `createDatabase` for a name that already exists.
 - `InternalErrorException` reports a server-side storage failure.
 - `ProtocolException` reports malformed or incompatible wire data.
 

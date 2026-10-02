@@ -59,11 +59,12 @@ class WireTest {
 
     @Test
     void encodeHelloProducesTheDocumentedByteLayout() throws IOException {
-        byte[] payload = Wire.encodeHello("admin", "hi");
+        byte[] payload = Wire.encodeHello("admin", "hi", "mydb");
         byte[] expected = {
                 0x00,
                 5, 'a', 'd', 'm', 'i', 'n',
                 2, 'h', 'i',
+                4, 'm', 'y', 'd', 'b',
         };
         assertArrayEquals(expected, payload);
     }
@@ -194,7 +195,18 @@ class WireTest {
     @Test
     void encodeHelloRejectsAUsernameOverTheLengthLimit() {
         String tooLong = "u".repeat(256);
-        assertThrows(IllegalArgumentException.class, () -> Wire.encodeHello(tooLong, "pw"));
+        assertThrows(IllegalArgumentException.class, () -> Wire.encodeHello(tooLong, "pw", "db"));
+    }
+
+    @Test
+    void encodesDatabaseManagementRequests() throws IOException {
+        assertArrayEquals(new byte[] {0x0D}, Wire.encodeListDatabases());
+        assertArrayEquals(
+                new byte[] {0x0E, 2, 0, 'd', 'b'},
+                Wire.encodeCreateDatabase("db"));
+        assertArrayEquals(
+                new byte[] {0x0F, 2, 0, 'd', 'b'},
+                Wire.encodeRemoveDatabase("db"));
     }
 
     @Test
@@ -264,24 +276,43 @@ class WireTest {
     void decodesHelloOk() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(0); // read_only = false
+        buf.write(1); // database_selected = true
         buf.write(3);
         Wire.writeU32(buf, 10_000);
-        buf.write(0);
+        Wire.writeU32(buf, 32);
 
         Wire.Response response = Wire.decodeResponse(buf.toByteArray());
-        assertEquals(new Wire.HelloOk(3, 10_000L, false), response);
+        assertEquals(
+                new Wire.HelloOk(false, Optional.of(new Wire.DatabaseShape(3, 10_000L, 32L))),
+                response);
     }
 
     @Test
     void decodesHelloOkReportingAReadOnlyAccount() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
+        buf.write(1); // read_only = true
+        buf.write(1); // database_selected = true
         buf.write(4);
         Wire.writeU32(buf, 1);
-        buf.write(1);
+        Wire.writeU32(buf, 1);
 
         Wire.Response response = Wire.decodeResponse(buf.toByteArray());
-        assertEquals(new Wire.HelloOk(4, 1L, true), response);
+        assertEquals(
+                new Wire.HelloOk(true, Optional.of(new Wire.DatabaseShape(4, 1L, 1L))),
+                response);
+    }
+
+    @Test
+    void decodesHelloOkWithNoDatabaseSelected() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x00);
+        buf.write(0); // read_only = false
+        buf.write(0); // database_selected = false -- no shape fields follow
+
+        Wire.Response response = Wire.decodeResponse(buf.toByteArray());
+        assertEquals(new Wire.HelloOk(false, Optional.empty()), response);
     }
 
     @Test
@@ -329,15 +360,13 @@ class WireTest {
     void decodesHealthResponse() throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x08);
-        buf.write(3);
-        Wire.writeU32(buf, 10_000);
-        Wire.writeU32(buf, 32);
         writeU64(buf, 123);
+        Wire.writeU32(buf, 2);
         byte[] hostname = "db-1.example.com".getBytes(StandardCharsets.UTF_8);
         Wire.writeU16(buf, hostname.length);
         buf.write(hostname);
         assertEquals(
-                new Wire.HealthResp(new Health("db-1.example.com", 3, 10_000, 32, 123)),
+                new Wire.HealthResp(new Health("db-1.example.com", 2, 123)),
                 Wire.decodeResponse(buf.toByteArray()));
     }
 
@@ -347,10 +376,8 @@ class WireTest {
         // pre-hostname format would stop exactly here.
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x08);
-        buf.write(3);
-        Wire.writeU32(buf, 10_000);
-        Wire.writeU32(buf, 32);
         writeU64(buf, 123);
+        Wire.writeU32(buf, 2);
         assertThrows(ProtocolException.class, () -> Wire.decodeResponse(buf.toByteArray()));
     }
 
@@ -433,8 +460,9 @@ class WireTest {
 
     @Test
     void decodeResponseRejectsATruncatedPayload() {
-        // HelloOk promising axes/world_dim/read_only, but cut off after axes.
-        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(new byte[] {0x00, 3}));
+        // HelloOk promising a selected database's shape, but cut off after
+        // read_only/database_selected.
+        assertThrows(ProtocolException.class, () -> Wire.decodeResponse(new byte[] {0x00, 0, 1}));
     }
 
     @Test
@@ -486,6 +514,28 @@ class WireTest {
         Wire.writeU16(buf, message.length);
         buf.write(message);
         assertEquals(new Wire.Conflict("already exists"), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesDatabasesResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0E);
+        Wire.writeU32(buf, 2);
+        byte[] a = "a".getBytes(StandardCharsets.UTF_8);
+        Wire.writeU16(buf, a.length);
+        buf.write(a);
+        byte[] b = "b".getBytes(StandardCharsets.UTF_8);
+        Wire.writeU16(buf, b.length);
+        buf.write(b);
+        assertEquals(new Wire.Databases(List.of("a", "b")), Wire.decodeResponse(buf.toByteArray()));
+    }
+
+    @Test
+    void decodesAnEmptyDatabasesResponse() throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0E);
+        Wire.writeU32(buf, 0);
+        assertEquals(new Wire.Databases(List.of()), Wire.decodeResponse(buf.toByteArray()));
     }
 
     @Test

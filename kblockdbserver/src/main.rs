@@ -170,7 +170,8 @@ fn expect_value(args: &mut impl Iterator<Item = String>, flag: &str) -> String {
 
 fn print_help() {
     println!(
-        "kblockdbserver -- a RESTful HTTP front end for the kblockdblib storage engine\n\n\
+        "kblockdbserver -- a RESTful HTTP front end for the kblockdblib storage engine,\n\
+         managing any number of independent databases under one data directory\n\n\
          USAGE:\n    kblockdbserver [OPTIONS]\n\n\
          OPTIONS:\n    \
          --config <path>      Config file (default: ./kblockdbserver.toml). Required --\n                          \
@@ -193,10 +194,16 @@ fn print_help() {
          [[users]]\n                          \
          username = \"alice\"\n                          \
          password = \"alice-password\"\n    \
-         --data-dir <path>    World data directory (default: ./data)\n    \
-         --axes <n>           Axis count for a brand-new world (default: {})\n    \
-         --world-dim <n>      Cells per axis for a brand-new world (default: {})\n    \
-         --chunk-size <n>     Cells per axis within a chunk, for a brand-new world\n                          \
+         --data-dir <path>    Data directory; each database is its own subdirectory\n                          \
+         of this one (default: ./data). No database is created\n                          \
+         automatically -- see PUT /rest/databases/{{name}} (or the\n                          \
+         binary protocol's CreateDatabase)\n    \
+         --axes <n>           Axis count for a brand-new database, when none is given\n                          \
+         explicitly at creation time (default: {})\n    \
+         --world-dim <n>      Cells per axis for a brand-new database, same default-only\n                          \
+         rule as --axes (default: {})\n    \
+         --chunk-size <n>     Cells per axis within a chunk, for a brand-new database,\n                          \
+         same default-only rule as --axes\n                          \
          (default: {}; see kblockdblib::DEFAULT_CHUNK_DIM -- a\n                          \
          bigger chunk means fewer, larger chunk files, so more\n                          \
          bytes rewritten per single-cell write but less filesystem\n                          \
@@ -208,30 +215,31 @@ fn print_help() {
          port, which the startup banner then reports.\n    \
          --binary-port <port> Also listen on this port for the binary protocol (see\n                          \
          wire.rs and the README's \"Binary protocol\" section) --\n                          \
-         disabled unless given; same World, same accounts as the\n                          \
+         disabled unless given; same databases, same accounts as the\n                          \
          REST API, just without HTTP/JSON overhead\n    \
          --max-concurrent-disk-ops <n>\n                          \
-         Cap on concurrent filesystem operations\n                          \
-         (default: {}; see kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS --\n                          \
-         the right number depends on your filesystem/storage;\n                          \
-         measure it with kblockdbperf's concurrency_scan)\n    \
+         Cap on concurrent filesystem operations, applied to every\n                          \
+         database (default: {}; see\n                          \
+         kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS -- the right\n                          \
+         number depends on your filesystem/storage; measure it with\n                          \
+         kblockdbperf's concurrency_scan)\n    \
          --max-cached-chunks <n>\n                          \
          Cap on distinct chunks kept in the write-through cache at\n                          \
-         once, LRU-evicted beyond that (default: {}; see\n                          \
-         kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
+         once, per database, LRU-evicted beyond that (default: {};\n                          \
+         see kblockdblib::DEFAULT_MAX_CACHED_CHUNKS -- 0 disables the\n                          \
          cache's benefit without disabling the server)\n    \
          -h, --help           Print this help\n\n\
          hostname (config file only) overrides what /rest/health reports as this\n\
          instance's name; it defaults to the OS hostname.\n\n\
          compression (config file only, default false) zstd-compresses every chunk\n\
-         file the server writes. It can be turned on or off on an existing world at\n\
-         any time: each chunk file records its own encoding, so a world may hold a\n\
-         mix, and existing files are only re-encoded when their chunk is next\n\
-         written.\n\n\
-         --axes/--world-dim/--chunk-size only matter the first time a world is\n\
-         created at --data-dir; reopening an existing one reads its real shape\n\
-         from its world.txt and ignores these flags (World::open does, not\n\
-         create).\n\n\
+         file the server writes, for every database. It can be turned on or off at any\n\
+         time: each chunk file records its own encoding, so a database may hold a mix,\n\
+         and existing files are only re-encoded when their chunk is next written.\n\n\
+         --axes/--world-dim/--chunk-size only matter for a database created without an\n\
+         explicit shape of its own (an empty PUT /rest/databases/{{name}} body, or the\n\
+         binary protocol's CreateDatabase, which has no way to override them at all);\n\
+         reopening an existing database reads its real shape from its own world.txt and\n\
+         ignores these flags.\n\n\
          Every REST endpoint except /health requires HTTP Basic Auth against\n\
          an account from the config file (admin_password, or a [[users]] entry).\n\
          admin_password/users are config-file-only -- never CLI flags -- so\n\
@@ -284,33 +292,45 @@ async fn main() {
         .or(config.max_concurrent_disk_ops);
     let max_cached_chunks = args.max_cached_chunks.or(config.max_cached_chunks);
 
-    let mut world = kblockdblib::World::create(&data_dir, axes, world_dim, chunk_size)
-        .unwrap_or_else(|e| {
-            eprintln!("failed to open world at {data_dir}: {e}");
-            std::process::exit(1);
-        })
-        .with_compression(config.compression);
-    if let Some(n) = max_concurrent_disk_ops {
-        world = world.with_max_concurrent_disk_ops(n);
-    }
-    if let Some(n) = max_cached_chunks {
-        world = world.with_max_cached_chunks(n);
-    }
+    let default_shape = state::WorldShape {
+        axes,
+        world_dim,
+        chunk_dim: chunk_size,
+    };
+    let databases = state::Databases::new(&data_dir, default_shape)
+        .with_compression(config.compression)
+        .with_max_concurrent_disk_ops(max_concurrent_disk_ops)
+        .with_max_cached_chunks(max_cached_chunks);
+    let existing = databases.list().unwrap_or_else(|e| {
+        eprintln!("failed to read data directory {data_dir}: {e}");
+        std::process::exit(1);
+    });
     let credentials = config.credentials();
     println!(
-        "kblockdbserver: world at {data_dir} (axes={}, world_dim={}, chunk_size={}, \
-         max_concurrent_disk_ops={}, max_cached_chunks={}, compression={}), \
-         {} account(s) configured",
-        world.axes(),
-        world.world_dim(),
-        world.chunk_dim(),
-        world.max_concurrent_disk_ops(),
-        world.max_cached_chunks(),
-        world.compression(),
-        credentials.len()
+        "kblockdbserver: data dir {data_dir} ({} existing database(s): {}), default shape for a \
+         new database: axes={default_shape_axes}, world_dim={default_shape_world_dim}, \
+         chunk_size={default_shape_chunk_dim}, max_concurrent_disk_ops={}, \
+         max_cached_chunks={}, compression={}, {} account(s) configured",
+        existing.len(),
+        if existing.is_empty() {
+            "none".to_string()
+        } else {
+            existing.join(", ")
+        },
+        max_concurrent_disk_ops
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| kblockdblib::DEFAULT_MAX_CONCURRENT_DISK_OPS.to_string()),
+        max_cached_chunks
+            .map(|n| n.to_string())
+            .unwrap_or_else(|| kblockdblib::DEFAULT_MAX_CACHED_CHUNKS.to_string()),
+        config.compression,
+        credentials.len(),
+        default_shape_axes = default_shape.axes,
+        default_shape_world_dim = default_shape.world_dim,
+        default_shape_chunk_dim = default_shape.chunk_dim,
     );
 
-    let mut state = AppState::new(world, std::sync::Arc::new(credentials));
+    let mut state = AppState::new(databases, std::sync::Arc::new(credentials));
     if let Some(hostname) = config.hostname.clone() {
         state = state.with_hostname(hostname);
     }
@@ -353,9 +373,9 @@ async fn main() {
         .map(base_url)
         .unwrap_or_else(|_| base_url(http_addr));
     println!("kblockdbserver listening on {base}");
-    println!("  data browser  {base}/");
-    println!("  health API    {base}/rest/health");
-    println!("  stats API     {base}/rest/stats");
+    println!("  data browser    {base}/");
+    println!("  health API      {base}/rest/health");
+    println!("  databases API   {base}/rest/databases");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

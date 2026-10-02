@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 import java.util.Optional;
 
 /**
@@ -190,11 +191,12 @@ final class Wire {
 
     // --- Requests (client -> server) ---
 
-    static byte[] encodeHello(String username, String password) throws IOException {
+    static byte[] encodeHello(String username, String password, String database) throws IOException {
         ByteArrayOutputStream buf = new ByteArrayOutputStream();
         buf.write(0x00);
         writeShortString(buf, username);
         writeShortString(buf, password);
+        writeShortString(buf, database);
         return buf.toByteArray();
     }
 
@@ -291,12 +293,49 @@ final class Wire {
         return buf.toByteArray();
     }
 
+    static byte[] encodeListDatabases() {
+        return new byte[] {0x0D};
+    }
+
+    /**
+     * Always uses the server's configured default shape -- there's no way
+     * to override axes/world_dim/chunk_size over this protocol (unlike the
+     * REST API's {@code PUT /rest/databases/{name}}, which accepts an
+     * optional shape in its body).
+     */
+    static byte[] encodeCreateDatabase(String name) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0E);
+        writeKey(buf, name);
+        return buf.toByteArray();
+    }
+
+    static byte[] encodeRemoveDatabase(String name) throws IOException {
+        ByteArrayOutputStream buf = new ByteArrayOutputStream();
+        buf.write(0x0F);
+        writeKey(buf, name);
+        return buf.toByteArray();
+    }
+
     // --- Responses (server -> client) ---
 
     sealed interface Response {
     }
 
-    record HelloOk(int axes, long worldDim, boolean readOnly) implements Response {
+    /** A selected database's shape -- {@code None} on the Rust side becomes {@link Optional#empty()} here. */
+    record DatabaseShape(int axes, long worldDim, long chunkDim) {
+    }
+
+    /**
+     * @param database empty if {@code Hello}'s named database didn't exist
+     *                 yet -- the account still authenticated, but no
+     *                 database is selected for this connection until a
+     *                 later {@code Hello} (see {@link KBlockDBClient#useDatabase}) names one that exists.
+     */
+    record HelloOk(boolean readOnly, Optional<DatabaseShape> database) implements Response {
+        HelloOk {
+            Objects.requireNonNull(database, "database");
+        }
     }
 
     record Ok() implements Response {
@@ -344,12 +383,18 @@ final class Wire {
     record Conflict(String message) implements Response {
     }
 
+    record Databases(List<String> names) implements Response {
+        Databases {
+            names = List.copyOf(names);
+        }
+    }
+
     static Response decodeResponse(byte[] payload) throws ProtocolException {
         Reader r = new Reader(payload);
         int status = r.u8();
         switch (status) {
             case 0x00:
-                return new HelloOk(r.u8(), r.u32(), r.u8() != 0);
+                return helloOkOf(r);
             case 0x01:
                 return new Ok();
             case 0x02:
@@ -376,25 +421,38 @@ final class Wire {
                 return new Columns(r.columns());
             case 0x0D:
                 return new Conflict(r.message());
+            case 0x0E:
+                return new Databases(r.stringList());
             default:
                 throw new ProtocolException("unknown status 0x" + Integer.toHexString(status));
         }
     }
 
     /**
-     * {@code 0x08 Health}: {@code [u8 axes][u32 LE world_dim]
-     * [u32 LE chunk_dim][u64 LE timestamp]<hostname>}. Pulled out of the
-     * {@code switch} above so the field order reads in one place -- the
-     * arguments to {@link Health}'s constructor are in a different order
-     * than the wire puts them in, and evaluating them inline would make
-     * that reordering invisible.
+     * {@code 0x00 HelloOk}: {@code [u8 read_only][u8 database_selected]},
+     * then only if {@code database_selected != 0}:
+     * {@code [u8 axes][u32 LE world_dim][u32 LE chunk_dim]}.
+     */
+    private static HelloOk helloOkOf(Reader r) throws ProtocolException {
+        boolean readOnly = r.u8() != 0;
+        boolean selected = r.u8() != 0;
+        Optional<DatabaseShape> database = selected
+                ? Optional.of(new DatabaseShape(r.u8(), r.u32(), r.u32()))
+                : Optional.empty();
+        return new HelloOk(readOnly, database);
+    }
+
+    /**
+     * {@code 0x08 Health}: {@code [u64 LE timestamp][u32 LE database_count]
+     * <hostname>}. Pulled out of the {@code switch} above so the field
+     * order reads in one place -- the arguments to {@link Health}'s
+     * constructor are in a different order than the wire puts them in, and
+     * evaluating them inline would make that reordering invisible.
      */
     private static Health healthOf(Reader r) throws ProtocolException {
-        int axes = r.u8();
-        long worldDim = r.u32();
-        long chunkDim = r.u32();
         long timestamp = r.u64();
-        return new Health(r.message(), axes, worldDim, chunkDim, timestamp);
+        long databaseCount = r.u32();
+        return new Health(r.message(), databaseCount, timestamp);
     }
 
     /**
@@ -517,6 +575,16 @@ final class Wire {
                 values.add(u8() == 0 ? Optional.empty() : Optional.of(value()));
             }
             return values;
+        }
+
+        /** A {@code [u32 LE count][count * <message>]} list of plain strings -- database names, here. */
+        List<String> stringList() throws ProtocolException {
+            int count = count32();
+            List<String> names = new ArrayList<>(Math.min(count, remaining()));
+            for (int i = 0; i < count; i++) {
+                names.add(message());
+            }
+            return names;
         }
 
         List<Column> columns() throws ProtocolException {

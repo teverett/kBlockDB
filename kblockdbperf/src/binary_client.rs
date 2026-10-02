@@ -40,21 +40,28 @@ pub struct BinaryClient {
 }
 
 impl BinaryClient {
-    /// Connects to `addr` and authenticates as `username`/`password` in
-    /// one step (this protocol always needs a successful `Hello` before
-    /// anything else, so there's no useful "connected but not
-    /// authenticated" state to hand back separately). `None` on any
-    /// connection failure, decode failure, or rejected `Hello`.
+    /// Connects to `addr`, authenticates as `username`/`password`, and
+    /// selects `database` in one step (this protocol always needs a
+    /// successful `Hello` before anything else, so there's no useful
+    /// "connected but not authenticated" state to hand back separately).
+    /// `None` on any connection failure, decode failure, rejected `Hello`,
+    /// *or* a `Hello` that authenticates but doesn't select `database`
+    /// (i.e. it doesn't exist yet -- callers are expected to have already
+    /// created it, e.g. via `Client::ensure_database`, the same way
+    /// `BinaryClient` has never had its own way to create a database at
+    /// all).
     pub async fn connect(
         addr: &str,
         username: &str,
         password: &str,
+        database: &str,
     ) -> Option<(BinaryClient, HealthInfo)> {
         let mut stream = TcpStream::connect(addr).await.ok()?;
         stream.set_nodelay(true).ok()?;
         let hello = Request::Hello {
             username: username.to_string(),
             password: password.to_string(),
+            database: database.to_string(),
         };
         wire::write_frame(&mut stream, &wire::encode_request(&hello))
             .await
@@ -62,12 +69,13 @@ impl BinaryClient {
         let payload = wire::read_frame(&mut stream).await.ok()??;
         match wire::decode_response(&payload).ok()? {
             Response::HelloOk {
-                axes, world_dim, ..
+                database: Some(shape),
+                ..
             } => Some((
                 BinaryClient { stream },
                 HealthInfo {
-                    axes: axes as usize,
-                    world_dim,
+                    axes: shape.axes as usize,
+                    world_dim: shape.world_dim,
                 },
             )),
             _ => None,
