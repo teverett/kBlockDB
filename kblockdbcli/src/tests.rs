@@ -590,20 +590,41 @@ fn databases_create_database_and_remove_database_round_trip_through_a_real_serve
     let create = run_kblockdbcli(
         &kblockdbcli_bin,
         &server,
-        &["create-database", "extra", "--axes", "2", "--world-dim", "50"],
+        &[
+            "create-database",
+            "extra",
+            "--axes",
+            "2",
+            "--world-dim",
+            "50",
+        ],
     );
-    assert!(create.status.success(), "create failed: {}", stderr(&create));
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        stderr(&create)
+    );
 
     let list_after_create = run_kblockdbcli(&kblockdbcli_bin, &server, &["databases"]);
     let out = stdout(&list_after_create);
     assert!(out.contains("extra"), "unexpected databases output: {out}");
-    assert!(out.ends_with("2 database(s)"), "unexpected databases output: {out}");
+    assert!(
+        out.ends_with("2 database(s)"),
+        "unexpected databases output: {out}"
+    );
 
     let remove = run_kblockdbcli(&kblockdbcli_bin, &server, &["remove-database", "extra"]);
-    assert!(remove.status.success(), "remove failed: {}", stderr(&remove));
+    assert!(
+        remove.status.success(),
+        "remove failed: {}",
+        stderr(&remove)
+    );
 
     let list_after_remove = run_kblockdbcli(&kblockdbcli_bin, &server, &["databases"]);
-    assert_eq!(stdout(&list_after_remove), format!("{TEST_DB}\n1 database(s)"));
+    assert_eq!(
+        stdout(&list_after_remove),
+        format!("{TEST_DB}\n1 database(s)")
+    );
 
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -632,7 +653,11 @@ fn two_databases_are_isolated_through_the_cli() {
     };
 
     let create = run_kblockdbcli(&kblockdbcli_bin, &server, &["create-database", "other"]);
-    assert!(create.status.success(), "create failed: {}", stderr(&create));
+    assert!(
+        create.status.success(),
+        "create failed: {}",
+        stderr(&create)
+    );
 
     let set = run_kblockdbcli(
         &kblockdbcli_bin,

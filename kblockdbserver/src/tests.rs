@@ -372,7 +372,10 @@ async fn a_bool_cell_roundtrips_through_set_get_and_select() {
 
     let (status, body) = send(
         app,
-        post("/rest/db/db/query", query("SELECT * WHERE flammable = true")),
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE flammable = true"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -512,7 +515,11 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
         {"type": "i64", "value": 2},
         {"type": "i64", "value": 3},
     ]});
-    let (status, _) = send(app.clone(), put("/rest/db/db/regions/0,0,0/2,2,1/n", values)).await;
+    let (status, _) = send(
+        app.clone(),
+        put("/rest/db/db/regions/0,0,0/2,2,1/n", values),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (status, body) = send(app, get("/rest/db/db/regions/0,0,0/2,2,1/n")).await;
@@ -530,7 +537,11 @@ async fn set_region_then_get_region_roundtrips_per_cell_values() {
 
 #[tokio::test]
 async fn get_region_on_an_untouched_area_is_all_null() {
-    let (status, body) = send(test_app().0, get("/rest/db/db/regions/0,0,0/2,2,2/material")).await;
+    let (status, body) = send(
+        test_app().0,
+        get("/rest/db/db/regions/0,0,0/2,2,2/material"),
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["values"].as_array().unwrap().len(), 8);
     assert!(body["values"].as_array().unwrap().iter().all(Json::is_null));
@@ -561,7 +572,11 @@ async fn remove_region_clears_every_cell_in_it() {
     )
     .await;
 
-    let (status, _) = send(app.clone(), delete("/rest/db/db/regions/0,0,0/2,1,1/material")).await;
+    let (status, _) = send(
+        app.clone(),
+        delete("/rest/db/db/regions/0,0,0/2,1,1/material"),
+    )
+    .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     let (_, body) = send(app, get("/rest/db/db/regions/0,0,0/2,1,1/material")).await;
@@ -1027,11 +1042,7 @@ async fn rows_rejects_a_zero_page_or_an_oversized_page_size() {
     let (status, _) = send(app.clone(), get(&format!("/rows?db={DB}&page=0"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 
-    let (status, _) = send(
-        app,
-        get(&format!("/rows?db={DB}&page_size=100000")),
-    )
-    .await;
+    let (status, _) = send(app, get(&format!("/rows?db={DB}&page_size=100000"))).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1040,7 +1051,10 @@ async fn rows_reflects_a_removed_cell() {
     let (app, _dir) = test_app();
     send(
         app.clone(),
-        put("/rest/db/db/cells/1,2,3/k", json!({"type": "i64", "value": 1})),
+        put(
+            "/rest/db/db/cells/1,2,3/k",
+            json!({"type": "i64", "value": 1}),
+        ),
     )
     .await;
     send(app.clone(), delete("/rest/db/db/cells/1,2,3/k")).await;
@@ -1176,7 +1190,10 @@ async fn select_where_filters_by_value() {
 
     let (status, body) = send(
         app,
-        post("/rest/db/db/query", query("SELECT * WHERE material = 'stone'")),
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE material = 'stone'"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1198,7 +1215,11 @@ async fn select_where_filters_by_axis_coordinate() {
         .await;
     }
 
-    let (_, body) = send(app, post("/rest/db/db/query", query("SELECT * WHERE x0 >= 10"))).await;
+    let (_, body) = send(
+        app,
+        post("/rest/db/db/query", query("SELECT * WHERE x0 >= 10")),
+    )
+    .await;
     assert_eq!(body["total_rows"], 1);
     assert_eq!(body["rows"][0]["coord"], json!([40, 40, 40]));
 }
@@ -1219,7 +1240,10 @@ async fn select_from_range_scopes_to_the_box() {
 
     let (_, body) = send(
         app,
-        post("/rest/db/db/query", query("SELECT * FROM (0,0,0) TO (10,10,10)")),
+        post(
+            "/rest/db/db/query",
+            query("SELECT * FROM (0,0,0) TO (10,10,10)"),
+        ),
     )
     .await;
     assert_eq!(body["total_rows"], 1);
@@ -1229,7 +1253,11 @@ async fn select_from_range_scopes_to_the_box() {
 #[tokio::test]
 async fn a_malformed_query_is_400() {
     let (app, _dir) = test_app();
-    let (status, body) = send(app, post("/rest/db/db/query", query("NOT VALID SQL AT ALL"))).await;
+    let (status, body) = send(
+        app,
+        post("/rest/db/db/query", query("NOT VALID SQL AT ALL")),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body["error"].is_string());
 }
@@ -1299,7 +1327,10 @@ async fn update_never_creates_a_cell_that_does_not_already_exist() {
 async fn a_read_only_account_cannot_set() {
     let (app, _dir) = test_app();
     let req = with_auth(
-        post("/rest/db/db/query", query("SET (k = 1) IN (0,0,0) TO (1,1,1)")),
+        post(
+            "/rest/db/db/query",
+            query("SET (k = 1) IN (0,0,0) TO (1,1,1)"),
+        ),
         TEST_READ_ONLY_USER,
         TEST_READ_ONLY_PASSWORD,
     );
@@ -1345,7 +1376,11 @@ async fn set_upserts_every_cell_in_range_when_there_is_no_where_clause() {
     assert_eq!(body["affected_cells"], 4); // 2x2x1 box
 
     for coords in ["0,0,0", "1,0,0", "0,1,0", "1,1,0"] {
-        let (_, cell) = send(app.clone(), get(&format!("/rest/db/db/cells/{coords}/material"))).await;
+        let (_, cell) = send(
+            app.clone(),
+            get(&format!("/rest/db/db/cells/{coords}/material")),
+        )
+        .await;
         assert_eq!(cell["value"], json!({"type": "str", "value": "stone"}));
     }
 }
@@ -1448,7 +1483,10 @@ async fn delete_removes_every_key_at_matching_cells() {
 
     let (status, body) = send(
         app.clone(),
-        post("/rest/db/db/query", query("DELETE WHERE material = 'stone'")),
+        post(
+            "/rest/db/db/query",
+            query("DELETE WHERE material = 'stone'"),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::OK);
@@ -1538,7 +1576,10 @@ async fn columns_are_listed_sorted_by_key() {
     for key in ["material", "hardness", "visible"] {
         let (status, _) = send(
             app.clone(),
-            put(&format!("/rest/db/db/columns/{key}"), json!({"type": "str"})),
+            put(
+                &format!("/rest/db/db/columns/{key}"),
+                json!({"type": "str"}),
+            ),
         )
         .await;
         assert_eq!(status, StatusCode::NO_CONTENT);
@@ -1561,7 +1602,11 @@ async fn adding_a_column_that_already_exists_is_409() {
         put("/rest/db/db/columns/material", json!({"type": "str"})),
     )
     .await;
-    let (status, body) = send(app, put("/rest/db/db/columns/material", json!({"type": "str"}))).await;
+    let (status, body) = send(
+        app,
+        put("/rest/db/db/columns/material", json!({"type": "str"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::CONFLICT);
     assert!(body["error"].as_str().unwrap().contains("material"));
 }
@@ -1569,7 +1614,11 @@ async fn adding_a_column_that_already_exists_is_409() {
 #[tokio::test]
 async fn adding_a_column_with_an_unknown_type_is_a_client_error() {
     let (app, _dir) = test_app();
-    let (status, _) = send(app, put("/rest/db/db/columns/material", json!({"type": "blob"}))).await;
+    let (status, _) = send(
+        app,
+        put("/rest/db/db/columns/material", json!({"type": "blob"})),
+    )
+    .await;
     // Axum's own `Json` extractor rejects this before the handler runs,
     // same as any other unparseable body -- see
     // `malformed_json_body_is_a_client_error`.
@@ -1582,7 +1631,11 @@ async fn adding_a_column_whose_key_the_schema_cant_store_is_400() {
     // A tab would split the key across `schema.txt`'s own field
     // separator, so the schema rejects it rather than writing a line it
     // couldn't read back.
-    let (status, _) = send(app, put("/rest/db/db/columns/bad%09key", json!({"type": "str"}))).await;
+    let (status, _) = send(
+        app,
+        put("/rest/db/db/columns/bad%09key", json!({"type": "str"})),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
@@ -1970,7 +2023,10 @@ async fn every_per_database_route_404s_for_an_unknown_database() {
 
     let (status, _) = send(
         app.clone(),
-        put("/rest/db/nope/cells/0,0,0/k", json!({"type": "i64", "value": 1})),
+        put(
+            "/rest/db/nope/cells/0,0,0/k",
+            json!({"type": "i64", "value": 1}),
+        ),
     )
     .await;
     assert_eq!(status, StatusCode::NOT_FOUND);

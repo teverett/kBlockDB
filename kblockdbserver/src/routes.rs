@@ -172,7 +172,9 @@ pub struct DatabasesResponse {
     ),
     security(("basic_auth" = [])),
 )]
-async fn list_databases(State(state): State<AppState>) -> Result<Json<DatabasesResponse>, ApiError> {
+async fn list_databases(
+    State(state): State<AppState>,
+) -> Result<Json<DatabasesResponse>, ApiError> {
     let databases = state.list_databases().await?;
     Ok(Json(DatabasesResponse { databases }))
 }

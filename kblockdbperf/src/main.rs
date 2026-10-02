@@ -362,24 +362,24 @@ async fn main() {
         .any(|n| args.scenarios.is_empty() || args.scenarios.iter().any(|s| s == n));
     let mut binary_client = if want_binary {
         match &binary_target_addr {
-            Some(addr) => match BinaryClient::connect(addr, &binary_user, &binary_password, &db)
-                .await
-            {
-                Some((client, bh)) => {
-                    println!(
-                        "binary protocol reachable at {addr} (axes={}, world_dim={})\n",
-                        bh.axes, bh.world_dim
-                    );
-                    Some(client)
-                }
-                None => {
-                    println!(
-                        "note: couldn't reach the binary protocol at {addr} -- \
+            Some(addr) => {
+                match BinaryClient::connect(addr, &binary_user, &binary_password, &db).await {
+                    Some((client, bh)) => {
+                        println!(
+                            "binary protocol reachable at {addr} (axes={}, world_dim={})\n",
+                            bh.axes, bh.world_dim
+                        );
+                        Some(client)
+                    }
+                    None => {
+                        println!(
+                            "note: couldn't reach the binary protocol at {addr} -- \
                          skipping binary_* scenarios\n"
-                    );
-                    None
+                        );
+                        None
+                    }
                 }
-            },
+            }
             None => {
                 if !args.scenarios.is_empty() {
                     // Explicitly asked for a binary_* scenario with nothing
@@ -410,13 +410,11 @@ async fn main() {
         results.push(scenarios::get_cell(primary, axes, world_dim, args.cells).await);
     }
     if want("remove_cell") {
-        results
-            .push(scenarios::remove_cell(primary, axes, world_dim, args.cells).await);
+        results.push(scenarios::remove_cell(primary, axes, world_dim, args.cells).await);
     }
     if want("region") {
         results.extend(
-            scenarios::region_sweep(primary, axes, &args.region_edges, args.region_reps)
-                .await,
+            scenarios::region_sweep(primary, axes, &args.region_edges, args.region_reps).await,
         );
     }
     if want("concurrency_scan") {
@@ -433,25 +431,18 @@ async fn main() {
     }
     if want("contended_cell") {
         results.extend(
-            scenarios::contended_cell(primary, axes, &args.concurrency, args.ops_per_client)
-                .await,
+            scenarios::contended_cell(primary, axes, &args.concurrency, args.ops_per_client).await,
         );
     }
     if let Some(bc) = binary_client.as_mut() {
         if want("binary_set_cell") {
-            results.push(
-                scenarios::binary_set_cell(bc, axes, world_dim, args.cells).await,
-            );
+            results.push(scenarios::binary_set_cell(bc, axes, world_dim, args.cells).await);
         }
         if want("binary_get_cell") {
-            results.push(
-                scenarios::binary_get_cell(bc, axes, world_dim, args.cells).await,
-            );
+            results.push(scenarios::binary_get_cell(bc, axes, world_dim, args.cells).await);
         }
         if want("binary_remove_cell") {
-            results.push(
-                scenarios::binary_remove_cell(bc, axes, world_dim, args.cells).await,
-            );
+            results.push(scenarios::binary_remove_cell(bc, axes, world_dim, args.cells).await);
         }
     }
     println!();

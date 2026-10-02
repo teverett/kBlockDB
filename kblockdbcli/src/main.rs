@@ -999,7 +999,9 @@ mod unit_tests {
             world_dim: None,
             chunk_size: None,
         }));
-        assert!(!command_needs_db(&Command::RemoveDatabase { name: "x".into() }));
+        assert!(!command_needs_db(&Command::RemoveDatabase {
+            name: "x".into()
+        }));
     }
 
     #[test]

@@ -232,8 +232,8 @@ async fn binary_connect_against_a_not_yet_created_database_selects_nothing() {
     // No `ensure_database` call first -- the database genuinely doesn't
     // exist, so `connect` (which requires `HelloOk.database` to be
     // present) must report this as a connection failure.
-    let result = BinaryClient::connect(binary_addr, "admin", TEST_ADMIN_PASSWORD, "never-created")
-        .await;
+    let result =
+        BinaryClient::connect(binary_addr, "admin", TEST_ADMIN_PASSWORD, "never-created").await;
     assert!(result.is_none());
 
     let _ = std::fs::remove_dir_all(&dir);

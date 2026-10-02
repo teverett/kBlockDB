@@ -404,7 +404,10 @@ pub fn encode_request(req: &Request) -> Vec<u8> {
 pub fn encode_response(resp: &Response) -> Vec<u8> {
     let mut buf = Vec::new();
     match resp {
-        Response::HelloOk { read_only, database } => {
+        Response::HelloOk {
+            read_only,
+            database,
+        } => {
             buf.push(0x00);
             buf.push(u8::from(*read_only));
             match database {
@@ -775,7 +778,10 @@ pub fn decode_response(payload: &[u8]) -> Result<Response, DecodeError> {
                     chunk_dim: r.u32()?,
                 }),
             };
-            Ok(Response::HelloOk { read_only, database })
+            Ok(Response::HelloOk {
+                read_only,
+                database,
+            })
         }
         0x01 => Ok(Response::Ok),
         0x02 => {

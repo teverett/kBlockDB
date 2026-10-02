@@ -1326,8 +1326,7 @@ mod tests {
         .await;
         assert_eq!(create, Response::Ok);
 
-        let Response::Databases(mut names) =
-            roundtrip(&mut stream, &Request::ListDatabases).await
+        let Response::Databases(mut names) = roundtrip(&mut stream, &Request::ListDatabases).await
         else {
             panic!("expected Response::Databases");
         };
