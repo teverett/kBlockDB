@@ -1402,7 +1402,7 @@ async fn a_read_only_account_cannot_update() {
 #[tokio::test]
 async fn set_without_a_range_is_400() {
     // SET is an upsert -- unlike UPDATE, it requires IN <range> (see
-    // query.rs's doc comment), so omitting it is a parse error, not a
+    // kblockdbquery's doc comment), so omitting it is a parse error, not a
     // request that silently does nothing.
     let (app, _dir) = test_app();
     let (status, _) = send(app, post("/rest/db/db/query", query("SET (k = 1)"))).await;
@@ -1459,7 +1459,7 @@ async fn set_with_an_axis_where_clause_only_upserts_matching_coordinates() {
 async fn set_with_a_key_based_where_clause_never_creates_a_new_cell() {
     // A key-based WHERE can never match a cell that doesn't exist yet (same
     // "missing key never matches" rule eval uses everywhere else), so this
-    // behaves like UPDATE even though it's SET -- see query.rs's doc
+    // behaves like UPDATE even though it's SET -- see kblockdbquery's doc
     // comment on why that's the intended, not a surprising, outcome.
     let (app, _dir) = test_app();
     send(

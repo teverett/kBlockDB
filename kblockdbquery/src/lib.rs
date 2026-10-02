@@ -15,8 +15,8 @@
 //! (`key = 'value'`, `x0 >= 10`, ...) and `EXISTS(key)` (whether `key` is
 //! set at a cell at all, regardless of its value) with `AND`/`OR`/`NOT` and
 //! parentheses; `x<N>` addresses coordinate axis `N`, anything else is a
-//! key name. See `docs/query-language.md` for the full grammar and
-//! worked examples.
+//! key name. See `docs/query-language.md` (at the repository root) for the
+//! full grammar and worked examples.
 //!
 //! **`SET` is an upsert, `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all
 //! operate on `kblockdblib::World::list_cells` -- i.e. only cells that
@@ -32,20 +32,22 @@
 //! all, or one that only compares against axis coordinates (`x<N>`), where
 //! `SET` can genuinely bring new cells into existence and `UPDATE` cannot.
 //! `SET` requires `IN <range>` (not optional, unlike `UPDATE`'s) because
-//! "upsert everywhere" has no meaningful bound -- `routes.rs` needs a range
-//! to know which coordinates to even consider creating.
+//! "upsert everywhere" has no meaningful bound -- `kblockdbserver`'s
+//! `routes.rs` needs a range to know which coordinates to even consider
+//! creating.
 //!
 //! `SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes -- see
-//! `Statement::is_write`, which `routes.rs`'s query handler uses to reject
-//! a `read_only` account's writes the same way the REST API's `PUT`/
-//! `DELETE` handlers do, just checked explicitly there instead of by HTTP
-//! method (this whole language shares one endpoint and one HTTP method --
-//! see `routes.rs`'s doc comment on why).
+//! `Statement::is_write`, which `kblockdbserver`'s query handler uses to
+//! reject a `read_only` account's writes the same way the REST API's
+//! `PUT`/`DELETE` handlers do, just checked explicitly there instead of by
+//! HTTP method (this whole language shares one endpoint and one HTTP
+//! method -- see `kblockdbserver/src/routes.rs`'s doc comment on why).
 //!
-//! This module only builds and evaluates the AST against
-//! `kblockdblib::CellEntry` values (in memory, no I/O) -- `routes.rs`
+//! This crate only builds and evaluates the AST against
+//! `kblockdblib::CellEntry` values (in memory, no I/O) -- `kblockdbserver`
 //! drives the actual `World::list_cells`/`get_region`/`set_region`/`set`/
-//! `remove` calls the parsed statement implies.
+//! `remove` calls the parsed statement implies, and every REST/binary-
+//! protocol wire format that carries query text in and results back out.
 
 use kblockdblib::{CellEntry, Value};
 use pest::iterators::Pair;
@@ -68,8 +70,8 @@ pub enum Columns {
 /// expressed as two corners instead of a corner + a size. `from.len()` and
 /// `to.len()` are always equal (the grammar can't produce a mismatch --
 /// both come from the same `point` rule applied twice), but may differ
-/// from the world's actual axis count, which only `routes.rs` (the one
-/// place that knows the target `World`) can check.
+/// from the world's actual axis count, which only `kblockdbserver`'s
+/// `routes.rs` (the one place that knows the target `World`) can check.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Range {
     pub from: Vec<i32>,
@@ -137,7 +139,7 @@ pub enum Statement {
     },
     /// An upsert: every coordinate in `range` satisfying `where_clause` is
     /// written, whether or not a cell already existed there. `range` isn't
-    /// optional -- see this module's doc comment on why.
+    /// optional -- see this crate's doc comment on why.
     Set {
         assignments: Vec<(String, Literal)>,
         where_clause: Option<Expr>,
@@ -145,7 +147,7 @@ pub enum Statement {
     },
     /// Same shape as the old `SET`: only ever touches cells `World::list_cells`
     /// already reports (i.e. that already have some key set) -- never
-    /// creates one. See this module's doc comment on how this differs from
+    /// creates one. See this crate's doc comment on how this differs from
     /// `Set`.
     Update {
         assignments: Vec<(String, Literal)>,
@@ -160,7 +162,7 @@ pub enum Statement {
 
 impl Statement {
     /// `SET`/`UPDATE`/`DELETE` are writes; `SELECT` is a read. See this
-    /// module's doc comment on why this -- not HTTP method -- is what
+    /// crate's doc comment on why this -- not HTTP method -- is what
     /// gates a `read_only` account here.
     pub fn is_write(&self) -> bool {
         matches!(
@@ -489,7 +491,7 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal, ParseError> {
 // --- Evaluation ---
 //
 // Pure functions over an in-memory `CellEntry` -- no I/O, no `World`. See
-// this module's doc comment for why `routes.rs` owns everything that
+// this crate's doc comment for why `kblockdbserver` owns everything that
 // actually touches disk.
 
 /// Whether `cell` falls inside `range` (or `range` is `None`, matching
@@ -509,7 +511,7 @@ pub fn matches(range: Option<&Range>, where_clause: Option<&Expr>, cell: &CellEn
     where_clause.is_none_or(|expr| eval(expr, cell))
 }
 
-/// `eval` alone, without a range check -- `routes.rs`'s `SET` (upsert)
+/// `eval` alone, without a range check -- `kblockdbserver`'s `SET` (upsert)
 /// handling needs this directly: it already knows a candidate coordinate
 /// is in range (from `kblockdblib::Region::iter()`), and evaluates
 /// `WHERE` against either that coordinate's existing `CellEntry` or a
@@ -531,7 +533,7 @@ fn eval_compare(operand: &Operand, op: CompareOp, literal: &Literal, cell: &Cell
             (Some(&c), Literal::Float(n)) => compare_f64(f64::from(c), op, *n),
             // A coordinate is never a string, and an axis past the world's
             // own axis count can't match anything -- both are "doesn't
-            // match", not an error (see this module's doc comment on
+            // match", not an error (see this crate's doc comment on
             // mismatched types).
             _ => false,
         },

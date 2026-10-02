@@ -482,12 +482,11 @@ the frame/request/response byte layout.
   (see `routes.rs`'s doc comment).
 - `kblockdbserver/src/routes.rs`     -- the router (mounted under `/rest`,
   see "Databases"/"REST API" above), all HTTP handlers, and each one's
-  `#[utoipa::path(...)]` OpenAPI annotation.
-- `kblockdbserver/src/query.pest`/`query.rs` -- the
-  [query language](query-language.md): grammar, AST, parsing, and
-  in-memory evaluation against a `kblockdblib::CellEntry` (no I/O --
-  `routes.rs`'s query handler owns every actual `World` call the parsed
-  statement implies).
+  `#[utoipa::path(...)]` OpenAPI annotation. Its query handler (`### Query`
+  above) is the only caller of the [`kblockdbquery`](query-language.md)
+  crate -- grammar, AST, parsing, and in-memory evaluation all live there,
+  not in this crate; `routes.rs` owns every actual `World` call a parsed
+  statement implies.
 - `kblockdbserver/src/openapi.rs`    -- `ApiDoc`, the `utoipa::OpenApi` derive
   that collects every handler's annotation (and every response type's
   `#[derive(ToSchema)]`) into the spec served at `/rest/api-docs/openapi.json`,

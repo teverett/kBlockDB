@@ -1,8 +1,10 @@
 # Query language
 
-A small SQL-like language over a database's cells, parsed with a
-[pest](https://pest.rs) grammar (`kblockdbserver/src/query.pest`/`query.rs`).
-It's the same grammar regardless of how you send it: `POST
+A small SQL-like language over a database's cells, implemented in its own
+crate (`kblockdbquery/src/lib.rs`/`query.pest`), parsed with a
+[pest](https://pest.rs) grammar. `kblockdbserver` embeds it; it has no I/O
+or transport concerns of its own -- see `kblockdbquery/src/lib.rs`'s own
+doc comment. It's the same grammar regardless of how you send it: `POST
 /rest/db/{db}/query` on the [REST API](kblockdbserver.md#query), the
 [binary protocol](binary-protocol.md)'s `Query` request, or
 [`kblockdbcli query`](kblockdbcli.md) -- this page covers the grammar and

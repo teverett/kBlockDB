@@ -41,7 +41,7 @@
 //! that doesn't use `require_auth`: that middleware's `read_only` check is
 //! purely a function of HTTP method (`GET` = read, anything else = write),
 //! but one query can be *either* depending on the query text itself
-//! (`SELECT` vs `SET`/`UPDATE`/`DELETE` -- see `query.rs`'s
+//! (`SELECT` vs `SET`/`UPDATE`/`DELETE` -- see `kblockdbquery`'s
 //! `Statement::is_write`). `run_query` authenticates the same way
 //! `require_auth` does (`auth::account_from_headers`) and only then checks
 //! `read_only` against the parsed statement, not the HTTP method.
@@ -51,7 +51,6 @@ use crate::browser;
 use crate::coords::parse_coords;
 use crate::error::{ApiError, ErrorBody};
 use crate::openapi::ApiDoc;
-use crate::query;
 use crate::state::{AppState, WorldShape};
 use crate::value_json::{ValueJson, ValueTypeJson};
 use axum::extract::{Path, State};
@@ -60,6 +59,7 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use kblockdbquery as query;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use utoipa::{OpenApi, ToSchema};
@@ -830,7 +830,7 @@ pub(crate) async fn execute_query(
 }
 
 /// `SET`'s upsert: every coordinate in `range` (mandatory -- see
-/// `query.rs`'s doc comment) satisfying `where_clause` gets `assignments`
+/// `kblockdbquery`'s doc comment) satisfying `where_clause` gets `assignments`
 /// written, whether or not a cell already existed there.
 ///
 /// Two paths, chosen for cost, not just convenience:
@@ -923,8 +923,8 @@ fn range_to_region(range: &query::Range) -> kblockdblib::Region {
 }
 
 /// A query's optional `FROM`/`IN` range must name exactly as many axes as
-/// the target database has -- `query.rs` itself can't check this (it has no
-/// `World` to check against), so `execute_query` does, before running
+/// the target database has -- `kblockdbquery` itself can't check this (it
+/// has no `World` to check against), so `execute_query` does, before running
 /// anything, the same "reject up front, don't touch any data" policy
 /// `check_region` (used by the region endpoints above) follows.
 fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError> {

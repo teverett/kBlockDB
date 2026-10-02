@@ -614,6 +614,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kblockdbquery"
+version = "0.1.0"
+dependencies = [
+ "kblockdblib",
+ "pest",
+ "pest_derive",
+]
+
+[[package]]
 name = "kblockdbserver"
 version = "0.1.0"
 dependencies = [
@@ -622,8 +631,7 @@ dependencies = [
  "hostname",
  "http-body-util",
  "kblockdblib",
- "pest",
- "pest_derive",
+ "kblockdbquery",
  "serde",
  "serde_json",
  "tokio",

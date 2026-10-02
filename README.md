@@ -56,25 +56,31 @@ A read-only web browser for every database is served at
 
 ## What's here
 
-A Cargo workspace of four Rust crates, plus two standalone clients:
+A Cargo workspace of five Rust crates, plus two standalone clients:
 
 - **`kblockdblib`** -- the storage engine, as a library plus a small
   demo/benchmark binary. Chunked on-disk format, a write-through LRU chunk
   cache, a cap on concurrent disk operations, and optional zstd
   compression of chunk files. `zstd` is its only external dependency, and
   only the compression option uses it; everything else is `std`.
-- **`kblockdbserver`** -- embeds `kblockdblib` and serves it over a REST
-  HTTP API, a read-only web data browser, and (optionally, as a peer to
-  REST rather than a replacement) a compact binary protocol with less
-  per-call overhead. Manages any number of independent databases under one
-  data directory (`/rest/databases` to list/create/delete); every
-  per-database route is scoped under `/rest/db/{name}/...` and supports
-  single cells and axis-aligned regions, a SQL-like query language
-  (`SELECT`/`SET`/`UPDATE`/`DELETE`), and schema column management, all
-  behind HTTP Basic Auth with per-account read-only access. Unlike
-  `kblockdblib` it uses the usual modern Rust web stack (axum, tokio,
-  serde, pest) -- the near-dependency-free constraint applies to the
-  storage format, not to everything built on top of it.
+- **`kblockdbquery`** -- the SQL-like query language
+  (`SELECT`/`SET`/`UPDATE`/`DELETE`) as a standalone crate: grammar
+  (parsed with [pest](https://pest.rs)), AST, parsing, and in-memory
+  evaluation against a `kblockdblib::CellEntry`. No I/O, no REST/binary
+  transport concerns -- `kblockdbserver` embeds it and owns every actual
+  `World` call a parsed statement implies.
+- **`kblockdbserver`** -- embeds `kblockdblib` and `kblockdbquery` and
+  serves them over a REST HTTP API, a read-only web data browser, and
+  (optionally, as a peer to REST rather than a replacement) a compact
+  binary protocol with less per-call overhead. Manages any number of
+  independent databases under one data directory (`/rest/databases` to
+  list/create/delete); every per-database route is scoped under
+  `/rest/db/{name}/...` and supports single cells and axis-aligned
+  regions, the query language, and schema column management, all behind
+  HTTP Basic Auth with per-account read-only access. Unlike `kblockdblib`
+  it uses the usual modern Rust web stack (axum, tokio, serde) -- the
+  near-dependency-free constraint applies to the storage format, not to
+  everything built on top of it.
 - **`kblockdbperf`** -- drives a real server over real HTTP and measures
   it: single-cell and region throughput and latency, concurrency scaling,
   and lock contention.
@@ -89,7 +95,8 @@ A Cargo workspace of four Rust crates, plus two standalone clients:
 
 ```
 kblockdblib/      the storage engine (library + demo binary `kblockdblib`)
-kblockdbserver/   the server (binary `kblockdbserver`, embeds kblockdblib)
+kblockdbquery/    the query language (library only, embedded by kblockdbserver)
+kblockdbserver/   the server (binary `kblockdbserver`, embeds kblockdblib/kblockdbquery)
 kblockdbperf/     the performance suite (binary `kblockdbperf`, over HTTP)
 kblockdbcli/      the command-line client (binary `kblockdbcli`, over HTTP)
 client/java/      the Java client (binary protocol; Maven, not Cargo)

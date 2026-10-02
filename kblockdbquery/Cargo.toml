@@ -1,0 +1,22 @@
+[package]
+name = "kblockdbquery"
+version = "0.1.0"
+edition = "2021"
+
+# kBlockDB's SQL-like query language (SELECT/SET/UPDATE/DELETE) as a
+# standalone crate: grammar, AST, parsing, and in-memory evaluation against
+# a kblockdblib::CellEntry. No I/O and no notion of a REST/binary transport
+# live here -- kblockdbserver (a separate crate in this workspace) owns
+# every actual World call a parsed statement implies and every wire format
+# that carries query text in and results back out. See
+# docs/query-language.md at the repository root for the grammar and
+# worked examples.
+
+[lib]
+name = "kblockdbquery"
+path = "src/lib.rs"
+
+[dependencies]
+kblockdblib = { path = "../kblockdblib" }
+pest = "2"
+pest_derive = "2"
