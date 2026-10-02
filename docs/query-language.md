@@ -31,12 +31,30 @@ DELETE [WHERE <criteria>] [IN <range>]
   touching any data.
 - `<criteria>` is a boolean expression:
   - Comparisons (`=`, `!=`, `<`, `<=`, `>`, `>=`) between an operand and a
-    literal. An operand's left side is either `x<N>` (coordinate axis `N`,
-    zero-indexed) or a key name; its right side is a string (`'stone'`),
-    integer, float, or boolean (`true`/`false`, case-insensitive) literal
-    (`x0 >= -10` works the same as any other comparison). A key literally
-    named e.g. `x0` can't be addressed this way -- a known limitation of a
-    generic axis-count grammar.
+    literal. An operand's left side is `x<N>` (coordinate axis `N`,
+    zero-indexed), one of the metadata keywords below, or a key name; its
+    right side is a string (`'stone'`), integer, float, boolean
+    (`true`/`false`, case-insensitive), or `now()` literal (`x0 >= -10`
+    works the same as any other comparison). A key literally named e.g.
+    `x0`, `created`, `updated`, or `version` can't be addressed this way --
+    a known limitation of a generic axis-count grammar, extended here to
+    the metadata keywords too.
+  - `now()` is the current time in milliseconds since the Unix epoch --
+    same units as `created`/`updated` -- resolved once, when the query is
+    parsed, so every use of it within one statement (even across several
+    comparisons, or in a `SET`/`UPDATE` assignment) is the same instant,
+    e.g. `WHERE updated < now()` (cells not touched since the query
+    started) or `SET (seen_at = now())`.
+  - `created`, `updated`, and `version` address a cell's per-key metadata
+    (the same `created_at_ms`/`modified_at_ms`/`version` every query
+    result already reports -- see below) instead of a value, e.g.
+    `WHERE version > 0` or `WHERE created < 1700000000000`. Only integer
+    and float literals compare against them (a string or boolean literal
+    never matches, same as any other type mismatch). Metadata is recorded
+    per *key*, not per cell -- a cell with several keys set has a separate
+    `created`/`updated`/`version` for each -- so a comparison against one
+    of these keywords matches a cell if *any* value set there satisfies it,
+    the same "is this true of something here" spirit as `EXISTS` below.
   - `EXISTS(<key>)` -- whether `<key>` is set at a cell at all, regardless
     of its value or type. Unlike a comparison, which only ever matches a
     *particular* value, this is how you ask "is this key set here" on its
@@ -49,10 +67,11 @@ DELETE [WHERE <criteria>] [IN <range>]
     `EXISTS` composes with these exactly like a comparison does --
     `NOT EXISTS(density)`, `EXISTS(density) AND density > 1`,
     `EXISTS(a) OR EXISTS(b)`, and so on.
-  - Keywords (including `EXISTS`) are case-insensitive and word-bounded,
-    so a key that merely starts with one -- `existsflag`, `andrew` -- is
-    still an ordinary key name, never mistaken for the keyword; key/axis
-    names themselves are case-sensitive.
+  - Keywords (including `EXISTS` and the metadata keywords) are
+    case-insensitive and word-bounded, so a key that merely starts with
+    one -- `existsflag`, `versioning`, `andrew` -- is still an ordinary
+    key name, never mistaken for the keyword; key/axis names themselves
+    are case-sensitive.
 - A comparison against a key that isn't set at a given cell, or whose
   value's type doesn't match the literal's (a string literal against a
   numeric key, say), simply doesn't match that cell -- never an error, the
@@ -87,6 +106,9 @@ or opcode the way every other operation's read/write split works.
 SELECT material, density WHERE x0 >= 10 AND x0 < 20 AND material = 'stone'
 SELECT * WHERE EXISTS(density)
 SELECT * WHERE NOT EXISTS(density)
+SELECT * WHERE version > 0
+SELECT * WHERE created >= 1700000000000 AND updated < 1700000100000
+SELECT * WHERE updated < now()
 
 # upsert: fills every cell in the box with material='stone', creating any
 # that don't already exist.

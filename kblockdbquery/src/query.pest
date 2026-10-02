@@ -29,6 +29,13 @@ kw_and    = @{ ^"AND"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_or     = @{ ^"OR"     ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not    = @{ ^"NOT"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_exists = @{ ^"EXISTS" ~ !(ASCII_ALPHANUMERIC | "_") }
+// Metadata keywords -- see `meta` below: these address a cell's
+// per-key `CellMeta` fields (`created_at_ms`/`modified_at_ms`/`version`)
+// from a WHERE clause, the same word-bounded, case-insensitive way every
+// other keyword here does.
+kw_created = @{ ^"CREATED" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_updated = @{ ^"UPDATED" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_version = @{ ^"VERSION" ~ !(ASCII_ALPHANUMERIC | "_") }
 
 statement = { SOI ~ (select_stmt | set_stmt | update_stmt | delete_stmt) ~ EOI }
 
@@ -69,14 +76,29 @@ primary   = { "(" ~ expr ~ ")" | exists | comparison }
 exists = { kw_exists ~ "(" ~ ident ~ ")" }
 
 comparison = { operand ~ compare_op ~ literal }
-// `x0`, `x1`, ... addresses a coordinate axis by index; anything else is a
-// key name. A key literally named e.g. "x0" can't be addressed this way --
-// a known, documented limitation of a generic axis-count grammar.
-operand    = { axis | ident }
+// `x0`, `x1`, ... addresses a coordinate axis by index; `created`/
+// `updated`/`version` address a cell's metadata (see `meta`); anything
+// else is a key name. A key literally named e.g. "x0", "created",
+// "updated", or "version" can't be addressed this way -- a known,
+// documented limitation of a generic axis-count grammar, extended here to
+// the metadata keywords too.
+operand    = { axis | meta | ident }
 axis       = @{ "x" ~ ASCII_DIGIT+ }
+// A cell's per-key metadata, addressed by keyword in a WHERE clause --
+// `created`/`updated` are millisecond timestamps, `version` an overwrite
+// counter (see `kblockdblib::CellMeta`). Checked ahead of `ident` in
+// `operand` so these take priority the same way every other keyword here
+// does.
+meta       = { kw_created | kw_updated | kw_version }
 compare_op = { "!=" | "<=" | ">=" | "=" | "<" | ">" }
 
-literal  = { string | float | int | bool_lit }
+literal  = { string | float | int | bool_lit | now_call }
+// `now()` -- the current time in milliseconds since the Unix epoch, same
+// units as `created`/`updated`. No word-boundary lookahead needed (unlike
+// the `kw_*` keywords above): the mandatory "(" immediately after "NOW"
+// already can't appear in a bare identifier, so a key named e.g. "nowish"
+// never collides with this.
+now_call = @{ ^"NOW" ~ "(" ~ ")" }
 string   = @{ "'" ~ (!"'" ~ ANY)* ~ "'" }
 float    = @{ "-"? ~ ASCII_DIGIT+ ~ "." ~ ASCII_DIGIT+ }
 int      = @{ "-"? ~ ASCII_DIGIT+ }

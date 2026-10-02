@@ -14,9 +14,14 @@
 //! `<criteria>` is a boolean expression combining comparisons
 //! (`key = 'value'`, `x0 >= 10`, ...) and `EXISTS(key)` (whether `key` is
 //! set at a cell at all, regardless of its value) with `AND`/`OR`/`NOT` and
-//! parentheses; `x<N>` addresses coordinate axis `N`, anything else is a
-//! key name. See `docs/query-language.md` (at the repository root) for the
-//! full grammar and worked examples.
+//! parentheses; `x<N>` addresses coordinate axis `N`, `created`/`updated`/
+//! `version` address a per-key `kblockdblib::CellMeta` field (see
+//! `Operand::Meta`/`MetaField`), anything else is a key name. A literal
+//! may also be `now()` -- the current time in milliseconds since the Unix
+//! epoch, same units as `created`/`updated` (e.g. `WHERE updated < now()`)
+//! -- resolved once, at parse time, so every use of it within one
+//! statement is the same instant. See `docs/query-language.md` (at the
+//! repository root) for the full grammar and worked examples.
 //!
 //! **`SET` is an upsert, `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all
 //! operate on `kblockdblib::World::list_cells` -- i.e. only cells that
@@ -109,10 +114,26 @@ impl Literal {
     }
 }
 
+/// A cell's per-key `CellMeta` field, addressed by one of the `created`/
+/// `updated`/`version` keywords. See `Operand::Meta` and
+/// `eval_compare`'s handling of it for how a comparison against this
+/// actually matches a cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MetaField {
+    /// `created`: `CellMeta::created_at_ms`.
+    Created,
+    /// `updated`: `CellMeta::modified_at_ms`.
+    Updated,
+    /// `version`: `CellMeta::version`.
+    Version,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Operand {
     /// `x<N>`: coordinate axis `N`.
     Axis(usize),
+    /// `created`/`updated`/`version`: a per-key metadata field.
+    Meta(MetaField),
     /// Anything else: a key name.
     Key(String),
 }
@@ -449,8 +470,22 @@ fn build_operand(pair: Pair<Rule>) -> Operand {
                 .expect("axis = { \"x\" ~ ASCII_DIGIT+ }: always digits after 'x'");
             Operand::Axis(n)
         }
+        Rule::meta => Operand::Meta(build_meta_field(inner)),
         Rule::ident => Operand::Key(inner.as_str().to_string()),
-        other => unreachable!("operand can only contain axis/ident, got {other:?}"),
+        other => unreachable!("operand can only contain axis/meta/ident, got {other:?}"),
+    }
+}
+
+fn build_meta_field(pair: Pair<Rule>) -> MetaField {
+    // meta = { kw_created | kw_updated | kw_version } -- exactly one of
+    // these three (now-visible, see is_keyword) keyword pairs is always
+    // present.
+    let kw = pair.into_inner().next().unwrap();
+    match kw.as_rule() {
+        Rule::kw_created => MetaField::Created,
+        Rule::kw_updated => MetaField::Updated,
+        Rule::kw_version => MetaField::Version,
+        other => unreachable!("meta can only contain kw_created/kw_updated/kw_version, got {other:?}"),
     }
 }
 
@@ -484,8 +519,32 @@ fn build_literal(pair: Pair<Rule>) -> Result<Literal, ParseError> {
             .map(Literal::Int)
             .map_err(|_| ParseError(format!("'{}' is not a valid integer", inner.as_str()))),
         Rule::bool_lit => Ok(Literal::Bool(inner.as_str().eq_ignore_ascii_case("true"))),
-        other => unreachable!("literal can only contain string/float/int/bool_lit, got {other:?}"),
+        // `now()` is resolved to a concrete millisecond timestamp right
+        // here, at parse time -- not lazily, at eval time -- so every
+        // comparison and assignment in one statement sees the *same*
+        // "now", however many cells it ends up evaluated against. See
+        // this crate's doc comment for why reading the wall clock (as
+        // opposed to touching disk or a `World`) is the one exception to
+        // "no I/O" here.
+        Rule::now_call => Ok(Literal::Int(now_ms())),
+        other => unreachable!(
+            "literal can only contain string/float/int/bool_lit/now_call, got {other:?}"
+        ),
     }
+}
+
+/// The current time in milliseconds since the Unix epoch -- same units as
+/// `CellMeta::created_at_ms`/`modified_at_ms`, which is what makes `now()`
+/// meaningful to compare against `created`/`updated`. A clock read that
+/// can't go backwards relative to the epoch is assumed to always succeed;
+/// the `unwrap_or` only guards a clock set before 1970, which would be a
+/// misconfigured host, not a bug here.
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // --- Evaluation ---
@@ -537,6 +596,27 @@ fn eval_compare(operand: &Operand, op: CompareOp, literal: &Literal, cell: &Cell
             // mismatched types).
             _ => false,
         },
+        // Metadata is per *key*, not per cell (a cell with several keys
+        // set has a separate created/modified/version for each one), so
+        // there's no single value to compare against here the way an
+        // axis coordinate has. Matching the same spirit as `EXISTS` and
+        // `Operand::Key` below -- "is this true of some value here" --
+        // this matches if *any* value set at the cell satisfies the
+        // comparison against its own metadata.
+        Operand::Meta(field) => cell.values.iter().any(|(_, _, meta)| {
+            let n = match field {
+                MetaField::Created => meta.created_at_ms,
+                MetaField::Updated => meta.modified_at_ms,
+                MetaField::Version => meta.version,
+            } as f64;
+            match literal {
+                Literal::Int(lit) => compare_f64(n, op, *lit as f64),
+                Literal::Float(lit) => compare_f64(n, op, *lit),
+                // A metadata field is never a string or bool -- "doesn't
+                // match", not an error, same as everywhere else.
+                _ => false,
+            }
+        }),
         Operand::Key(name) => {
             let Some((_, value, _)) = cell.values.iter().find(|(k, _, _)| k == name) else {
                 return false; // key not set at this cell -- doesn't match
@@ -1148,6 +1228,198 @@ mod tests {
     fn eval_exists_is_false_when_the_key_is_not_set() {
         let c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
         assert!(!eval(&parse_expr("EXISTS(density)"), &c));
+    }
+
+    // --- Parsing/evaluation: metadata keywords (created/updated/version) ---
+
+    #[test]
+    fn parses_created_updated_version_as_operands() {
+        let stmt = parse("SELECT * WHERE created > 0 AND updated > 0 AND version > 0").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::And(
+                    Box::new(Expr::Compare(
+                        Operand::Meta(MetaField::Created),
+                        CompareOp::Gt,
+                        Literal::Int(0)
+                    )),
+                    Box::new(Expr::Compare(
+                        Operand::Meta(MetaField::Updated),
+                        CompareOp::Gt,
+                        Literal::Int(0)
+                    )),
+                )),
+                Box::new(Expr::Compare(
+                    Operand::Meta(MetaField::Version),
+                    CompareOp::Gt,
+                    Literal::Int(0)
+                )),
+            )
+        );
+    }
+
+    #[test]
+    fn metadata_keywords_are_case_insensitive_and_word_bounded() {
+        assert!(parse("SELECT * WHERE CREATED > 0").is_ok());
+        assert!(parse("SELECT * WHERE Version = 0").is_ok());
+
+        // A key that merely starts with a metadata keyword is still an
+        // ordinary identifier -- same word-boundary guarantee every other
+        // keyword here has.
+        let stmt = parse("SELECT * WHERE versioning = true").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::Compare(
+                Operand::Key("versioning".to_string()),
+                CompareOp::Eq,
+                Literal::Bool(true)
+            )
+        );
+    }
+
+    #[test]
+    fn eval_compares_metadata_fields() {
+        let mut c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        c.values[0].2 = CellMeta {
+            created_at_ms: 1_000,
+            modified_at_ms: 3_000,
+            version: 2,
+        };
+
+        assert!(eval(&parse_expr("created = 1000"), &c));
+        assert!(eval(&parse_expr("updated = 3000"), &c));
+        assert!(eval(&parse_expr("version = 2"), &c));
+        assert!(eval(&parse_expr("version > 1"), &c));
+        assert!(!eval(&parse_expr("version > 2"), &c));
+    }
+
+    #[test]
+    fn eval_metadata_matches_if_any_value_at_the_cell_satisfies_it() {
+        // Metadata is per key, not per cell -- a comparison matches if
+        // *any* value set at the cell satisfies it against its own
+        // metadata, the same "any match" spirit as EXISTS/Operand::Key.
+        let mut c = cell(
+            &[0, 0, 0],
+            vec![
+                ("material", Value::Str("stone".into())),
+                ("hardness", Value::I64(7)),
+            ],
+        );
+        c.values[0].2 = CellMeta {
+            created_at_ms: 1_000,
+            modified_at_ms: 1_000,
+            version: 0,
+        };
+        c.values[1].2 = CellMeta {
+            created_at_ms: 1_000,
+            modified_at_ms: 5_000,
+            version: 3,
+        };
+
+        assert!(eval(&parse_expr("version = 0"), &c)); // material's version
+        assert!(eval(&parse_expr("version = 3"), &c)); // hardness's version
+        assert!(!eval(&parse_expr("version = 9"), &c));
+    }
+
+    #[test]
+    fn eval_metadata_against_a_non_numeric_literal_is_false_not_an_error() {
+        let c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        assert!(!eval(&parse_expr("version = 'zero'"), &c));
+        assert!(!eval(&parse_expr("version = true"), &c));
+    }
+
+    // --- Parsing/evaluation: now() ---
+
+    #[test]
+    fn now_parses_to_a_current_millisecond_timestamp_literal() {
+        let before = now_ms();
+        let stmt = parse("SELECT * WHERE updated < now()").unwrap();
+        let after = now_ms();
+        let Statement::Select {
+            where_clause: Some(Expr::Compare(Operand::Meta(MetaField::Updated), CompareOp::Lt, Literal::Int(n))),
+            ..
+        } = stmt
+        else {
+            panic!("expected Compare(Meta(Updated), Lt, Int), got something else");
+        };
+        assert!((before..=after).contains(&n), "{n} not in [{before}, {after}]");
+    }
+
+    #[test]
+    fn now_is_case_insensitive_and_requires_parentheses() {
+        assert!(parse("SELECT * WHERE created < NOW()").is_ok());
+        assert!(parse("SELECT * WHERE created < Now()").is_ok());
+        assert!(parse("SELECT * WHERE created < now").is_err());
+        assert!(parse("SELECT * WHERE created < now(1)").is_err());
+    }
+
+    #[test]
+    fn a_key_named_like_now_still_works_as_an_ordinary_identifier() {
+        // "nowish" can't match `now_call` -- the "(" right after "NOW" is
+        // what distinguishes the function call, not a word-boundary
+        // lookahead, so an identifier that happens to start the same way
+        // is unaffected.
+        let stmt = parse("SELECT * WHERE nowish = true").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::Compare(
+                Operand::Key("nowish".to_string()),
+                CompareOp::Eq,
+                Literal::Bool(true)
+            )
+        );
+    }
+
+    #[test]
+    fn now_can_also_be_used_in_an_assignment() {
+        let before = now_ms();
+        let stmt = parse("SET (seen_at = now()) IN (0,0,0) TO (1,1,1)").unwrap();
+        let after = now_ms();
+        let Statement::Set { assignments, .. } = stmt else {
+            panic!("expected Set");
+        };
+        let [(key, Literal::Int(n))] = assignments.as_slice() else {
+            panic!("expected a single int assignment, got {assignments:?}");
+        };
+        assert_eq!(key, "seen_at");
+        assert!((before..=after).contains(n), "{n} not in [{before}, {after}]");
+    }
+
+    #[test]
+    fn now_matches_against_metadata_as_an_ordinary_int_comparison() {
+        let mut c = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
+        c.values[0].2 = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        // A cell created/modified at ms=1 is always in the past relative
+        // to now() -- this is exactly `load.sh`'s own worked example,
+        // `WHERE updated < now()`.
+        assert!(eval(&parse_expr("updated < now()"), &c));
+        assert!(eval(&parse_expr("created < now()"), &c));
     }
 
     #[test]
