@@ -152,3 +152,7 @@ code {
   border-radius: 4px;
   font-size: 0.85em;
 }
+
+#aggregate-results { margin-top: 0.5rem; }
+td.aggregate-value { font-variant-numeric: tabular-nums; }
+td.aggregate-none { color: #888; font-style: italic; }

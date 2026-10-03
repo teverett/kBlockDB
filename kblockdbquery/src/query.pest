@@ -62,10 +62,16 @@ column_list     = { ident ~ ("," ~ ident)* }
 aggregate_list  = { aggregate_call ~ ("," ~ aggregate_call)* }
 aggregate_call  = { count_call | sum_call | mean_call | max_call | min_call }
 count_call      = { ^"COUNT" ~ "(" ~ "*" ~ ")" }
-sum_call        = { ^"SUM"  ~ "(" ~ ident ~ ")" }
-mean_call       = { ^"MEAN" ~ "(" ~ ident ~ ")" }
-max_call        = { ^"MAX"  ~ "(" ~ ident ~ ")" }
-min_call        = { ^"MIN"  ~ "(" ~ ident ~ ")" }
+sum_call        = { ^"SUM"  ~ "(" ~ aggregate_arg ~ ")" }
+mean_call       = { ^"MEAN" ~ "(" ~ aggregate_arg ~ ")" }
+max_call        = { ^"MAX"  ~ "(" ~ aggregate_arg ~ ")" }
+min_call        = { ^"MIN"  ~ "(" ~ aggregate_arg ~ ")" }
+// What sum/mean/max/min reduce: a metadata keyword (`max(updated)`, the
+// latest change to any matching key -- see `meta` below) or a key name.
+// `meta` is tried first, same priority it gets in `operand`, so a key
+// literally named "updated" can't be aggregated -- the same documented
+// limitation WHERE already has.
+aggregate_arg   = { meta | ident }
 
 assignment_list = { assignment ~ ("," ~ assignment)* }
 assignment      = { ident ~ "=" ~ literal }

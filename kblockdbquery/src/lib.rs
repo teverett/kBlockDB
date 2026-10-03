@@ -75,40 +75,63 @@ pub enum Columns {
 }
 
 /// One aggregate function over a `SELECT`'s matching cells -- `count(*)`
-/// counts cells; the rest reduce the named key's numeric value across
-/// every cell where it's set (ignoring cells where it's missing or
-/// non-numeric, same "doesn't apply, not an error" philosophy as the rest
-/// of this language). See `aggregate`.
+/// counts cells; the rest reduce an `AggregateArg` -- a key's numeric
+/// value, or a metadata field -- across the matching cells (ignoring
+/// cells where a key is missing or non-numeric, same "doesn't apply, not
+/// an error" philosophy as the rest of this language). See `aggregate`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Aggregate {
     /// `count(*)`: how many cells matched, regardless of any key.
     Count,
-    /// `sum(key)`: the sum of `key`'s numeric value across every matching
-    /// cell where it's set. `0.0` if none are.
-    Sum(String),
-    /// `mean(key)`: the arithmetic mean of `key`'s numeric value across
-    /// every matching cell where it's set. `None` (not `0.0`/`NaN`) if
-    /// none are -- a mean of nothing is undefined, not zero.
-    Mean(String),
-    /// `max(key)`: the largest numeric value `key` takes across every
-    /// matching cell where it's set. `None` if none are.
-    Max(String),
-    /// `min(key)`: the smallest numeric value `key` takes across every
-    /// matching cell where it's set. `None` if none are.
-    Min(String),
+    /// `sum(arg)`: the sum of every value `arg` takes. `0.0` if none.
+    Sum(AggregateArg),
+    /// `mean(arg)`: the arithmetic mean of every value `arg` takes.
+    /// `None` (not `0.0`/`NaN`) if none -- a mean of nothing is
+    /// undefined, not zero.
+    Mean(AggregateArg),
+    /// `max(arg)`: the largest value `arg` takes. `None` if none.
+    Max(AggregateArg),
+    /// `min(arg)`: the smallest value `arg` takes. `None` if none.
+    Min(AggregateArg),
+}
+
+/// What `sum`/`mean`/`max`/`min` reduce.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AggregateArg {
+    /// A key's numeric value, at every matching cell where it's set to a
+    /// number.
+    Key(String),
+    /// `created`/`updated`/`version`: a metadata field of *every key* set
+    /// at every matching cell -- metadata is per key, not per cell (see
+    /// `Operand::Meta`), so e.g. `max(updated)` is the latest change to
+    /// anything in the matching cells, `min(created)` the earliest
+    /// creation.
+    Meta(MetaField),
+}
+
+impl std::fmt::Display for AggregateArg {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AggregateArg::Key(key) => f.write_str(key),
+            AggregateArg::Meta(MetaField::Created) => f.write_str("created"),
+            AggregateArg::Meta(MetaField::Updated) => f.write_str("updated"),
+            AggregateArg::Meta(MetaField::Version) => f.write_str("version"),
+        }
+    }
 }
 
 impl Aggregate {
     /// The label this aggregate's result is reported under -- e.g.
-    /// `"sum(density)"` -- echoing the function call it was parsed from
-    /// rather than inventing a separate naming scheme.
+    /// `"sum(density)"`, `"max(updated)"` -- echoing the function call it
+    /// was parsed from (metadata keywords lowercased) rather than
+    /// inventing a separate naming scheme.
     pub fn label(&self) -> String {
         match self {
             Aggregate::Count => "count(*)".to_string(),
-            Aggregate::Sum(key) => format!("sum({key})"),
-            Aggregate::Mean(key) => format!("mean({key})"),
-            Aggregate::Max(key) => format!("max({key})"),
-            Aggregate::Min(key) => format!("min({key})"),
+            Aggregate::Sum(arg) => format!("sum({arg})"),
+            Aggregate::Mean(arg) => format!("mean({arg})"),
+            Aggregate::Max(arg) => format!("max({arg})"),
+            Aggregate::Min(arg) => format!("min({arg})"),
         }
     }
 }
@@ -410,9 +433,9 @@ fn build_aggregate_call(pair: Pair<Rule>) -> Aggregate {
     let inner = pair.into_inner().next().unwrap();
     match inner.as_rule() {
         Rule::count_call => Aggregate::Count,
-        // sum_call = { ^"SUM" ~ "(" ~ ident ~ ")" }, etc. -- the literal
-        // keyword text and parens produce no pairs of their own, so the
-        // single remaining inner pair is always the key name.
+        // sum_call = { ^"SUM" ~ "(" ~ aggregate_arg ~ ")" }, etc. -- the
+        // literal keyword text and parens produce no pairs of their own,
+        // so the single remaining inner pair is always the argument.
         Rule::sum_call => Aggregate::Sum(aggregate_arg(inner)),
         Rule::mean_call => Aggregate::Mean(aggregate_arg(inner)),
         Rule::max_call => Aggregate::Max(aggregate_arg(inner)),
@@ -423,12 +446,19 @@ fn build_aggregate_call(pair: Pair<Rule>) -> Aggregate {
     }
 }
 
-fn aggregate_arg(call: Pair<Rule>) -> String {
-    call.into_inner()
+fn aggregate_arg(call: Pair<Rule>) -> AggregateArg {
+    // aggregate_arg = { meta | ident }
+    let arg = call
+        .into_inner()
         .next()
-        .expect("sum/mean/max/min_call always has an ident pair")
-        .as_str()
-        .to_string()
+        .expect("sum/mean/max/min_call always has an aggregate_arg pair")
+        .into_inner()
+        .next()
+        .expect("aggregate_arg is always a meta or an ident");
+    match arg.as_rule() {
+        Rule::meta => AggregateArg::Meta(build_meta_field(arg)),
+        _ => AggregateArg::Key(arg.as_str().to_string()),
+    }
 }
 
 fn build_assignment_list(pair: Pair<Rule>) -> Result<Vec<(String, Literal)>, ParseError> {
@@ -739,22 +769,42 @@ pub fn aggregate(aggregates: &[Aggregate], cells: &[&CellEntry]) -> Vec<Aggregat
             label: agg.label(),
             value: match agg {
                 Aggregate::Count => Some(cells.len() as f64),
-                Aggregate::Sum(key) => Some(numeric_values(cells, key).sum()),
-                Aggregate::Mean(key) => {
-                    let values: Vec<f64> = numeric_values(cells, key).collect();
+                Aggregate::Sum(arg) => Some(arg_values(cells, arg).sum()),
+                Aggregate::Mean(arg) => {
+                    let values: Vec<f64> = arg_values(cells, arg).collect();
                     if values.is_empty() {
                         None
                     } else {
                         Some(values.iter().sum::<f64>() / values.len() as f64)
                     }
                 }
-                Aggregate::Max(key) => numeric_values(cells, key)
+                Aggregate::Max(arg) => arg_values(cells, arg)
                     .fold(None, |max, n| Some(max.map_or(n, |max: f64| max.max(n)))),
-                Aggregate::Min(key) => numeric_values(cells, key)
+                Aggregate::Min(arg) => arg_values(cells, arg)
                     .fold(None, |min, n| Some(min.map_or(n, |min: f64| min.min(n)))),
             },
         })
         .collect()
+}
+
+/// Every value `arg` takes across `cells`, as `f64`: a key's numeric
+/// values (see `numeric_values`), or a metadata field of every key set at
+/// every cell. Millisecond timestamps are well inside `f64`'s exact
+/// integer range (2^53), so `created`/`updated` lose nothing.
+fn arg_values<'a>(
+    cells: &'a [&CellEntry],
+    arg: &'a AggregateArg,
+) -> Box<dyn Iterator<Item = f64> + 'a> {
+    match arg {
+        AggregateArg::Key(key) => Box::new(numeric_values(cells, key)),
+        AggregateArg::Meta(field) => Box::new(cells.iter().flat_map(move |cell| {
+            cell.values.iter().map(move |(_, _, meta)| match field {
+                MetaField::Created => meta.created_at_ms as f64,
+                MetaField::Updated => meta.modified_at_ms as f64,
+                MetaField::Version => meta.version as f64,
+            })
+        })),
+    }
 }
 
 /// `key`'s numeric value (`I64` or `F64`, as `f64`) at every cell in
@@ -1519,10 +1569,10 @@ mod tests {
         assert_eq!(
             columns,
             Columns::Aggregates(vec![
-                Aggregate::Sum("density".to_string()),
-                Aggregate::Mean("density".to_string()),
-                Aggregate::Max("density".to_string()),
-                Aggregate::Min("density".to_string()),
+                Aggregate::Sum(AggregateArg::Key("density".to_string())),
+                Aggregate::Mean(AggregateArg::Key("density".to_string())),
+                Aggregate::Max(AggregateArg::Key("density".to_string())),
+                Aggregate::Min(AggregateArg::Key("density".to_string())),
             ])
         );
     }
@@ -1546,21 +1596,129 @@ mod tests {
     fn aggregate_label_echoes_the_function_call() {
         assert_eq!(Aggregate::Count.label(), "count(*)");
         assert_eq!(
-            Aggregate::Sum("density".to_string()).label(),
+            Aggregate::Sum(AggregateArg::Key("density".to_string())).label(),
             "sum(density)"
         );
         assert_eq!(
-            Aggregate::Mean("density".to_string()).label(),
+            Aggregate::Mean(AggregateArg::Key("density".to_string())).label(),
             "mean(density)"
         );
         assert_eq!(
-            Aggregate::Max("density".to_string()).label(),
+            Aggregate::Max(AggregateArg::Key("density".to_string())).label(),
             "max(density)"
         );
         assert_eq!(
-            Aggregate::Min("density".to_string()).label(),
+            Aggregate::Min(AggregateArg::Key("density".to_string())).label(),
             "min(density)"
         );
+    }
+
+    /// The `columns` of a `SELECT` -- for the aggregate parsing tests.
+    fn select_columns(src: &str) -> Columns {
+        match parse(src).unwrap() {
+            Statement::Select { columns, .. } => columns,
+            other => panic!("expected a SELECT, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn aggregates_parse_metadata_keywords_as_metadata() {
+        assert_eq!(
+            select_columns(
+                "SELECT max(updated), min(created), mean(version), sum(VERSION) FROM (0) TO (1)"
+            ),
+            Columns::Aggregates(vec![
+                Aggregate::Max(AggregateArg::Meta(MetaField::Updated)),
+                Aggregate::Min(AggregateArg::Meta(MetaField::Created)),
+                Aggregate::Mean(AggregateArg::Meta(MetaField::Version)),
+                Aggregate::Sum(AggregateArg::Meta(MetaField::Version)),
+            ])
+        );
+        // Word-bounded, like everywhere else: a key that merely starts
+        // with a metadata keyword is still a key.
+        assert_eq!(
+            select_columns("SELECT max(updatedness) FROM (0) TO (1)"),
+            Columns::Aggregates(vec![Aggregate::Max(AggregateArg::Key(
+                "updatedness".to_string()
+            ))])
+        );
+    }
+
+    #[test]
+    fn metadata_aggregates_are_labelled_lowercase() {
+        assert_eq!(
+            Aggregate::Max(AggregateArg::Meta(MetaField::Updated)).label(),
+            "max(updated)"
+        );
+        assert_eq!(
+            Aggregate::Min(AggregateArg::Meta(MetaField::Created)).label(),
+            "min(created)"
+        );
+        assert_eq!(
+            Aggregate::Sum(AggregateArg::Meta(MetaField::Version)).label(),
+            "sum(version)"
+        );
+    }
+
+    #[test]
+    fn metadata_aggregates_reduce_every_keys_metadata_across_cells() {
+        let meta = |created, updated, version| CellMeta {
+            created_at_ms: created,
+            modified_at_ms: updated,
+            version,
+        };
+        // Two keys in one cell, each with its own metadata, plus a second
+        // cell -- every key's metadata counts.
+        let mut a = cell(
+            &[0, 0, 0],
+            vec![
+                ("material", Value::Str("stone".into())),
+                ("density", Value::F64(2.6)),
+            ],
+        );
+        a.values[0].2 = meta(1_000, 5_000, 4);
+        a.values[1].2 = meta(2_000, 2_000, 0);
+        let mut b = cell(&[1, 0, 0], vec![("material", Value::Str("sand".into()))]);
+        b.values[0].2 = meta(500, 9_000, 2);
+        let empty = cell(&[2, 0, 0], vec![]);
+
+        let results = aggregate(
+            &[
+                Aggregate::Max(AggregateArg::Meta(MetaField::Updated)),
+                Aggregate::Min(AggregateArg::Meta(MetaField::Created)),
+                Aggregate::Max(AggregateArg::Meta(MetaField::Version)),
+                Aggregate::Sum(AggregateArg::Meta(MetaField::Version)),
+                Aggregate::Mean(AggregateArg::Meta(MetaField::Version)),
+            ],
+            &[&a, &b, &empty],
+        );
+        let values: Vec<Option<f64>> = results.iter().map(|r| r.value).collect();
+        assert_eq!(
+            values,
+            vec![Some(9_000.0), Some(500.0), Some(4.0), Some(6.0), Some(2.0)]
+        );
+
+        // No keys at all: nothing to take a max of.
+        let results = aggregate(
+            &[Aggregate::Max(AggregateArg::Meta(MetaField::Updated))],
+            &[&empty],
+        );
+        assert_eq!(results[0].value, None);
+    }
+
+    #[test]
+    fn millisecond_timestamps_survive_metadata_aggregation_exactly() {
+        let mut a = cell(&[0, 0, 0], vec![("k", Value::I64(1))]);
+        a.values[0].2 = CellMeta {
+            created_at_ms: 1_790_999_411_204,
+            modified_at_ms: 1_790_999_411_205,
+            version: 0,
+        };
+        let results = aggregate(
+            &[Aggregate::Max(AggregateArg::Meta(MetaField::Updated))],
+            &[&a],
+        );
+        assert_eq!(results[0].value.map(|v| v as u64), Some(1_790_999_411_205));
     }
 
     #[test]
@@ -1586,10 +1744,10 @@ mod tests {
 
         let results = aggregate(
             &[
-                Aggregate::Sum("density".to_string()),
-                Aggregate::Mean("density".to_string()),
-                Aggregate::Max("density".to_string()),
-                Aggregate::Min("density".to_string()),
+                Aggregate::Sum(AggregateArg::Key("density".to_string())),
+                Aggregate::Mean(AggregateArg::Key("density".to_string())),
+                Aggregate::Max(AggregateArg::Key("density".to_string())),
+                Aggregate::Min(AggregateArg::Key("density".to_string())),
             ],
             &cells,
         );
@@ -1621,10 +1779,10 @@ mod tests {
         let a = cell(&[0, 0, 0], vec![("material", Value::Str("stone".into()))]);
         let results = aggregate(
             &[
-                Aggregate::Sum("density".to_string()),
-                Aggregate::Mean("density".to_string()),
-                Aggregate::Max("density".to_string()),
-                Aggregate::Min("density".to_string()),
+                Aggregate::Sum(AggregateArg::Key("density".to_string())),
+                Aggregate::Mean(AggregateArg::Key("density".to_string())),
+                Aggregate::Max(AggregateArg::Key("density".to_string())),
+                Aggregate::Min(AggregateArg::Key("density".to_string())),
             ],
             &[&a],
         );
@@ -1640,7 +1798,10 @@ mod tests {
         let missing = cell(&[1, 0, 0], vec![]);
         let wrong_type = cell(&[2, 0, 0], vec![("density", Value::Str("heavy".into()))]);
         let results = aggregate(
-            &[Aggregate::Sum("density".to_string()), Aggregate::Count],
+            &[
+                Aggregate::Sum(AggregateArg::Key("density".to_string())),
+                Aggregate::Count,
+            ],
             &[&numeric, &missing, &wrong_type],
         );
         assert_eq!(results[0].value, Some(10.0)); // only `numeric` contributes

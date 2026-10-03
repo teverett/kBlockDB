@@ -495,8 +495,11 @@ of trying to query for nothing.
 The query box runs a real [`SELECT`](query-language.md) against the
 selected database via `POST /query` (body `{"db": "<name>", "query":
 "<text>"}`) -- a plain `SELECT`'s rows, or an aggregate `SELECT`'s
-`count`/`sum`/`mean`/`max`/`min` results (shown as `label = value` lines
-instead of the table). `SET`/`UPDATE`/`DELETE` are refused with a `403`
+`count`/`sum`/`mean`/`max`/`min` results, shown in their own Aggregate /
+Value table in place of the cell table and pager. Whole numbers show
+without a trailing `.0`; a `min`/`max`/`mean` of `created`/`updated` shows
+as a local date-time (raw milliseconds on hover); an aggregate over no
+values shows "no values". `SET`/`UPDATE`/`DELETE` are refused with a `403`
 here *unconditionally* -- unlike `POST /rest/db/{db}/query`, a
 full-access account gets no exception, since this page's whole premise
 is that there's no way to edit anything from here. The query itself runs
@@ -507,9 +510,16 @@ occasionally, not meant for a query matching millions of cells.
 
 The **Cluster** tab lists every host this server knows about -- itself,
 plus every peer, whether configured or learned because it connected in --
-with a connected / not connected status, from
-`GET /rest/cluster`. It re-fetches every time the tab is opened, so
-switching back to it picks up any peer that's connected or dropped since.
+from `GET /rest/cluster`: each one's node id, sequence number, connected /
+not connected status, sync state against this server (in sync, behind,
+ahead, diverged -- both version vectors on hover), and when it last
+synced. It refreshes every 5 seconds while it's open, pausing while the
+page is hidden, without flickering; a failed refresh keeps the last rows
+and says so underneath.
+
+The open tab is kept in the URL (`/#cluster` for the Cluster tab), so a
+browser refresh reopens the same tab, `/#cluster` can be bookmarked, and
+the back/forward buttons step between tabs.
 
 Deliberately kept outside `/rest`: this is a convenience UI over the same
 data, not part of the versioned REST API surface -- it has no OpenAPI

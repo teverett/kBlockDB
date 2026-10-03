@@ -99,6 +99,14 @@ rather than one row per cell:
   from `count(*)` or from any other aggregate in the same `SELECT`).
   `sum` of nothing is `0`; `mean`/`max`/`min` of nothing is `null` --
   unlike `sum`, there's no sensible number to report for an empty set.
+- `sum`/`mean`/`max`/`min(created | updated | version)` -- the same
+  reductions over metadata. Metadata is per key (see the metadata keywords
+  above), so these take in *every key set* at every matching cell:
+  `max(updated)` is when anything in the matching cells last changed (ms
+  since the Unix epoch), `min(created)` when the oldest value was first
+  written, `max(version)` the most-overwritten value's version. Like the
+  WHERE keywords, a key literally named `created`, `updated` or `version`
+  can't be aggregated.
 
 A key literally named e.g. `count`, `sum`, `mean`, `max`, or `min` can
 still be selected or compared against as an ordinary column/key -- same
@@ -109,6 +117,7 @@ of these parse as an aggregate call.
 ```text
 SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'
 SELECT sum(density), mean(density), max(density), min(density)
+SELECT count(*), max(updated), min(created) WHERE material = 'stone'
 ```
 
 **`SET` is an upsert; `UPDATE` is not.** `SELECT`/`UPDATE`/`DELETE` all run

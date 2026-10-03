@@ -27,24 +27,36 @@
       <select id="database" aria-label="Database"></select>
     </div>
 
-    <table>
+    <div id="cell-results">
+      <table>
+        <thead>
+          <tr>
+            <th>Coordinate</th>
+            <th># keys</th>
+            <th>Created</th>
+            <th>Modified</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" class="empty" hidden>No cells match.</p>
+
+      <div class="pager">
+        <button id="prev" type="button">&larr; Prev</button>
+        <span id="page-info" class="muted"></span>
+        <button id="next" type="button">Next &rarr;</button>
+      </div>
+    </div>
+
+    <table id="aggregate-results" hidden>
       <thead>
         <tr>
-          <th>Coordinate</th>
-          <th># keys</th>
-          <th>Created</th>
-          <th>Modified</th>
+          <th>Aggregate</th>
+          <th>Value</th>
         </tr>
       </thead>
-      <tbody id="rows"></tbody>
+      <tbody id="aggregate-rows"></tbody>
     </table>
-    <p id="empty" class="empty" hidden>No cells match.</p>
-
-    <div class="pager">
-      <button id="prev" type="button">&larr; Prev</button>
-      <span id="page-info" class="muted"></span>
-      <button id="next" type="button">Next &rarr;</button>
-    </div>
   </div>
 
   <div id="tab-cluster" class="tab-panel" hidden role="tabpanel">
@@ -97,6 +109,9 @@
   const state = { database: "", page: 1, pageSize: 50, rows: [] };
 
   const rowsBody = document.getElementById("rows");
+  const cellResults = document.getElementById("cell-results");
+  const aggregateResults = document.getElementById("aggregate-results");
+  const aggregateRowsBody = document.getElementById("aggregate-rows");
   const emptyMsg = document.getElementById("empty");
   const pageInfo = document.getElementById("page-info");
   const databaseSelect = document.getElementById("database");
@@ -241,6 +256,7 @@
       renderAggregates(data.aggregates);
       return;
     }
+    showAggregates(false);
     state.rows = (data.rows || []).map(function (row) {
       const created = row.values.map(function (v) { return v.created_at_ms; });
       const modified = row.values.map(function (v) { return v.modified_at_ms; });
@@ -272,22 +288,60 @@
     });
   }
 
+  // Swaps the results area between the cell table (with its pager) and
+  // the aggregates table -- an aggregate query has no rows to page.
+  function showAggregates(show) {
+    aggregateResults.hidden = !show;
+    cellResults.hidden = show;
+  }
+
+  // A `SELECT count(*)`/`sum(...)`/`max(updated)`/... result: one row per
+  // aggregate, in the order the query asked for them.
   function renderAggregates(aggregates) {
     state.rows = [];
     rowsBody.textContent = "";
-    emptyMsg.hidden = true;
-    pageInfo.textContent = "";
-    prevBtn.disabled = true;
-    nextBtn.disabled = true;
-    queryStatus.textContent = "";
-    queryStatus.classList.remove("error");
-    aggregates.forEach(function (a) {
-      const value = a.value === null || a.value === undefined ? "null" : String(a.value);
-      queryStatus.appendChild(cell("div", a.label + " = " + value));
-    });
+    showAggregates(true);
+    aggregateRowsBody.replaceChildren.apply(
+      aggregateRowsBody,
+      aggregates.map(function (a) {
+        const tr = document.createElement("tr");
+        tr.appendChild(cell("td", a.label));
+        const formatted = formatAggregate(a.label, a.value);
+        const valueTd = cell("td", formatted.text);
+        valueTd.className = formatted.className;
+        if (formatted.title) {
+          valueTd.title = formatted.title;
+        }
+        tr.appendChild(valueTd);
+        return tr;
+      })
+    );
+    setQueryStatus(aggregates.length + " aggregate" + (aggregates.length === 1 ? "" : "s"));
+  }
+
+  // How an aggregate's value is shown. `null` (a mean/max/min over no
+  // values) reads "no values"; a min/max/mean of `created`/`updated` is a
+  // timestamp, shown as a local date-time with the raw ms on hover;
+  // anything else is a plain number -- whole numbers without a trailing
+  // ".0", and float noise trimmed to 12 significant digits.
+  function formatAggregate(label, value) {
+    if (value === null || value === undefined) {
+      return { text: "no values", className: "aggregate-none" };
+    }
+    if (/^(min|max|mean)\((created|updated)\)$/.test(label)) {
+      const ms = Math.round(value);
+      return {
+        text: new Date(ms).toLocaleString(),
+        className: "aggregate-value",
+        title: ms + " ms",
+      };
+    }
+    const text = Number.isInteger(value) ? String(value) : String(Number(value.toPrecision(12)));
+    return { text: text, className: "aggregate-value" };
   }
 
   function renderError(message) {
+    showAggregates(false);
     state.rows = [];
     rowsBody.textContent = "";
     emptyMsg.hidden = false;

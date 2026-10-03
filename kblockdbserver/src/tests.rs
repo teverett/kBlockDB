@@ -1193,6 +1193,28 @@ async fn the_cluster_tab_refreshes_itself() {
     assert!(html.contains(r#"id="cluster-updated""#));
 }
 
+/// An aggregate query's results get their own table (in place of the
+/// cell table and its pager), formatted per aggregate.
+#[tokio::test]
+async fn the_data_browser_has_an_aggregate_results_table() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let resp = test_app()
+        .0
+        .oneshot(with_auth(req, TEST_ADMIN, TEST_ADMIN_PASSWORD))
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains(r#"<table id="aggregate-results" hidden>"#));
+    assert!(html.contains(r#"<tbody id="aggregate-rows">"#));
+    assert!(html.contains(r#"<div id="cell-results">"#));
+    assert!(html.contains("function formatAggregate(label, value)"));
+}
+
 #[tokio::test]
 async fn the_browser_stylesheet_requires_auth() {
     let req = Request::builder()
@@ -1483,6 +1505,54 @@ async fn select_count_star_counts_matching_cells() {
         body["aggregates"],
         json!([{"label": "count(*)", "value": 3.0}])
     );
+}
+
+#[tokio::test]
+async fn select_aggregates_metadata_like_max_updated() {
+    let (app, _dir) = test_app();
+    let before = kblockdbcluster::hub::now_ms();
+    // One cell written twice (version 1), one once (version 0).
+    for (coords, material) in [("1,2,3", "stone"), ("1,2,3", "granite"), ("4,5,6", "air")] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/db/db/cells/{coords}/material"),
+                json!({"type": "str", "value": material}),
+            ),
+        )
+        .await;
+    }
+    let (_, cell) = send(app.clone(), get("/rest/db/db/cells/4,5,6/material")).await;
+    let latest = cell["modified_at_ms"].as_u64().unwrap();
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT max(updated), min(created), max(version), sum(version)"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let results = body["aggregates"].as_array().unwrap();
+    let labels: Vec<&str> = results
+        .iter()
+        .map(|r| r["label"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            "max(updated)",
+            "min(created)",
+            "max(version)",
+            "sum(version)"
+        ]
+    );
+    assert_eq!(results[0]["value"].as_f64().unwrap() as u64, latest);
+    let min_created = results[1]["value"].as_f64().unwrap() as u64;
+    assert!(min_created >= before && min_created <= latest);
+    assert_eq!(results[2]["value"], json!(1.0));
+    assert_eq!(results[3]["value"], json!(1.0));
 }
 
 #[tokio::test]
