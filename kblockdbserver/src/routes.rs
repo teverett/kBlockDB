@@ -228,6 +228,16 @@ pub struct ClusterPeer {
     /// seconds while its link to this instance is up); `null` until it
     /// has.
     vector: Option<BTreeMap<String, u64>>,
+    /// The peer's own sequence number: the latest of its own writes it has
+    /// confirmed (its own entry in `vector`). Until it has reported a
+    /// vector, the latest of its writes this instance is known to have;
+    /// `null` if neither is known yet.
+    seq: Option<u64>,
+    /// When the peer last confirmed it had sent this instance everything
+    /// (its last `Synced`, every few seconds while its link is up), in ms
+    /// since the Unix epoch by this instance's clock; `null` if it hasn't
+    /// yet since this instance started.
+    last_synced_ms: Option<u64>,
     /// The peer's vector compared with this instance's.
     sync: SyncState,
     /// Roughly how many writes this instance has that the peer doesn't:
@@ -300,6 +310,13 @@ pub struct ClusterResponse {
     node_id: Option<String>,
     /// Same as `HealthResponse::vector`.
     vector: BTreeMap<String, u64>,
+    /// This instance's own sequence number: the latest of its own writes
+    /// it has confirmed (its own entry in `vector`). `null` unless
+    /// clustering is configured.
+    seq: Option<u64>,
+    /// This instance's current time, ms since the Unix epoch -- the clock
+    /// each peer's `last_synced_ms` is by, for working out how long ago.
+    now_ms: u64,
     peers: Vec<ClusterPeer>,
 }
 
@@ -319,6 +336,8 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
             hostname: state.hostname.to_string(),
             node_id: None,
             vector: BTreeMap::new(),
+            seq: None,
+            now_ms: kblockdbcluster::hub::now_ms(),
             peers: Vec::new(),
         });
     };
@@ -333,11 +352,19 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
                 Some(theirs) => compare_vectors(&mine, theirs),
                 None => (SyncState::Unknown, 0, 0),
             };
+            let seq = node_id.and_then(|id| {
+                theirs
+                    .as_ref()
+                    .and_then(|theirs| theirs.get(id))
+                    .or_else(|| mine.get(id))
+            });
             ClusterPeer {
                 host,
                 connected,
                 node_id: node_id.map(node_id_hex),
                 vector: theirs.as_ref().map(vector_json),
+                seq,
+                last_synced_ms: node_id.and_then(|id| peer_set.vectors().peer_last_synced(id)),
                 sync,
                 behind_by,
                 ahead_by,
@@ -347,6 +374,8 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
     Json(ClusterResponse {
         hostname: state.hostname.to_string(),
         node_id: Some(node_id_hex(peer_set.node_id())),
+        seq: mine.get(peer_set.node_id()),
+        now_ms: kblockdbcluster::hub::now_ms(),
         vector: vector_json(&mine),
         peers,
     })

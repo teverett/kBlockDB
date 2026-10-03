@@ -253,6 +253,24 @@ impl PeerSet {
         );
     }
 
+    /// Cuts short the reconnect backoff of the link to a peer that's just
+    /// shown it's up -- by connecting in from `address` as node `node_id`
+    /// -- so it reconnects (and catches the peer up) now instead of
+    /// whenever its backoff would have retried. Wakes the link known by
+    /// that address and, if different, the one that reached that node id
+    /// before (a peer configured by hostname, say).
+    pub fn wake(&self, address: &str, node_id: u64) {
+        let inner = self.inner.lock().unwrap();
+        let claimed = inner.claims.get(&node_id).map(String::as_str);
+        for address in std::iter::once(address).chain(claimed) {
+            if let Some(entry) = inner.known.get(address) {
+                if !entry.status.is_connected() {
+                    entry.status.wake();
+                }
+            }
+        }
+    }
+
     /// Whether `status` is still the live entry for `address` -- false
     /// once it's been pruned or dropped, even if the same address has
     /// since been re-added (with a fresh status). A `client::run` task

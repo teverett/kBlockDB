@@ -147,12 +147,15 @@ impl Sequencer {
         if seqs.is_empty() {
             return;
         }
+        // Signalled *before* the seqs leave `in_flight`: a link that reads a
+        // `confirmed_through` past them is then sure to see the resync too
+        // (see `client.rs`'s `Synced` tick), so it never confirms them to a
+        // peer without first catching it up on them.
+        self.resync.send_modify(|n| *n += 1);
         let mut state = self.state.lock().unwrap();
         for seq in seqs {
             state.in_flight.remove(seq);
         }
-        drop(state);
-        self.resync.send_modify(|n| *n += 1);
     }
 
     /// Every seq up to here has been published (or never used): what this

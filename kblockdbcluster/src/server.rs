@@ -171,6 +171,11 @@ async fn handle_connection<S: ReplicationSink>(
     // as well -- a no-op if it's already known (e.g. configured here too).
     if peers.add(dial_back.clone()) {
         eprintln!("peer protocol: learned new peer {dial_back}");
+    } else {
+        // Known already, and evidently back up (a restart, say): if our
+        // link to it is waiting out a reconnect backoff, retry now, so it
+        // catches up straight away.
+        peers.wake(&dial_back, node_id);
     }
 
     // Ask for everything this server doesn't have yet -- see `peers.rs`'s
@@ -259,6 +264,7 @@ mod tests {
         spawn_node, spawn_node_with, wait_until, RecordingSink, TestNode, CLUSTER_SECRET,
     };
     use kblockdblib::{Value, VersionVector};
+    use std::time::Duration;
     use tokio::net::TcpStream as ClientStream;
 
     const DB: &str = "db";
@@ -384,6 +390,41 @@ mod tests {
         // ... so the next request still starts from 5.
         let (_stream, known) = connect_and_read_catch_up_request(addr).await;
         assert_eq!(known.get(TEST_CLIENT_NODE_ID), Some(5));
+    }
+
+    /// A restarted peer connecting in wakes this node's own link to it, so
+    /// it catches the peer up at once instead of after its backoff.
+    #[tokio::test]
+    async fn a_peer_connecting_in_wakes_the_link_back_to_it() {
+        let a = spawn_node("node-a").await;
+        let b_addr = crate::test_support::free_addr();
+        // A knows B, which is down: A's link backs off (it's now waiting
+        // until ~3.5s), and A writes something B will need.
+        a.peers.add(b_addr.to_string());
+        local_write(&a, &[7], Some("written-while-b-was-down"));
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+
+        // B comes up and dials A (as if A were in its config).
+        let listener = tokio::net::TcpListener::bind(b_addr).await.unwrap();
+        let b = crate::test_support::spawn_node_on(
+            "node-b",
+            listener,
+            RecordingSink::new(),
+            crate::hub::ReplicationHub::new(),
+            |p| p,
+        );
+        b.peers.add(a.addr.to_string());
+
+        let caught_up = tokio::time::timeout(Duration::from_millis(800), async {
+            while b.sink.get(DB, &[7], "material").is_none() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(
+            caught_up.is_ok(),
+            "B wasn't caught up before A's backoff ran out"
+        );
     }
 
     #[tokio::test]

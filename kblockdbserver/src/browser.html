@@ -54,13 +54,16 @@
         <tr>
           <th>Host</th>
           <th>Node</th>
+          <th title="The node's own sequence number: how many writes it has made (the latest it has confirmed)">Seq</th>
           <th>Status</th>
           <th title="This peer's version vector -- every write it's guaranteed to have, per origin -- compared with this server's">Sync</th>
+          <th title="When this peer last confirmed it had sent this server everything, by this server's clock">Last synced</th>
         </tr>
       </thead>
       <tbody id="cluster-rows"></tbody>
     </table>
     <p id="cluster-empty" class="empty" hidden></p>
+    <p id="cluster-updated" class="updated"></p>
   </div>
 
   <div id="modal-backdrop">
@@ -113,6 +116,7 @@
   const tabCluster = document.getElementById("tab-cluster");
   const clusterRowsBody = document.getElementById("cluster-rows");
   const clusterEmpty = document.getElementById("cluster-empty");
+  const clusterUpdated = document.getElementById("cluster-updated");
 
   // Every helper below builds DOM nodes via createElement/textContent,
   // never innerHTML, for anything derived from cell data (coordinates are
@@ -353,10 +357,8 @@
   }
 
   // Shows the named tab's panel and hides the other -- `name` is
-  // `"browser"` or `"cluster"`. Reloads the cluster tab's own data every
-  // time it's switched to (rather than once, on first open) so switching
-  // back to it after time has passed reflects any peer that's connected
-  // or dropped since.
+  // `"browser"` or `"cluster"`. The Cluster tab refreshes itself while
+  // it's open (see `startClusterRefresh`) and stops when it's left.
   function showTab(name) {
     const browserActive = name === "browser";
     tabBrowser.hidden = !browserActive;
@@ -365,24 +367,54 @@
     tabBtnBrowser.setAttribute("aria-selected", String(browserActive));
     tabBtnCluster.classList.toggle("active", !browserActive);
     tabBtnCluster.setAttribute("aria-selected", String(!browserActive));
-    if (!browserActive) {
-      loadCluster();
+    if (browserActive) {
+      stopClusterRefresh();
+    } else if (!document.hidden) {
+      startClusterRefresh();
     }
   }
 
   // One row of the Cluster tab. `peer` is a `/rest/cluster` peer, or
-  // null for this server's own row (`self` = that response).
-  function clusterRow(host, nodeId, connected, peer, self) {
+  // null for this server's own row (`self` = that response); `seq` is the
+  // node's own sequence number, or null if not known yet.
+  function clusterRow(host, nodeId, seq, connected, peer, self) {
     const tr = document.createElement("tr");
     tr.appendChild(cell("td", host));
     const nodeTd = cell("td", nodeId || "");
     nodeTd.className = "node-id";
     tr.appendChild(nodeTd);
+    const seqTd = cell("td", seq === null || seq === undefined ? "" : String(seq));
+    seqTd.className = "seq";
+    tr.appendChild(seqTd);
     const statusTd = cell("td", connected ? "connected" : "not connected");
     statusTd.className = connected ? "status-up" : "status-down";
     tr.appendChild(statusTd);
     tr.appendChild(peer ? syncCell(peer, self) : cell("td", ""));
+    tr.appendChild(peer ? lastSyncedCell(peer.last_synced_ms, self.now_ms) : cell("td", ""));
     return tr;
+  }
+
+  // `ms` (since the Unix epoch, by the server's clock) as a local time plus
+  // how long before `nowMs` (the server's "now", so a skewed browser clock
+  // doesn't matter); "never" if null.
+  function lastSyncedCell(ms, nowMs) {
+    if (ms === null || ms === undefined) {
+      const td = cell("td", "never");
+      td.className = "last-synced-never";
+      return td;
+    }
+    const td = cell("td", new Date(ms).toLocaleString() + " (" + ago(nowMs - ms) + ")");
+    td.title = ms + " ms";
+    return td;
+  }
+
+  // "12s ago", "5m ago", "3h ago", "2d ago".
+  function ago(elapsedMs) {
+    const seconds = Math.max(0, Math.round(elapsedMs / 1000));
+    if (seconds < 60) return seconds + "s ago";
+    if (seconds < 3600) return Math.round(seconds / 60) + "m ago";
+    if (seconds < 86400) return Math.round(seconds / 3600) + "h ago";
+    return Math.round(seconds / 86400) + "d ago";
   }
 
   const SYNC_LABELS = {
@@ -420,41 +452,84 @@
       .join(", ") || "(empty)";
   }
 
+  // How often the Cluster tab refreshes itself while it's showing --
+  // the same cadence peers confirm (`Synced`) at, so each refresh can
+  // show something new.
+  const CLUSTER_REFRESH_MS = 5000;
+  let clusterTimer = null;
+  let clusterLoading = false;
+
   // Populates the Cluster tab from `GET /rest/cluster` -- this instance
   // itself, plus every known peer (configured, or learned because it
-  // connected in), connected or not (see `docs/clustering.md`).
-  // Not live-updating on its own; `showTab` re-runs this every time the
-  // tab is opened instead.
+  // connected in), connected or not (see `docs/clustering.md`). Runs when
+  // the tab is opened and then every `CLUSTER_REFRESH_MS` while it stays
+  // open (see `startClusterRefresh`). The new rows replace the old ones in
+  // one step, so a refresh doesn't flicker; a failed refresh keeps the
+  // last rows and says so underneath.
   async function loadCluster() {
-    clusterRowsBody.textContent = "";
-    clusterEmpty.hidden = true;
-    let resp;
+    if (clusterLoading) {
+      return; // the previous refresh is still in flight
+    }
+    clusterLoading = true;
     try {
-      resp = await fetch("rest/cluster");
-    } catch (e) {
-      clusterEmpty.hidden = false;
-      clusterEmpty.textContent = "request failed: " + e;
-      return;
-    }
-    if (!resp.ok) {
-      clusterEmpty.hidden = false;
-      clusterEmpty.textContent = resp.status + ": " + resp.statusText;
-      return;
-    }
-    const data = await resp.json();
+      let data;
+      try {
+        const resp = await fetch("rest/cluster");
+        if (!resp.ok) {
+          throw new Error(resp.status + ": " + resp.statusText);
+        }
+        data = await resp.json();
+      } catch (e) {
+        clusterUpdated.textContent = "Refresh failed (" + e.message + ") -- retrying every " +
+          CLUSTER_REFRESH_MS / 1000 + "s";
+        clusterUpdated.classList.add("failed");
+        return;
+      }
 
-    clusterRowsBody.appendChild(
-      clusterRow(data.hostname + " (this server)", data.node_id, true, null, data)
-    );
-    (data.peers || []).forEach(function (p) {
-      clusterRowsBody.appendChild(clusterRow(p.host, p.node_id, p.connected, p, data));
-    });
+      const rows = [
+        clusterRow(data.hostname + " (this server)", data.node_id, data.seq, true, null, data),
+      ];
+      (data.peers || []).forEach(function (p) {
+        rows.push(clusterRow(p.host, p.node_id, p.seq, p.connected, p, data));
+      });
+      clusterRowsBody.replaceChildren.apply(clusterRowsBody, rows);
 
-    if (!data.peers || data.peers.length === 0) {
-      clusterEmpty.hidden = false;
-      clusterEmpty.textContent = "No peers configured or connected -- see docs/clustering.md.";
+      const noPeers = !data.peers || data.peers.length === 0;
+      clusterEmpty.hidden = !noPeers;
+      clusterEmpty.textContent = noPeers
+        ? "No peers configured or connected -- see docs/clustering.md."
+        : "";
+      clusterUpdated.textContent = "Updated " + new Date().toLocaleTimeString() +
+        " -- refreshes every " + CLUSTER_REFRESH_MS / 1000 + "s";
+      clusterUpdated.classList.remove("failed");
+    } finally {
+      clusterLoading = false;
     }
   }
+
+  // Refreshes the Cluster tab now and then every `CLUSTER_REFRESH_MS` --
+  // only while it's the open tab and the browser tab is visible, so a
+  // backgrounded page doesn't keep polling.
+  function startClusterRefresh() {
+    stopClusterRefresh();
+    loadCluster();
+    clusterTimer = setInterval(loadCluster, CLUSTER_REFRESH_MS);
+  }
+
+  function stopClusterRefresh() {
+    if (clusterTimer !== null) {
+      clearInterval(clusterTimer);
+      clusterTimer = null;
+    }
+  }
+
+  document.addEventListener("visibilitychange", function () {
+    if (document.hidden) {
+      stopClusterRefresh();
+    } else if (!tabCluster.hidden) {
+      startClusterRefresh();
+    }
+  });
 
   // The open tab lives in the URL -- `#cluster` for the Cluster tab,
   // no fragment for the Browser tab -- so a refresh reopens the same tab,

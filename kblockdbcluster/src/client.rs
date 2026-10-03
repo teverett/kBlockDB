@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 
 /// Whether a `run` task's connection to its one peer is currently up, and
 /// if not, since when -- cheap to clone (`Arc`-shared) and read from
@@ -23,8 +23,14 @@ use tokio::sync::{broadcast, mpsc};
 /// `Hello`/`HelloOk` succeeds and down again the instant the connection
 /// ends, for any reason. `PeerSet::prune` uses `down_for` to find peers
 /// that have been unreachable too long.
+///
+/// Also carries the link's *wake* signal (see `wake`), which cuts a
+/// reconnect backoff short.
 #[derive(Clone)]
-pub struct ConnectionStatus(Arc<Mutex<LinkState>>);
+pub struct ConnectionStatus {
+    state: Arc<Mutex<LinkState>>,
+    wake: Arc<Notify>,
+}
 
 struct LinkState {
     connected: bool,
@@ -34,10 +40,13 @@ struct LinkState {
 
 impl Default for ConnectionStatus {
     fn default() -> Self {
-        ConnectionStatus(Arc::new(Mutex::new(LinkState {
-            connected: false,
-            down_since: Some(Instant::now()),
-        })))
+        ConnectionStatus {
+            state: Arc::new(Mutex::new(LinkState {
+                connected: false,
+                down_since: Some(Instant::now()),
+            })),
+            wake: Arc::new(Notify::new()),
+        }
     }
 }
 
@@ -56,12 +65,12 @@ impl ConnectionStatus {
     }
 
     pub fn is_connected(&self) -> bool {
-        self.0.lock().unwrap().connected
+        self.state.lock().unwrap().connected
     }
 
     /// How long the link has been continuously down, or `None` if it's up.
     pub fn down_for(&self) -> Option<Duration> {
-        self.0
+        self.state
             .lock()
             .unwrap()
             .down_since
@@ -71,11 +80,19 @@ impl ConnectionStatus {
     /// Whether `self` and `other` are the same shared flag -- i.e. the
     /// same `PeerSet` entry, not merely one for the same address.
     pub(crate) fn same(&self, other: &ConnectionStatus) -> bool {
-        Arc::ptr_eq(&self.0, &other.0)
+        Arc::ptr_eq(&self.state, &other.state)
+    }
+
+    /// Ends the link's current reconnect backoff early: it retries now, and
+    /// from the initial delay again. A no-op for a link that's up; if it's
+    /// mid-attempt, the attempt's own outcome decides, and a failure
+    /// retries straight away.
+    pub fn wake(&self) {
+        self.wake.notify_one();
     }
 
     fn set(&self, connected: bool) {
-        let mut state = self.0.lock().unwrap();
+        let mut state = self.state.lock().unwrap();
         if connected {
             state.down_since = None;
         } else if state.down_since.is_none() {
@@ -154,12 +171,27 @@ pub async fn run(address: String, peers: PeerSet, status: ConnectionStatus) {
                 return;
             }
             Err(e) => {
+                // A link that was up starts its backoff over: it's a fresh
+                // drop, not the latest in a run of failed attempts.
+                if status.is_connected() {
+                    delay = INITIAL_RECONNECT_DELAY;
+                }
                 status.set(false);
                 eprintln!("peer client '{address}': {e} -- retrying in {delay:?}");
             }
         }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(MAX_RECONNECT_DELAY);
+        // `wake` (the peer just connected in, so it's back) cuts this
+        // short -- see `PeerSet::wake`.
+        let woken = tokio::select! {
+            _ = tokio::time::sleep(delay) => false,
+            _ = status.wake.notified() => true,
+        };
+        delay = if woken {
+            eprintln!("peer client '{address}': peer is back -- reconnecting now");
+            INITIAL_RECONNECT_DELAY
+        } else {
+            (delay * 2).min(MAX_RECONNECT_DELAY)
+        };
     }
 }
 
@@ -312,7 +344,11 @@ async fn connect_and_forward(
                 // before that read -- has already gone out on this link.
                 if let (None, None, Some(confirmed)) = (&catch_up, &queued, &mut confirmed) {
                     let through = peers.hub().sequencer().confirmed_through();
-                    if rx.is_empty() {
+                    // A pending resync means `through` may count a write
+                    // that was stored but never sent (see
+                    // `Sequencer::release`): catch up first, confirm after.
+                    let resync_pending = resync.has_changed().unwrap_or(false);
+                    if rx.is_empty() && !resync_pending {
                         confirmed.observe(Stamp::new(node_id, through));
                         let synced = PeerMessage::Synced {
                             confirmed: [(node_id, through)].into_iter().collect(),
@@ -817,6 +853,33 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         status.set(false); // another failed reconnect attempt
         assert!(status.down_for().unwrap() >= Duration::from_millis(20));
+    }
+
+    #[tokio::test]
+    async fn wake_cuts_a_reconnect_backoff_short() {
+        let addr = crate::test_support::free_addr();
+        let peers = standalone_peers();
+        peers.add(addr.to_string());
+        // Attempts at ~0s, 0.5s and 1.5s fail; it's now waiting until ~3.5s.
+        tokio::time::sleep(Duration::from_millis(1700)).await;
+        let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+        let _node = crate::test_support::spawn_node_on(
+            "node-b",
+            listener,
+            RecordingSink::new(),
+            crate::hub::ReplicationHub::new(),
+            |p| p,
+        );
+
+        peers.wake(&addr.to_string(), 0);
+        // Well inside the ~1.8s the backoff had left to run.
+        let up = tokio::time::timeout(Duration::from_millis(500), async {
+            while peers.snapshot() != vec![(addr.to_string(), true)] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        assert!(up.is_ok(), "the woken link didn't reconnect promptly");
     }
 
     #[tokio::test]

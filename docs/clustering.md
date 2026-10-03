@@ -145,6 +145,12 @@ the catch-up is requested there:
    vector. While the link stays up and caught up, the sender confirms
    its own latest seq every few seconds.
 
+A link that's down retries with backoff (0.5s, doubling up to 30s). When a
+peer comes back -- a restart, say -- and connects in, the server wakes its
+own link back to that peer, which reconnects at once instead of waiting
+out the backoff; so a restarted server is caught up within moments, not
+up to 30 seconds later.
+
 A vector entry only ever advances on such a confirmation, and a sender
 only confirms a seq once every write up to it has actually been sent
 (writes are numbered when stored and published just after, so they can
@@ -220,9 +226,17 @@ Two endpoints report cluster membership and sync state, both live:
   and `"vector"` its version vector (see "Catch-up"), keyed by node id
   (hex). Compare two servers' `vector`s: equal means in sync.
 - `GET /rest/cluster` lists every known peer, connected or not:
-  `{"host", "connected", "node_id", "vector", "sync", "behind_by",
+  `{"host", "connected", "node_id", "vector", "seq", "sync", "behind_by",
   "ahead_by"}`. `vector` is the peer's own vector as it last reported it
-  (every few seconds while its link to this server is up). `sync`
+  (every few seconds while its link to this server is up), and `seq` the
+  peer's own sequence number -- the latest of its own writes, i.e. its
+  own entry in that vector (before it has reported, the latest of its
+  writes this server has; `null` if neither is known). `last_synced_ms`
+  is when the peer last confirmed it had sent this server everything (its
+  last `Synced`, every 5s while its link is up), by this server's clock,
+  or `null` if it hasn't since this server started. The response's
+  top-level `seq` is this server's own, and `now_ms` this server's
+  current time (what `last_synced_ms` is measured against). `sync`
   compares it with this server's: `in_sync`, `behind` (the peer is
   missing writes this server has -- it's catching up), `ahead` (this
   server is missing writes the peer has), `diverged` (both), or `unknown`
@@ -231,7 +245,9 @@ Two endpoints report cluster membership and sync state, both live:
   peer's reported vector trails by up to ~10 seconds (a confirmation
   every 5s each way), so right after a write, or under steady writes,
   peers show `behind`/`ahead` briefly before settling on `in_sync`. The
-  data browser's **Cluster** tab renders this, with a **Sync** column.
+  data browser's **Cluster** tab renders this, with **Seq**, **Sync** and
+  **Last synced** columns, refreshing every 5 seconds while it's open
+  (and paused while the browser tab is hidden).
 
 Both read `kblockdbcluster::peers::PeerSet`, where each peer's
 `connected` flag is flipped by its `client::run` task as the link comes

@@ -268,7 +268,7 @@ A cell value on the wire is a small tagged JSON object:
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[],"node_id":null,"vector":{}}` |
-| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","node_id":"1f2e3d4c5b6a7980","vector":{...},"peers":[{"host":"10.0.0.2:8082","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"sync":"in_sync","behind_by":0,"ahead_by":0}]}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","node_id":"1f2e3d4c5b6a7980","vector":{...},"seq":42,"now_ms":1735689600456,"peers":[{"host":"10.0.0.2:8082","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"seq":17,"last_synced_ms":1735689598001,"sync":"in_sync","behind_by":0,"ahead_by":0}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -305,8 +305,9 @@ exactly the same writes. Both are `null`/empty unless clustering is
 configured.
 
 `GET /rest/cluster` (auth required, unlike `/rest/health`) reports
-`{"hostname": ..., "node_id": ..., "vector": {...}, "peers": [{"host":
-..., "connected": true | false, "node_id": ..., "vector": {...}, "sync":
+`{"hostname": ..., "node_id": ..., "vector": {...}, "seq": N, "now_ms": ...,
+"peers": [{"host": ..., "connected": true | false, "node_id": ..., "vector":
+{...}, "seq": N | null, "last_synced_ms": ... | null, "sync":
 "in_sync" | "behind" | "ahead" | "diverged" | "unknown", "behind_by": N,
 "ahead_by": N}, ...]}` -- every peer this instance knows about, connected
 or not, with its version vector as it last reported it and how that

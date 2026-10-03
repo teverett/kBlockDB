@@ -1,6 +1,6 @@
 //! What this server knows it has, per origin (a `VersionVector`, see
 //! docs/clustering.md's "Catch-up"), persisted across restarts -- plus,
-//! for display, the vector each peer last reported.
+//! for display, the vector each peer last reported and when.
 
 use kblockdblib::VersionVector;
 use std::collections::HashMap;
@@ -19,7 +19,9 @@ pub struct VectorStore {
 #[derive(Default)]
 struct State {
     known: VersionVector,
-    peers: HashMap<u64, VersionVector>,
+    /// Per peer node id: the vector it last reported, and when (ms since
+    /// the Unix epoch, by this server's clock).
+    peers: HashMap<u64, (VersionVector, u64)>,
 }
 
 impl VectorStore {
@@ -77,12 +79,33 @@ impl VectorStore {
     }
 
     /// Records the full vector peer `node_id` last reported, for display.
+    /// Records the full vector peer `node_id` just reported (in a
+    /// `Synced`), stamped with the current time -- for display.
     pub fn record_peer(&self, node_id: u64, vector: VersionVector) {
-        self.state.lock().unwrap().peers.insert(node_id, vector);
+        self.record_peer_at(node_id, vector, crate::hub::now_ms());
     }
 
+    /// `record_peer`, as of `at_ms` -- for an embedder's own tests.
+    pub fn record_peer_at(&self, node_id: u64, vector: VersionVector, at_ms: u64) {
+        self.state
+            .lock()
+            .unwrap()
+            .peers
+            .insert(node_id, (vector, at_ms));
+    }
+
+    /// The vector peer `node_id` last reported.
     pub fn peer(&self, node_id: u64) -> Option<VersionVector> {
-        self.state.lock().unwrap().peers.get(&node_id).cloned()
+        let state = self.state.lock().unwrap();
+        state.peers.get(&node_id).map(|(vector, _)| vector.clone())
+    }
+
+    /// When peer `node_id` last reported its vector -- the last time it
+    /// confirmed (`Synced`) it had sent this server everything -- in ms
+    /// since the Unix epoch, by this server's clock.
+    pub fn peer_last_synced(&self, node_id: u64) -> Option<u64> {
+        let state = self.state.lock().unwrap();
+        state.peers.get(&node_id).map(|&(_, at_ms)| at_ms)
     }
 
     fn save(&self, known: &VersionVector) -> io::Result<()> {
@@ -119,6 +142,20 @@ mod tests {
     }
 
     #[test]
+    fn a_reported_peer_vector_records_when_it_arrived() {
+        let store = VectorStore::in_memory();
+        assert_eq!(store.peer_last_synced(9), None);
+        let before = crate::hub::now_ms();
+        store.record_peer(9, vector(&[(9, 1)]));
+        let at = store.peer_last_synced(9).unwrap();
+        assert!(at >= before && at <= crate::hub::now_ms());
+
+        store.record_peer_at(9, vector(&[(9, 2)]), 1_234);
+        assert_eq!(store.peer_last_synced(9), Some(1_234));
+        assert_eq!(store.peer(9), Some(vector(&[(9, 2)])));
+    }
+
+    #[test]
     fn the_vector_persists_and_peer_vectors_do_not() {
         let dir =
             std::env::temp_dir().join(format!("kblockdbcluster-vector-{}", std::process::id()));
@@ -132,6 +169,7 @@ mod tests {
         let reloaded = VectorStore::load(&path).unwrap();
         assert_eq!(reloaded.known(), vector(&[(0xABC, 42), (u64::MAX, 7)]));
         assert_eq!(reloaded.peer(9), None);
+        assert_eq!(reloaded.peer_last_synced(9), None);
         assert_eq!(store.peer(9), Some(vector(&[(9, 1)])));
         let _ = fs::remove_dir_all(&dir);
     }

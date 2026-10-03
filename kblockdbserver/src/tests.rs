@@ -347,6 +347,8 @@ async fn cluster_reports_every_peer_with_its_connection_status() {
             "connected": connected,
             "node_id": null,
             "vector": null,
+            "seq": null,
+            "last_synced_ms": null,
             "sync": "unknown",
             "behind_by": 0,
             "ahead_by": 0,
@@ -361,6 +363,73 @@ async fn cluster_reports_every_peer_with_its_connection_status() {
             not_yet_linked("10.0.0.3:8082", false),
         ])
     );
+}
+
+#[tokio::test]
+async fn cluster_reports_each_nodes_own_sequence_number() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[
+        ("10.0.0.2:8082", true),
+        ("10.0.0.3:8082", true),
+        ("10.0.0.4:8082", false),
+    ]);
+    // This server has made two writes.
+    for _ in 0..2 {
+        let seq = peers.hub().sequencer().assign().seq;
+        peers.hub().sequencer().published(seq);
+    }
+    // 10.0.0.2 reported its vector: its own entry is 9.
+    peers.insert_claim("10.0.0.2:8082", 0xB0);
+    peers
+        .vectors()
+        .record_peer(0xB0, [(0xB0, 9), (0xB1, 3)].into_iter().collect());
+    // 10.0.0.3 hasn't reported, but this server has 4 of its writes.
+    peers.insert_claim("10.0.0.3:8082", 0xB1);
+    peers.vectors().merge(&[(0xB1, 4)].into_iter().collect());
+    // 10.0.0.4 has never linked: unknown.
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["seq"], json!(2));
+    let seqs: Vec<Json> = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p["seq"].clone())
+        .collect();
+    assert_eq!(seqs, vec![json!(9), json!(4), json!(null)]);
+}
+
+#[tokio::test]
+async fn cluster_reports_when_each_peer_last_synced() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("10.0.0.2:8082", true), ("10.0.0.3:8082", true)]);
+    peers.insert_claim("10.0.0.2:8082", 0xB0);
+    peers
+        .vectors()
+        .record_peer_at(0xB0, [(0xB0, 1)].into_iter().collect(), 1_790_000_000_123);
+    // 10.0.0.3 is linked but hasn't confirmed anything yet.
+    peers.insert_claim("10.0.0.3:8082", 0xB1);
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let before = kblockdbcluster::hub::now_ms();
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["peers"][0]["last_synced_ms"],
+        json!(1_790_000_000_123u64)
+    );
+    assert_eq!(body["peers"][1]["last_synced_ms"], json!(null));
+    let now = body["now_ms"].as_u64().unwrap();
+    assert!(now >= before && now <= kblockdbcluster::hub::now_ms());
+}
+
+#[tokio::test]
+async fn cluster_reports_no_seq_when_unclustered() {
+    let (status, body) = send(test_app().0, get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["seq"], json!(null));
 }
 
 #[tokio::test]
@@ -1099,6 +1168,29 @@ async fn the_data_browser_restores_its_tab_from_the_url() {
     assert!(html.contains(r##"location.hash === "#cluster""##));
     assert!(html.contains("showTab(tabFromUrl());"));
     assert!(html.contains(r#"addEventListener("popstate""#));
+}
+
+/// The Cluster tab polls `rest/cluster` on a timer while it's open, and
+/// stops when it's left or the page is hidden.
+#[tokio::test]
+async fn the_cluster_tab_refreshes_itself() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let resp = test_app()
+        .0
+        .oneshot(with_auth(req, TEST_ADMIN, TEST_ADMIN_PASSWORD))
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains("const CLUSTER_REFRESH_MS = 5000;"));
+    assert!(html.contains("setInterval(loadCluster, CLUSTER_REFRESH_MS)"));
+    assert!(html.contains("clearInterval(clusterTimer)"));
+    assert!(html.contains(r#"addEventListener("visibilitychange""#));
+    assert!(html.contains(r#"id="cluster-updated""#));
 }
 
 #[tokio::test]

@@ -295,6 +295,27 @@ pub async fn spawn_node_with(
     configure: impl FnOnce(crate::peers::PeerSet) -> crate::peers::PeerSet,
 ) -> TestNode {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    spawn_node_on(server_id, listener, sink, hub, configure)
+}
+
+/// An address nothing is listening on (yet): a port the OS just handed
+/// out and was released -- for a test that brings a node up there later.
+pub fn free_addr() -> std::net::SocketAddr {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+}
+
+/// `spawn_node_with`, serving on an already-bound `listener` (e.g. one
+/// bound to a `free_addr`).
+pub fn spawn_node_on(
+    server_id: &str,
+    listener: tokio::net::TcpListener,
+    sink: RecordingSink,
+    hub: Arc<crate::hub::ReplicationHub>,
+    configure: impl FnOnce(crate::peers::PeerSet) -> crate::peers::PeerSet,
+) -> TestNode {
     let addr = listener.local_addr().unwrap();
     let peers = configure(
         crate::peers::PeerSet::new(
