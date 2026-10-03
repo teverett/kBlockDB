@@ -263,7 +263,7 @@ A cell value on the wire is a small tagged JSON object:
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[]}` |
-| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","peers":[{"host":"10.0.0.2:8082","direction":"outbound","connected":true}]}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","peers":[{"host":"10.0.0.2:8082","connected":true}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -289,20 +289,17 @@ currently manages (same number `GET /rest/databases` would list) -- health
 is server-wide, not scoped to any one database, so it has no per-database
 shape to report the way the old single-world `/rest/health` once did; ask
 `GET /rest/db/{db}/stats` or a binary-protocol `Hello` for a specific
-database's shape. `peers` lists only the peers *currently connected*
-(see [clustering.md](clustering.md)) -- configured `[[peers]]` addresses
-this instance has successfully dialed out to, plus the `server_id` of
-every peer currently connected *into* it. A configured peer that's down
-or still being retried isn't listed; `GET /rest/cluster` (below) is the
-full membership view, connected or not. Empty unless clustering is
-configured.
+database's shape. `peers` lists the address of every known peer (see
+[clustering.md](clustering.md)) this instance's link to is *currently
+up*; a peer that's down or still being retried isn't listed. Empty unless
+clustering is configured.
 
 `GET /rest/cluster` (auth required, unlike `/rest/health`) reports
-`{"hostname": ..., "peers": [{"host": ..., "direction": "outbound" |
-"inbound", "connected": true | false}, ...]}` -- every configured
-outbound peer with its live connection status, plus every peer currently
-connected inbound (always `connected: true`, since an inbound peer drops
-off the list the moment it disconnects).
+`{"hostname": ..., "peers": [{"host": ..., "connected": true | false},
+...]}` -- every peer this instance knows about, connected or not. A peer
+is known once it's configured in `[[peers]]` *or* has connected in; either
+way it's replicated to and from (peers have no direction -- see
+clustering.md's "Peers are symmetric").
 
 `/rest/db/{db}/stats` walks the on-disk chunk files under that database's
 directory and reports: `total_chunks` (chunk files currently on disk --
@@ -494,8 +491,8 @@ client-side, no second request -- fine for a database browsed
 occasionally, not meant for a query matching millions of cells.
 
 The **Cluster** tab lists every host this server knows about -- itself,
-each configured `[[peers]]` entry, and each peer currently connected into
-it -- with its direction and a connected / not connected status, from
+plus every peer, whether configured or learned because it connected in --
+with a connected / not connected status, from
 `GET /rest/cluster`. It re-fetches every time the tab is opened, so
 switching back to it picks up any peer that's connected or dropped since.
 

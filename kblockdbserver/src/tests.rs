@@ -4,7 +4,7 @@
 //! `coords.rs`/`value_json.rs`.
 
 use crate::routes::router;
-use crate::state::{Account, AppState, Databases, OutboundPeer, WorldShape};
+use crate::state::{Account, AppState, Databases, WorldShape};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum_extra::headers::{Authorization, HeaderMapExt};
@@ -236,18 +236,33 @@ async fn health_reports_an_empty_peer_list_when_unclustered() {
     assert_eq!(body["peers"], json!([]));
 }
 
-fn outbound(address: &str, status: ConnectionStatus) -> OutboundPeer {
-    OutboundPeer {
-        address: address.to_string(),
-        status,
+/// A `PeerSet` holding exactly `peers` (address, connected), without any
+/// real links -- `PeerSet::insert` never spawns a client.
+fn peer_set(peers: &[(&str, bool)]) -> kblockdbcluster::peers::PeerSet {
+    let set = kblockdbcluster::peers::PeerSet::new(
+        kblockdbcluster::peers::LocalIdentity {
+            cluster_secret: "s".to_string(),
+            server_id: "node-a".to_string(),
+            peer_port: 1,
+        },
+        kblockdbcluster::hub::ReplicationHub::new(),
+    );
+    for (address, connected) in peers {
+        let status = if *connected {
+            ConnectionStatus::connected()
+        } else {
+            ConnectionStatus::new()
+        };
+        set.insert(address.to_string(), status);
     }
+    set
 }
 
 #[tokio::test]
-async fn health_omits_a_configured_peer_that_is_not_connected() {
+async fn health_omits_a_peer_that_is_not_connected() {
     let (databases, _dir) = test_databases();
     let state = AppState::new(databases, Arc::new(HashMap::new()))
-        .with_outbound_peers(vec![outbound("10.0.0.2:8082", ConnectionStatus::new())]);
+        .with_peers(peer_set(&[("10.0.0.2:8082", false)]));
 
     let (status, body) = send(router(state), get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
@@ -255,43 +270,12 @@ async fn health_omits_a_configured_peer_that_is_not_connected() {
 }
 
 #[tokio::test]
-async fn health_includes_only_connected_outbound_peers() {
+async fn health_lists_only_connected_peers() {
     let (databases, _dir) = test_databases();
-    let state = AppState::new(databases, Arc::new(HashMap::new())).with_outbound_peers(vec![
-        outbound("10.0.0.2:8082", ConnectionStatus::connected()),
-        outbound("10.0.0.3:8082", ConnectionStatus::new()),
-    ]);
-
-    let (status, body) = send(router(state), get("/rest/health")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["peers"], json!(["10.0.0.2:8082"]));
-}
-
-#[tokio::test]
-async fn health_includes_a_peer_connected_into_this_instance() {
-    let (databases, _dir) = test_databases();
-    let registry = kblockdbcluster::registry::PeerRegistry::new();
-    let _connected = registry.track("node-b".to_string());
-    let state = AppState::new(databases, Arc::new(HashMap::new()))
-        .with_outbound_peers(vec![outbound("10.0.0.2:8082", ConnectionStatus::new())])
-        .with_peer_registry(registry);
-
-    let (status, body) = send(router(state), get("/rest/health")).await;
-    assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["peers"], json!(["node-b"]));
-}
-
-#[tokio::test]
-async fn health_does_not_duplicate_a_connected_peer_already_in_the_configured_list() {
-    let (databases, _dir) = test_databases();
-    let registry = kblockdbcluster::registry::PeerRegistry::new();
-    let _connected = registry.track("10.0.0.2:8082".to_string());
-    let state = AppState::new(databases, Arc::new(HashMap::new()))
-        .with_outbound_peers(vec![outbound(
-            "10.0.0.2:8082",
-            ConnectionStatus::connected(),
-        )])
-        .with_peer_registry(registry);
+    let state = AppState::new(databases, Arc::new(HashMap::new())).with_peers(peer_set(&[
+        ("10.0.0.2:8082", true),
+        ("10.0.0.3:8082", false),
+    ]));
 
     let (status, body) = send(router(state), get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
@@ -318,17 +302,14 @@ async fn cluster_is_empty_when_unclustered() {
 }
 
 #[tokio::test]
-async fn cluster_reports_every_host_with_its_connection_status() {
+async fn cluster_reports_every_peer_with_its_connection_status() {
     let (databases, _dir) = test_databases();
-    let registry = kblockdbcluster::registry::PeerRegistry::new();
-    let _connected = registry.track("node-c".to_string());
     let state = AppState::new(databases, Arc::new(test_credentials()))
         .with_hostname("node-a".to_string())
-        .with_outbound_peers(vec![
-            outbound("10.0.0.2:8082", ConnectionStatus::connected()),
-            outbound("10.0.0.3:8082", ConnectionStatus::new()),
-        ])
-        .with_peer_registry(registry);
+        .with_peers(peer_set(&[
+            ("10.0.0.3:8082", false),
+            ("10.0.0.2:8082", true),
+        ]));
 
     let (status, body) = send(router(state), get("/rest/cluster")).await;
     assert_eq!(status, StatusCode::OK);
@@ -337,9 +318,8 @@ async fn cluster_reports_every_host_with_its_connection_status() {
         json!({
             "hostname": "node-a",
             "peers": [
-                {"host": "10.0.0.2:8082", "direction": "outbound", "connected": true},
-                {"host": "10.0.0.3:8082", "direction": "outbound", "connected": false},
-                {"host": "node-c", "direction": "inbound", "connected": true},
+                {"host": "10.0.0.2:8082", "connected": true},
+                {"host": "10.0.0.3:8082", "connected": false},
             ]
         })
     );

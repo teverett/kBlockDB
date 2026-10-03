@@ -20,19 +20,18 @@
 //! - `hub` -- `ReplicationHub`, the in-process point an embedder's local
 //!   write publishes a `ChangeEntry` to.
 //! - `client` -- the connecting side of a peer link: one long-running,
-//!   auto-reconnecting task per configured peer that drains a
+//!   auto-reconnecting task per known peer (see `peers`) that drains a
 //!   `ReplicationHub` and streams it to that peer.
 //! - `server` -- the accepting side: the peer protocol's TCP listener,
 //!   per-connection `Hello` authentication, and applying every incoming
 //!   `ChangeEntry` via a `ReplicationSink`.
-//! - `registry` -- `PeerRegistry`, which peers currently have a live
-//!   inbound connection to `server::serve` (by their own self-reported
-//!   `server_id`), for an embedder to report (e.g. from a health
-//!   endpoint).
+//! - `peers` -- `PeerSet`, every known peer and its live link status.
+//!   Peers are symmetric: adding one (from config, or because it
+//!   connected in) starts replicating to it too.
 
 pub mod client;
 pub mod hub;
-pub mod registry;
+pub mod peers;
 pub mod server;
 pub mod wire;
 

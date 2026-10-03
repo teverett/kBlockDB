@@ -122,3 +122,49 @@ impl ReplicationSink for RecordingSink {
         Ok(())
     }
 }
+
+pub const CLUSTER_SECRET: &str = "cluster-secret";
+
+/// One complete in-process node: a real `server::serve` listener on an
+/// OS-assigned port, backed by a `RecordingSink`, with its own `PeerSet`
+/// and `ReplicationHub` -- what every end-to-end test in this crate builds
+/// a cluster out of.
+pub struct TestNode {
+    pub addr: std::net::SocketAddr,
+    pub sink: RecordingSink,
+    pub peers: crate::peers::PeerSet,
+    pub hub: Arc<crate::hub::ReplicationHub>,
+}
+
+pub async fn spawn_node(server_id: &str) -> TestNode {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hub = crate::hub::ReplicationHub::new();
+    let peers = crate::peers::PeerSet::new(
+        crate::peers::LocalIdentity {
+            cluster_secret: CLUSTER_SECRET.to_string(),
+            server_id: server_id.to_string(),
+            peer_port: addr.port(),
+        },
+        hub.clone(),
+    );
+    let sink = RecordingSink::new();
+    tokio::spawn(crate::server::serve(listener, sink.clone(), peers.clone()));
+    TestNode {
+        addr,
+        sink,
+        peers,
+        hub,
+    }
+}
+
+/// Polls `condition` every 10ms for up to 2s.
+pub async fn wait_until(mut condition: impl FnMut() -> bool) {
+    for _ in 0..200 {
+        if condition() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("condition was never met within 2s");
+}

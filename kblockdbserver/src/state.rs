@@ -260,14 +260,6 @@ impl Databases {
 /// exactly one `kblockdbserver` per data directory; scale by giving it more
 /// threads (it already uses as many as the async runtime has, see
 /// `with_database`), not by running more of it.
-/// One configured `[[peers]]` entry plus its own live connection status --
-/// see `AppState::outbound_peers`.
-#[derive(Clone)]
-pub struct OutboundPeer {
-    pub address: String,
-    pub status: kblockdbcluster::client::ConnectionStatus,
-}
-
 #[derive(Clone)]
 pub struct AppState {
     pub databases: Databases,
@@ -282,21 +274,10 @@ pub struct AppState {
     /// `cluster.rs` (this server's `ReplicationSink` impl, which
     /// `kblockdbcluster::server::serve` applies incoming changes through).
     pub replication: Option<Arc<kblockdbcluster::hub::ReplicationHub>>,
-    /// Every configured `[[peers]]` entry, paired with its own live
-    /// connection status -- empty unless clustering is configured. Each
-    /// `OutboundPeer::status` is shared with (and only ever written by)
-    /// the `kblockdbcluster::client::run` task dialing that one peer, so
-    /// reading it here always reflects that task's current state, not a
-    /// snapshot taken at startup.
-    pub outbound_peers: Arc<Vec<OutboundPeer>>,
-    /// Who currently has a live *inbound* connection to this instance's
-    /// peer listener, by their own self-reported `server_id` -- `None`
-    /// unless clustering is configured, in which case it's always
-    /// `Some`, live-updated by `kblockdbcluster::server::serve` as peers
-    /// connect and disconnect. `/rest/health` reports this alongside
-    /// `peers` so a peer that dialed *into* this instance (and so isn't
-    /// necessarily in its own `[[peers]]` list) still shows up.
-    pub connected_peers: Option<kblockdbcluster::registry::PeerRegistry>,
+    /// Every peer this instance knows about -- configured, or learned
+    /// because it connected in -- with live link status (see
+    /// `kblockdbcluster::peers`). `None` unless clustering is configured.
+    pub peers: Option<kblockdbcluster::peers::PeerSet>,
     credentials: Arc<HashMap<String, Account>>,
 }
 
@@ -306,8 +287,7 @@ impl AppState {
             databases,
             hostname: Arc::from(os_hostname()),
             replication: None,
-            outbound_peers: Arc::new(Vec::new()),
-            connected_peers: None,
+            peers: None,
             credentials,
         }
     }
@@ -331,20 +311,10 @@ impl AppState {
         self
     }
 
-    /// Records this instance's configured peers and their (shared, live)
-    /// connection status. See this struct's `outbound_peers` field doc
-    /// comment.
-    pub fn with_outbound_peers(mut self, peers: Vec<OutboundPeer>) -> Self {
-        self.outbound_peers = Arc::new(peers);
-        self
-    }
-
-    /// Enables reporting connected-peer status -- called once at startup,
-    /// only when the config sets a `cluster_secret`, with the same
-    /// `PeerRegistry` passed to `kblockdbcluster::server::serve`. See
-    /// this struct's `connected_peers` field doc comment.
-    pub fn with_peer_registry(mut self, registry: kblockdbcluster::registry::PeerRegistry) -> Self {
-        self.connected_peers = Some(registry);
+    /// Records this instance's `PeerSet` -- the same one passed to
+    /// `kblockdbcluster::server::serve`. See this struct's `peers` field.
+    pub fn with_peers(mut self, peers: kblockdbcluster::peers::PeerSet) -> Self {
+        self.peers = Some(peers);
         self
     }
 

@@ -130,14 +130,9 @@ pub struct HealthResponse {
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
     timestamp: u64,
-    /// Every peer *currently connected* -- either a configured `[[peers]]`
-    /// address this instance has successfully dialed out to, or the
-    /// `server_id` of a peer currently dialed into it (deduplicated
-    /// against the former, in case a configured peer's `server_id`
-    /// happens to equal its own address) -- empty unless clustering is
-    /// configured. A peer that's configured but not currently reachable
-    /// (still retrying, or down) is *not* listed here -- see `GET
-    /// /rest/cluster` for full membership including unconnected peers.
+    /// The address of every known peer (see `GET /rest/cluster`) this
+    /// instance's link to is *currently up* -- a peer that's down or still
+    /// being retried isn't listed. Empty unless clustering is configured.
     peers: Vec<String>,
 }
 
@@ -151,19 +146,11 @@ pub struct HealthResponse {
 )]
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let database_count = state.list_databases().await?.len();
-    let mut peers: Vec<String> = state
-        .outbound_peers
-        .iter()
-        .filter(|p| p.status.is_connected())
-        .map(|p| p.address.clone())
+    let peers = peer_snapshot(&state)
+        .into_iter()
+        .filter(|(_, connected)| *connected)
+        .map(|(address, _)| address)
         .collect();
-    if let Some(registry) = &state.connected_peers {
-        for server_id in registry.connected() {
-            if !peers.contains(&server_id) {
-                peers.push(server_id);
-            }
-        }
-    }
     Ok(Json(HealthResponse {
         status: "ok".to_string(),
         hostname: state.hostname.to_string(),
@@ -173,17 +160,25 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
     }))
 }
 
+/// Every known peer and whether this instance's link to it is up, sorted
+/// by address -- empty when clustering isn't configured.
+fn peer_snapshot(state: &AppState) -> Vec<(String, bool)> {
+    state
+        .peers
+        .as_ref()
+        .map(kblockdbcluster::peers::PeerSet::snapshot)
+        .unwrap_or_default()
+}
+
 /// One host this instance knows about, for `GET /rest/cluster` -- unlike
-/// `/rest/health`'s `peers`, this includes a configured peer even while
-/// it's unreachable, with `connected` saying which.
+/// `/rest/health`'s `peers`, this includes a peer even while it's
+/// unreachable, with `connected` saying which.
 #[derive(Serialize, ToSchema)]
 pub struct ClusterPeer {
+    /// The peer's address -- as configured in `[[peers]]`, or
+    /// `<source IP>:<its peer port>` if it was learned by connecting in.
     host: String,
-    /// `"outbound"` for a configured `[[peers]]` entry this instance
-    /// dials out to, `"inbound"` for a peer that dialed into it instead
-    /// (identified by its own self-reported `server_id`, not an address
-    /// this instance could dial back).
-    direction: &'static str,
+    /// Whether this instance's link to it is up right now.
     connected: bool,
 }
 
@@ -199,34 +194,16 @@ pub struct ClusterResponse {
     path = "/rest/cluster",
     tag = "cluster",
     responses(
-        (status = 200, description = "Every host this instance knows about, with live connection status", body = ClusterResponse),
+        (status = 200, description = "Every peer this instance knows about, with live connection status", body = ClusterResponse),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
 async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
-    let mut peers: Vec<ClusterPeer> = state
-        .outbound_peers
-        .iter()
-        .map(|p| ClusterPeer {
-            host: p.address.clone(),
-            direction: "outbound",
-            connected: p.status.is_connected(),
-        })
+    let peers = peer_snapshot(&state)
+        .into_iter()
+        .map(|(host, connected)| ClusterPeer { host, connected })
         .collect();
-    if let Some(registry) = &state.connected_peers {
-        for server_id in registry.connected() {
-            peers.push(ClusterPeer {
-                host: server_id,
-                direction: "inbound",
-                // Always true: `PeerRegistry::connected()` only ever
-                // reports a peer for as long as its connection lasts (see
-                // `kblockdbcluster::registry::PeerRegistry`), so there's
-                // no "inbound but not connected" case to represent.
-                connected: true,
-            });
-        }
-    }
     Json(ClusterResponse {
         hostname: state.hostname.to_string(),
         peers,

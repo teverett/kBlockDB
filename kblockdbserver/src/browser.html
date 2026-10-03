@@ -48,12 +48,11 @@
   </div>
 
   <div id="tab-cluster" class="tab-panel" hidden role="tabpanel">
-    <p class="sub">Every host this server knows about: itself, plus any peer it's configured to replicate to or that has connected into it (see <code>/rest/cluster</code>).</p>
+    <p class="sub">Every host this server knows about: itself, plus every peer -- configured, or learned because it connected in. Each peer is replicated to and from (see <code>/rest/cluster</code>).</p>
     <table>
       <thead>
         <tr>
           <th>Host</th>
-          <th>Direction</th>
           <th>Status</th>
         </tr>
       </thead>
@@ -369,10 +368,9 @@
     }
   }
 
-  function clusterRow(host, direction, connected) {
+  function clusterRow(host, connected) {
     const tr = document.createElement("tr");
     tr.appendChild(cell("td", host));
-    tr.appendChild(cell("td", direction));
     const statusTd = cell("td", connected ? "connected" : "not connected");
     statusTd.className = connected ? "status-up" : "status-down";
     tr.appendChild(statusTd);
@@ -380,8 +378,8 @@
   }
 
   // Populates the Cluster tab from `GET /rest/cluster` -- this instance
-  // itself, plus every configured outbound peer (connected or not) and
-  // every peer currently connected into it (see `docs/clustering.md`).
+  // itself, plus every known peer (configured, or learned because it
+  // connected in), connected or not (see `docs/clustering.md`).
   // Not live-updating on its own; `showTab` re-runs this every time the
   // tab is opened instead.
   async function loadCluster() {
@@ -402,9 +400,9 @@
     }
     const data = await resp.json();
 
-    clusterRowsBody.appendChild(clusterRow(data.hostname + " (this server)", "", true));
+    clusterRowsBody.appendChild(clusterRow(data.hostname + " (this server)", true));
     (data.peers || []).forEach(function (p) {
-      clusterRowsBody.appendChild(clusterRow(p.host, p.direction, p.connected));
+      clusterRowsBody.appendChild(clusterRow(p.host, p.connected));
     });
 
     if (!data.peers || data.peers.length === 0) {

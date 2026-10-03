@@ -19,8 +19,10 @@ cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
 # is set but this isn't). Distinct from http_port/binary_port.
 peer_port = 8082
 
-# Other servers to replicate local writes to -- "address" is that peer's
-# own peer_port, not its HTTP or binary-protocol port.
+# Other servers to replicate with -- "address" is that peer's own
+# peer_port, not its HTTP or binary-protocol port. Use IP addresses: a
+# peer that connects in is identified by its source IP (see "Peers are
+# symmetric" below).
 [[peers]]
 address = "10.0.0.2:8082"
 
@@ -28,11 +30,32 @@ address = "10.0.0.2:8082"
 address = "10.0.0.3:8082"
 ```
 
-A full mesh (every node replicates to every other node) means every
-node's config lists every *other* node -- there's no gossip or
-auto-discovery, each server only knows the peers explicitly listed in its
-own file. `--peer-port` is the matching CLI flag, same override order as
-every other port (`--peer-port` > config file > default).
+`--peer-port` is the matching CLI flag, same override order as every
+other port (`--peer-port` > config file > default).
+
+### Peers are symmetric
+
+A peer has no direction. However a server learns about a peer -- from its
+own `[[peers]]`, or because that peer connected in -- it both accepts the
+peer's changes *and* replicates its own changes to it. `Hello` carries the
+connecting server's `peer_port`, so the accepting side dials back to
+`<source IP>:<peer_port>` the first time it sees a new peer. So for any
+pair of servers, only *one* side has to list the other: if A's config names
+B, B learns A the moment A connects and starts sending to A as well.
+
+There's still no gossip: a server only knows peers it's configured with or
+that connected to it directly. For a full mesh (every node replicating to
+every other), each *pair* of nodes needs one side to list the other -- e.g.
+point every node at one seed node, and every node except the seed at each
+other, or simply list every other node everywhere.
+
+Learned peers live for the life of the process: a peer that goes away
+stays known (shown as not connected, its link retrying with backoff), and
+learned peers aren't written back to the config -- after a restart a
+server dials only its configured peers and relearns the rest as they
+reconnect. Peers are identified by address string, so a peer configured
+by hostname and later seen connecting from its IP shows up twice --
+configure peers by IP.
 
 ## How it works
 
@@ -41,7 +64,7 @@ binary protocol's equivalent requests, or the query language's
 `SET`/`UPDATE`/`DELETE` -- publishes a `ChangeEntry` (database, coordinate,
 key, the new value or a removal, and the write's own `created_at_ms`/
 `modified_at_ms`/`version`) to an in-process hub. One long-running task
-per configured peer drains that hub and streams the entries over its own
+per known peer drains that hub and streams the entries over its own
 TCP connection to that peer, authenticated once per connection with
 `Hello`/`cluster_secret`. The accepting side applies each entry directly
 against its matching database (auto-creating it, with its own default
@@ -54,19 +77,16 @@ nothing needs multi-hop forwarding.
 
 Two endpoints report cluster membership, both live:
 
-- `GET /rest/health`'s `"peers": [...]` lists only peers *currently
-  connected* -- configured `[[peers]]` addresses this instance has
-  successfully dialed out to, plus the `server_id` of every peer currently
-  dialed *into* it. A configured peer that's down or still retrying isn't
-  listed.
-- `GET /rest/cluster` lists every known host with its status:
-  `{"host", "direction": "outbound" | "inbound", "connected"}` for each
-  configured peer (connected or not) and each inbound connection. The
-  data browser's **Cluster** tab renders this.
+- `GET /rest/health`'s `"peers": [...]` lists the address of every known
+  peer this server's link to is *currently up*. A peer that's down or
+  still being retried isn't listed.
+- `GET /rest/cluster` lists every known peer, connected or not:
+  `{"host": <address>, "connected": <bool>}`. The data browser's
+  **Cluster** tab renders this.
 
-Outbound status is tracked by `kblockdbcluster::client::ConnectionStatus`
-(flipped by `client::run` as its connection comes up and drops); inbound
-by `kblockdbcluster::registry::PeerRegistry`.
+Both read `kblockdbcluster::peers::PeerSet`, where each peer's
+`connected` flag is flipped by its `client::run` task as the link comes
+up and drops.
 
 ## Crate split
 

@@ -6,6 +6,7 @@
 //! side.
 
 use crate::hub::ReplicationHub;
+use crate::peers::LocalIdentity;
 use crate::wire::{PeerMessage, PEER_PROTOCOL_VERSION};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -70,14 +71,13 @@ const MAX_BATCH_SIZE: usize = 256;
 /// docs/clustering.md's "Catch-up scope": live-forward only for v1).
 pub async fn run(
     address: String,
-    cluster_secret: String,
-    server_id: String,
+    identity: LocalIdentity,
     hub: Arc<ReplicationHub>,
     status: ConnectionStatus,
 ) {
     let mut delay = INITIAL_RECONNECT_DELAY;
     loop {
-        match connect_and_forward(&address, &cluster_secret, &server_id, &hub, &status).await {
+        match connect_and_forward(&address, &identity, &hub, &status).await {
             Ok(()) => {
                 // `connect_and_forward` only returns `Ok` if the hub's
                 // sender was dropped, which never happens while the
@@ -98,8 +98,7 @@ pub async fn run(
 
 async fn connect_and_forward(
     address: &str,
-    cluster_secret: &str,
-    server_id: &str,
+    identity: &LocalIdentity,
     hub: &Arc<ReplicationHub>,
     status: &ConnectionStatus,
 ) -> std::io::Result<()> {
@@ -118,8 +117,9 @@ async fn connect_and_forward(
     crate::wire::write_message(
         &mut stream,
         &PeerMessage::Hello {
-            secret: cluster_secret.to_string(),
-            server_id: server_id.to_string(),
+            secret: identity.cluster_secret.clone(),
+            server_id: identity.server_id.clone(),
+            peer_port: identity.peer_port,
             protocol_version: PEER_PROTOCOL_VERSION,
         },
     )
@@ -166,26 +166,20 @@ async fn connect_and_forward(
 mod tests {
     use super::*;
     use crate::hub::{publish_remove, publish_set};
-    use crate::test_support::RecordingSink;
+    use crate::test_support::{spawn_node, wait_until, TestNode, CLUSTER_SECRET};
     use kblockdblib::{CellMeta, Value};
-    use tokio::net::TcpListener;
 
-    const CLUSTER_SECRET: &str = "cluster-secret";
     const DB: &str = "db";
 
-    /// A real `server::serve`, backed by a `RecordingSink` rather than any
-    /// actual storage -- the accepting side of the end-to-end tests below.
-    async fn spawn_test_server() -> (std::net::SocketAddr, RecordingSink) {
-        let sink = RecordingSink::new();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(crate::server::serve(
-            listener,
-            sink.clone(),
-            CLUSTER_SECRET.to_string(),
-            crate::registry::PeerRegistry::new(),
-        ));
-        (addr, sink)
+    /// The `peer_port` these standalone `run` tasks claim. Nothing listens
+    /// there, so the receiving node's dial-back just retries harmlessly --
+    /// these tests exercise one direction only.
+    fn identity() -> LocalIdentity {
+        LocalIdentity {
+            cluster_secret: CLUSTER_SECRET.to_string(),
+            server_id: "node-a".to_string(),
+            peer_port: 1,
+        }
     }
 
     /// Retries `attempt` (expected to be `hub::publish_*`, cheap and
@@ -209,12 +203,11 @@ mod tests {
 
     #[tokio::test]
     async fn a_published_entry_reaches_the_peer_over_a_real_connection() {
-        let (addr, sink) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
         let hub = ReplicationHub::new();
         tokio::spawn(run(
             addr.to_string(),
-            CLUSTER_SECRET.to_string(),
-            "node-a".to_string(),
+            identity(),
             hub.clone(),
             ConnectionStatus::new(),
         ));
@@ -245,14 +238,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_published_remove_reaches_the_peer_over_a_real_connection() {
-        let (addr, sink) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
         sink.apply_set_now(DB, &[4, 5, 6], "material", Value::Str("stone".to_string()));
 
         let hub = ReplicationHub::new();
         tokio::spawn(run(
             addr.to_string(),
-            CLUSTER_SECRET.to_string(),
-            "node-a".to_string(),
+            identity(),
             hub.clone(),
             ConnectionStatus::new(),
         ));
@@ -267,12 +259,11 @@ mod tests {
 
     #[tokio::test]
     async fn multiple_published_entries_all_reach_the_peer() {
-        let (addr, sink) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
         let hub = ReplicationHub::new();
         tokio::spawn(run(
             addr.to_string(),
-            CLUSTER_SECRET.to_string(),
-            "node-a".to_string(),
+            identity(),
             hub.clone(),
             ConnectionStatus::new(),
         ));
@@ -302,14 +293,13 @@ mod tests {
 
     #[tokio::test]
     async fn status_is_disconnected_until_hello_succeeds() {
-        let (addr, _sink) = spawn_test_server().await;
+        let TestNode { addr, .. } = spawn_node("node-b").await;
         let status = ConnectionStatus::new();
         assert!(!status.is_connected());
 
         tokio::spawn(run(
             addr.to_string(),
-            CLUSTER_SECRET.to_string(),
-            "node-a".to_string(),
+            identity(),
             ReplicationHub::new(),
             status.clone(),
         ));
@@ -323,8 +313,7 @@ mod tests {
         let status = ConnectionStatus::new();
         tokio::spawn(run(
             "127.0.0.1:1".to_string(),
-            CLUSTER_SECRET.to_string(),
-            "node-a".to_string(),
+            identity(),
             ReplicationHub::new(),
             status.clone(),
         ));
@@ -333,15 +322,5 @@ mod tests {
         // never flipped to connected.
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(!status.is_connected());
-    }
-
-    async fn wait_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..200 {
-            if condition() {
-                return;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-        panic!("condition was never met within 2s");
     }
 }

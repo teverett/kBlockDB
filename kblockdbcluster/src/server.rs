@@ -5,9 +5,10 @@
 //! provides. See `wire.rs` for the wire format and `client.rs` for the
 //! connecting side.
 
-use crate::registry::PeerRegistry;
+use crate::peers::PeerSet;
 use crate::wire::{ChangeEntry, ChangeOp, PeerMessage};
 use std::future::Future;
+use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
 
 /// What `serve` applies each incoming `ChangeEntry` against -- implemented
@@ -46,19 +47,14 @@ pub trait ReplicationSink: Clone + Send + Sync + 'static {
 /// impl is expected to make each entry durable before resolving, the same
 /// way a local write would be).
 ///
-/// `registry` records every peer currently connected (by its own
-/// self-reported `server_id`) for as long as its connection lasts -- see
-/// `PeerRegistry`. Pass the same registry the embedder also reads (e.g.
-/// to report connected peers from a health endpoint); `serve` only ever
-/// adds to and removes from it, never reads it back.
-pub async fn serve<S: ReplicationSink>(
-    listener: TcpListener,
-    sink: S,
-    cluster_secret: String,
-    registry: PeerRegistry,
-) {
+/// Every peer that says a valid `Hello` is added to `peers` (keyed by
+/// its source IP plus the `peer_port` it reported), which starts
+/// replicating back to it if it wasn't already known -- see `peers.rs` on
+/// why peers are symmetric. The cluster secret checked against is
+/// `peers.identity().cluster_secret`.
+pub async fn serve<S: ReplicationSink>(listener: TcpListener, sink: S, peers: PeerSet) {
     loop {
-        let (stream, _addr) = match listener.accept().await {
+        let (stream, remote) = match listener.accept().await {
             Ok(pair) => pair,
             Err(e) => {
                 eprintln!("peer protocol: accept failed: {e}");
@@ -67,10 +63,9 @@ pub async fn serve<S: ReplicationSink>(
         };
         let _ = stream.set_nodelay(true);
         let sink = sink.clone();
-        let cluster_secret = cluster_secret.clone();
-        let registry = registry.clone();
+        let peers = peers.clone();
         tokio::spawn(async move {
-            handle_connection(stream, sink, &cluster_secret, registry).await;
+            handle_connection(stream, sink, peers, remote.ip()).await;
         });
     }
 }
@@ -82,9 +77,10 @@ pub async fn serve<S: ReplicationSink>(
 async fn handle_connection<S: ReplicationSink>(
     mut stream: TcpStream,
     sink: S,
-    cluster_secret: &str,
-    registry: PeerRegistry,
+    peers: PeerSet,
+    remote_ip: IpAddr,
 ) {
+    let cluster_secret = peers.identity().cluster_secret.as_str();
     let hello = match crate::wire::read_message(&mut stream).await {
         Ok(Some(msg)) => msg,
         Ok(None) => return,
@@ -93,6 +89,7 @@ async fn handle_connection<S: ReplicationSink>(
     let PeerMessage::Hello {
         secret,
         server_id,
+        peer_port,
         protocol_version,
     } = hello
     else {
@@ -142,12 +139,13 @@ async fn handle_connection<S: ReplicationSink>(
     {
         return;
     }
-    eprintln!("peer protocol: '{server_id}' connected");
-    // Held for the rest of this connection -- dropping it (whichever of
-    // this loop's several exit points runs) removes `server_id` from
-    // `registry` again, so a connected peer only ever appears in it for
-    // as long as the connection actually lasts.
-    let _connected = registry.track(server_id);
+    let dial_back = SocketAddr::new(remote_ip, peer_port).to_string();
+    eprintln!("peer protocol: '{server_id}' connected from {dial_back}");
+    // Peers are symmetric: a peer that connected in is replicated *to*
+    // as well -- a no-op if it's already known (e.g. configured here too).
+    if peers.add(dial_back.clone()) {
+        eprintln!("peer protocol: learned new peer {dial_back}");
+    }
 
     loop {
         let msg = match crate::wire::read_message(&mut stream).await {
@@ -205,26 +203,16 @@ async fn apply_entry<S: ReplicationSink>(sink: &S, entry: ChangeEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::RecordingSink;
+    use crate::test_support::{spawn_node, wait_until, TestNode, CLUSTER_SECRET};
     use kblockdblib::Value;
     use tokio::net::TcpStream as ClientStream;
 
-    const CLUSTER_SECRET: &str = "cluster-secret";
     const DB: &str = "db";
 
-    async fn spawn_test_server() -> (std::net::SocketAddr, RecordingSink, PeerRegistry) {
-        let sink = RecordingSink::new();
-        let registry = PeerRegistry::new();
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        tokio::spawn(serve(
-            listener,
-            sink.clone(),
-            CLUSTER_SECRET.to_string(),
-            registry.clone(),
-        ));
-        (addr, sink, registry)
-    }
+    /// The `peer_port` a raw test client claims in `Hello`. Nothing
+    /// listens there, so the dial-back this triggers just retries
+    /// harmlessly in the background.
+    const UNREACHABLE_PEER_PORT: u16 = 1;
 
     async fn hello(stream: &mut ClientStream, secret: &str) -> PeerMessage {
         crate::wire::write_message(
@@ -232,6 +220,7 @@ mod tests {
             &PeerMessage::Hello {
                 secret: secret.to_string(),
                 server_id: "test-peer".to_string(),
+                peer_port: UNREACHABLE_PEER_PORT,
                 protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
             },
         )
@@ -242,7 +231,7 @@ mod tests {
 
     #[tokio::test]
     async fn hello_with_the_right_secret_is_accepted() {
-        let (addr, _sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         assert_eq!(
             hello(&mut stream, CLUSTER_SECRET).await,
@@ -251,40 +240,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_connected_peer_is_added_to_the_registry() {
-        let (addr, _sink, registry) = spawn_test_server().await;
+    async fn a_peer_that_connects_in_is_learned_by_its_dial_back_address() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         hello(&mut stream, CLUSTER_SECRET).await;
 
-        wait_until(|| registry.connected() == vec!["test-peer".to_string()]).await;
+        let expected = format!("127.0.0.1:{UNREACHABLE_PEER_PORT}");
+        wait_until(|| peers.snapshot().iter().any(|(a, _)| *a == expected)).await;
     }
 
     #[tokio::test]
-    async fn a_disconnected_peer_is_removed_from_the_registry() {
-        let (addr, _sink, registry) = spawn_test_server().await;
-        let mut stream = ClientStream::connect(addr).await.unwrap();
-        hello(&mut stream, CLUSTER_SECRET).await;
-        wait_until(|| !registry.connected().is_empty()).await;
-
-        drop(stream);
-        wait_until(|| registry.connected().is_empty()).await;
-    }
-
-    #[tokio::test]
-    async fn a_rejected_hello_never_reaches_the_registry() {
-        let (addr, _sink, registry) = spawn_test_server().await;
+    async fn a_rejected_hello_is_never_learned() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         hello(&mut stream, "wrong").await;
 
-        // Give the (incorrect, if it happened) registration a moment to
-        // land, then assert it didn't.
+        // Give the (incorrect, if it happened) learning a moment to land,
+        // then assert it didn't.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert!(registry.connected().is_empty());
+        assert!(peers.snapshot().is_empty());
+    }
+
+    #[tokio::test]
+    async fn peers_are_symmetric_once_one_side_knows_the_other() {
+        let a = spawn_node("node-a").await;
+        let b = spawn_node("node-b").await;
+        // Only A is told about B -- B must learn A from A's `Hello` and
+        // dial back on its own.
+        a.peers.add(b.addr.to_string());
+
+        let a_addr = a.addr.to_string();
+        wait_until(|| b.peers.snapshot() == vec![(a_addr.clone(), true)]).await;
+        wait_until(|| a.peers.snapshot() == vec![(b.addr.to_string(), true)]).await;
+
+        // And B's writes now reach A, over the link B opened itself.
+        let replication = Some(b.hub.clone());
+        crate::hub::publish_set(
+            &replication,
+            DB,
+            &[1, 2, 3],
+            "material",
+            Value::Str("stone".to_string()),
+            kblockdblib::CellMeta {
+                created_at_ms: 1,
+                modified_at_ms: 1,
+                version: 0,
+            },
+        );
+        wait_until(|| a.sink.get(DB, &[1, 2, 3], "material").is_some()).await;
     }
 
     #[tokio::test]
     async fn hello_with_the_wrong_secret_is_rejected() {
-        let (addr, _sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         assert!(matches!(
             hello(&mut stream, "wrong").await,
@@ -294,13 +302,14 @@ mod tests {
 
     #[tokio::test]
     async fn hello_with_a_newer_protocol_version_is_rejected() {
-        let (addr, _sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         crate::wire::write_message(
             &mut stream,
             &PeerMessage::Hello {
                 secret: CLUSTER_SECRET.to_string(),
                 server_id: "test-peer".to_string(),
+                peer_port: UNREACHABLE_PEER_PORT,
                 protocol_version: crate::wire::PEER_PROTOCOL_VERSION + 1,
             },
         )
@@ -317,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_batch_set_is_applied_via_the_sink() {
-        let (addr, sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         hello(&mut stream, CLUSTER_SECRET).await;
 
@@ -345,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_change_batch_remove_is_applied_via_the_sink() {
-        let (addr, sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
         sink.apply_set_now(DB, &[1, 1, 1], "material", Value::Str("stone".to_string()));
 
         let mut stream = ClientStream::connect(addr).await.unwrap();
@@ -370,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_sink_error_is_logged_and_does_not_close_the_connection() {
-        let (addr, sink, _registry) = spawn_test_server().await;
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
         sink.fail_next();
         let mut stream = ClientStream::connect(addr).await.unwrap();
         hello(&mut stream, CLUSTER_SECRET).await;
@@ -405,15 +414,5 @@ mod tests {
 
         assert!(sink.get(DB, &[0, 0, 0], "k").is_none());
         wait_until(|| sink.get(DB, &[1, 0, 0], "k") == Some((Value::I64(2), 1, 1, 0))).await;
-    }
-
-    async fn wait_until(mut condition: impl FnMut() -> bool) {
-        for _ in 0..200 {
-            if condition() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("condition was never met within 2s");
     }
 }

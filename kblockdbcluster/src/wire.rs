@@ -15,7 +15,10 @@
 //!
 //! **Versioning** mirrors the binary protocol's `Hello`/`HelloOk` idiom
 //! with its own separate [`PEER_PROTOCOL_VERSION`]: the connecting side's
-//! `Hello` carries its version and cluster secret; the accepting side
+//! `Hello` carries its version, cluster secret, and the port its own
+//! peer listener is on (so the accepting side can dial back -- every
+//! known peer is replicated to in both directions, see `peers.rs`); the
+//! accepting side
 //! checks the secret first (wrong secret is indistinguishable on the wire
 //! from a version mismatch -- both just get `HelloRejected`, so a
 //! would-be attacker learns nothing about *why* a guess failed) and
@@ -42,7 +45,7 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// Bumped whenever this module's wire format changes in a way an older
 /// peer couldn't decode. Mirrors `kblockdbserver::wire::PROTOCOL_VERSION`'s
 /// reasoning, applied here to peer links instead of end-user ones.
-pub const PEER_PROTOCOL_VERSION: u8 = 0;
+pub const PEER_PROTOCOL_VERSION: u8 = 1;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -70,6 +73,10 @@ pub enum PeerMessage {
     Hello {
         secret: String,
         server_id: String,
+        /// The port the connecting server's own peer listener is on --
+        /// combined with the connection's source IP, the address the
+        /// accepting side dials back to (see `peers::PeerSet`).
+        peer_port: u16,
         protocol_version: u8,
     },
     HelloOk,
@@ -97,12 +104,14 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
         PeerMessage::Hello {
             secret,
             server_id,
+            peer_port,
             protocol_version,
         } => {
             buf.push(0);
             buf.push(*protocol_version);
             put_string(&mut buf, secret);
             put_string(&mut buf, server_id);
+            buf.extend_from_slice(&peer_port.to_le_bytes());
         }
         PeerMessage::HelloOk => buf.push(1),
         PeerMessage::HelloRejected(reason) => {
@@ -142,6 +151,7 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
             protocol_version: r.u8()?,
             secret: r.string()?,
             server_id: r.string()?,
+            peer_port: r.u16()?,
         }),
         1 => Ok(PeerMessage::HelloOk),
         2 => Ok(PeerMessage::HelloRejected(r.string()?)),
@@ -296,6 +306,10 @@ impl<'a> Reader<'a> {
         Ok(self.take(1)?[0])
     }
 
+    fn u16(&mut self) -> Result<u16, DecodeError> {
+        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
     fn u32(&mut self) -> Result<u32, DecodeError> {
         Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
     }
@@ -347,6 +361,7 @@ mod tests {
         roundtrip(PeerMessage::Hello {
             secret: "shh".to_string(),
             server_id: "node-a".to_string(),
+            peer_port: 8082,
             protocol_version: PEER_PROTOCOL_VERSION,
         });
     }

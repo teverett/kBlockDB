@@ -382,42 +382,29 @@ async fn main() {
         );
 
         let hub = kblockdbcluster::hub::ReplicationHub::new();
-        let peer_registry = kblockdbcluster::registry::PeerRegistry::new();
-        // One `ConnectionStatus` per configured peer, created here (before
-        // the matching `client::run` task is spawned below) so `AppState`
-        // and that task share the exact same flag -- `AppState` only ever
-        // reads it, `run` is the only writer.
-        let outbound_peers: Vec<state::OutboundPeer> = config
-            .peers
-            .iter()
-            .map(|p| state::OutboundPeer {
-                address: p.address.clone(),
-                status: kblockdbcluster::client::ConnectionStatus::new(),
-            })
-            .collect();
-        state = state
-            .with_replication(hub.clone())
-            .with_outbound_peers(outbound_peers.clone())
-            .with_peer_registry(peer_registry.clone());
+        // Every known peer -- configured below, or learned when one
+        // connects in -- is replicated to as well as from (see
+        // `kblockdbcluster::peers`); `add` spawns the outbound link.
+        let peers = kblockdbcluster::peers::PeerSet::new(
+            kblockdbcluster::peers::LocalIdentity {
+                cluster_secret,
+                server_id: state.hostname.to_string(),
+                peer_port: peer_listener
+                    .local_addr()
+                    .map(|a| a.port())
+                    .unwrap_or(peer_addr.port()),
+            },
+            hub.clone(),
+        );
+        for peer in &config.peers {
+            peers.add(peer.address.clone());
+        }
+        state = state.with_replication(hub).with_peers(peers.clone());
 
         let peer_state = state.clone();
-        let peer_secret = cluster_secret.clone();
         tokio::spawn(async move {
-            kblockdbcluster::server::serve(peer_listener, peer_state, peer_secret, peer_registry)
-                .await;
+            kblockdbcluster::server::serve(peer_listener, peer_state, peers).await;
         });
-
-        let server_id = state.hostname.to_string();
-        for peer in &outbound_peers {
-            let address = peer.address.clone();
-            let secret = cluster_secret.clone();
-            let server_id = server_id.clone();
-            let hub = hub.clone();
-            let status = peer.status.clone();
-            tokio::spawn(async move {
-                kblockdbcluster::client::run(address, secret, server_id, hub, status).await;
-            });
-        }
     }
 
     if let Some(binary_addr) = binary_addr {
