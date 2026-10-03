@@ -600,6 +600,7 @@ name = "kblockdbcluster"
 version = "0.1.0"
 dependencies = [
  "kblockdblib",
+ "socket2",
  "tokio",
 ]
 

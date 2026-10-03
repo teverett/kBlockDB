@@ -28,11 +28,14 @@
 //! - `peers` -- `PeerSet`, every known peer and its live link status.
 //!   Peers are symmetric: adding one (from config, or because it
 //!   connected in) starts replicating to it too.
+//! - `socket` -- `TCP_NODELAY` and TCP keepalive for both ends of a link,
+//!   so a peer that vanishes silently is still noticed.
 
 pub mod client;
 pub mod hub;
 pub mod peers;
 pub mod server;
+pub mod socket;
 pub mod wire;
 
 #[cfg(test)]

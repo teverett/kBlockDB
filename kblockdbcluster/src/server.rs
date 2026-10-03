@@ -61,7 +61,7 @@ pub async fn serve<S: ReplicationSink>(listener: TcpListener, sink: S, peers: Pe
                 continue;
             }
         };
-        let _ = stream.set_nodelay(true);
+        crate::socket::tune(&stream, peers.keepalive());
         let sink = sink.clone();
         let peers = peers.clone();
         tokio::spawn(async move {
@@ -90,6 +90,7 @@ async fn handle_connection<S: ReplicationSink>(
         secret,
         server_id,
         peer_port,
+        node_id,
         protocol_version,
     } = hello
     else {
@@ -133,10 +134,18 @@ async fn handle_connection<S: ReplicationSink>(
         .await;
         return;
     }
-    if crate::wire::write_message(&mut stream, &PeerMessage::HelloOk)
-        .await
-        .is_err()
-    {
+    // Our own node id goes back in `HelloOk` so the connecting side can
+    // tell if it just dialed itself (or an alias of a peer it already
+    // has) -- see `PeerSet::claim`. It drops the link in that case.
+    let ok = PeerMessage::HelloOk {
+        node_id: peers.node_id(),
+    };
+    if crate::wire::write_message(&mut stream, &ok).await.is_err() {
+        return;
+    }
+    if node_id == peers.node_id() {
+        // Dialed by ourselves, via some address that reaches this process
+        // -- nothing to learn or apply.
         return;
     }
     let dial_back = SocketAddr::new(remote_ip, peer_port).to_string();
@@ -153,15 +162,26 @@ async fn handle_connection<S: ReplicationSink>(
             Ok(None) => return,
             Err(_) => return,
         };
-        let PeerMessage::ChangeBatch(entries) = msg else {
-            // Only Hello/ChangeBatch ever travel this direction -- anything
-            // else is a protocol error, but per this module's "one bad
-            // frame doesn't end the connection" policy, just skip it
+        match msg {
+            PeerMessage::ChangeBatch(entries) => {
+                for entry in entries {
+                    apply_entry(&sink, entry).await;
+                }
+            }
+            // Gossip: learn any peer the sender is connected to that we
+            // don't know yet -- `add` spawns our link to it.
+            PeerMessage::PeerList(addresses) => {
+                for address in addresses {
+                    if peers.add(address.clone()) {
+                        eprintln!("peer protocol: learned {address} via gossip from '{server_id}'");
+                    }
+                }
+            }
+            // Only Hello/ChangeBatch/PeerList ever travel this direction --
+            // anything else is a protocol error, but per this module's "one
+            // bad frame doesn't end the connection" policy, just skip it
             // rather than disconnecting.
-            continue;
-        };
-        for entry in entries {
-            apply_entry(&sink, entry).await;
+            _ => continue,
         }
     }
 }
@@ -214,6 +234,9 @@ mod tests {
     /// harmlessly in the background.
     const UNREACHABLE_PEER_PORT: u16 = 1;
 
+    /// The node id a raw test client claims -- anything but the server's.
+    const TEST_CLIENT_NODE_ID: u64 = 42;
+
     async fn hello(stream: &mut ClientStream, secret: &str) -> PeerMessage {
         crate::wire::write_message(
             stream,
@@ -221,6 +244,7 @@ mod tests {
                 secret: secret.to_string(),
                 server_id: "test-peer".to_string(),
                 peer_port: UNREACHABLE_PEER_PORT,
+                node_id: TEST_CLIENT_NODE_ID,
                 protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
             },
         )
@@ -230,13 +254,88 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn hello_with_the_right_secret_is_accepted() {
-        let TestNode { addr, .. } = spawn_node("node-a").await;
+    async fn hello_with_the_right_secret_is_accepted_with_the_servers_node_id() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
         assert_eq!(
             hello(&mut stream, CLUSTER_SECRET).await,
-            PeerMessage::HelloOk
+            PeerMessage::HelloOk {
+                node_id: peers.node_id()
+            }
         );
+    }
+
+    #[tokio::test]
+    async fn a_peer_list_teaches_the_receiver_new_peers() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        hello(&mut stream, CLUSTER_SECRET).await;
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::PeerList(vec!["127.0.0.1:2".to_string()]),
+        )
+        .await
+        .unwrap();
+
+        wait_until(|| peers.snapshot().iter().any(|(a, _)| a == "127.0.0.1:2")).await;
+    }
+
+    #[tokio::test]
+    async fn three_nodes_converge_to_a_full_mesh_by_gossip() {
+        let a = spawn_node("node-a").await;
+        let b = spawn_node("node-b").await;
+        let c = spawn_node("node-c").await;
+        // A and C only know B; neither is told about the other.
+        a.peers.add(b.addr.to_string());
+        c.peers.add(b.addr.to_string());
+
+        let (a_addr, b_addr, c_addr) = (a.addr.to_string(), b.addr.to_string(), c.addr.to_string());
+        let mut expect_a = vec![(b_addr.clone(), true), (c_addr.clone(), true)];
+        let mut expect_c = vec![(a_addr.clone(), true), (b_addr.clone(), true)];
+        expect_a.sort();
+        expect_c.sort();
+        wait_until(|| a.peers.snapshot() == expect_a).await;
+        wait_until(|| c.peers.snapshot() == expect_c).await;
+
+        // A's writes now reach C over the link gossip created.
+        crate::hub::publish_set(
+            &Some(a.hub.clone()),
+            DB,
+            &[1, 2, 3],
+            "material",
+            Value::Str("stone".to_string()),
+            kblockdblib::CellMeta {
+                created_at_ms: 1,
+                modified_at_ms: 1,
+                version: 0,
+            },
+        );
+        wait_until(|| c.sink.get(DB, &[1, 2, 3], "material").is_some()).await;
+    }
+
+    #[tokio::test]
+    async fn a_node_handed_its_own_address_drops_it() {
+        let a = spawn_node("node-a").await;
+        a.peers.add(a.addr.to_string());
+        wait_until(|| a.peers.snapshot().is_empty()).await;
+        // And it stays dropped.
+        assert!(!a.peers.add(a.addr.to_string()));
+    }
+
+    #[tokio::test]
+    async fn a_second_address_for_an_already_linked_peer_is_dropped() {
+        let a = spawn_node("node-a").await;
+        let b = spawn_node("node-b").await;
+        let by_ip = b.addr.to_string();
+        let by_name = format!("localhost:{}", b.addr.port());
+        a.peers.add(by_ip.clone());
+        wait_until(|| a.peers.snapshot() == vec![(by_ip.clone(), true)]).await;
+
+        a.peers.add(by_name);
+        // Give the alias link time to connect and be dropped, then check
+        // only the original remains.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(a.peers.snapshot(), vec![(by_ip, true)]);
     }
 
     #[tokio::test]
@@ -310,6 +409,7 @@ mod tests {
                 secret: CLUSTER_SECRET.to_string(),
                 server_id: "test-peer".to_string(),
                 peer_port: UNREACHABLE_PEER_PORT,
+                node_id: TEST_CLIENT_NODE_ID,
                 protocol_version: crate::wire::PEER_PROTOCOL_VERSION + 1,
             },
         )

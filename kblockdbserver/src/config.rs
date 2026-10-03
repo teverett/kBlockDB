@@ -8,9 +8,11 @@
 //! command line leaks them into shell history and `ps` output.
 
 use crate::state::Account;
+use kblockdbcluster::socket::Keepalive;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 pub struct UserConfig {
@@ -54,7 +56,46 @@ pub struct ClusterConfig {
     /// `cluster_secret`).
     #[serde(default)]
     pub cluster_secret: Option<String>,
+    /// How long a peer *learned* at runtime (it connected in, or was
+    /// gossiped) may stay continuously unreachable before it's dropped --
+    /// see `kblockdbcluster::peers::PeerSet::prune`. Configured
+    /// `[[peers]]` are never dropped. Defaults to
+    /// `DEFAULT_DEAD_PEER_TIMEOUT_SECS`; `0` disables dropping entirely.
+    #[serde(default)]
+    pub dead_peer_timeout_secs: Option<u64>,
+    /// TCP keepalive on every peer link (see `kblockdbcluster::socket`):
+    /// seconds a link may be idle before the first probe. Defaults to 30.
+    #[serde(default)]
+    pub keepalive_idle_secs: Option<u64>,
+    /// Seconds between unanswered keepalive probes. Defaults to 10.
+    #[serde(default)]
+    pub keepalive_interval_secs: Option<u64>,
+    /// Unanswered keepalive probes before a link is dropped. Defaults to 3.
+    #[serde(default)]
+    pub keepalive_retries: Option<u32>,
 }
+
+impl ClusterConfig {
+    /// The keepalive settings for peer links: this table's values, each
+    /// falling back to `kblockdbcluster::socket::Keepalive`'s default.
+    pub fn keepalive(&self) -> Keepalive {
+        let defaults = Keepalive::default();
+        Keepalive {
+            idle: self
+                .keepalive_idle_secs
+                .map_or(defaults.idle, Duration::from_secs),
+            interval: self
+                .keepalive_interval_secs
+                .map_or(defaults.interval, Duration::from_secs),
+            retries: self.keepalive_retries.unwrap_or(defaults.retries),
+        }
+    }
+}
+
+/// `ClusterConfig::dead_peer_timeout_secs`' default: five minutes -- long
+/// enough to ride out a restart or a brief network blip, short enough that
+/// a node that's really gone stops being retried by everyone.
+pub const DEFAULT_DEAD_PEER_TIMEOUT_SECS: u64 = 300;
 
 /// The `[worldparameters]` table: the three numbers that fix a *new*
 /// world's shape (see `kblockdblib::params::WorldParams`) -- meaningless,
@@ -161,6 +202,21 @@ impl Config {
                     )
                 }
                 Some(_) => {}
+            }
+        }
+        for (name, value) in [
+            ("keepalive_idle_secs", self.cluster.keepalive_idle_secs),
+            (
+                "keepalive_interval_secs",
+                self.cluster.keepalive_interval_secs,
+            ),
+            (
+                "keepalive_retries",
+                self.cluster.keepalive_retries.map(u64::from),
+            ),
+        ] {
+            if value == Some(0) {
+                return Err(format!("[cluster].{name} must be greater than 0"));
             }
         }
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
@@ -512,6 +568,66 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["10.0.0.2:8082", "10.0.0.3:8082"]
         );
+    }
+
+    #[test]
+    fn dead_peer_timeout_defaults_to_unset_and_can_be_set() {
+        let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
+        assert_eq!(config.cluster.dead_peer_timeout_secs, None);
+
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            [cluster]
+            cluster_secret = "shh"
+            dead_peer_timeout_secs = 60
+            "#,
+        )
+        .unwrap();
+        assert_eq!(config.cluster.dead_peer_timeout_secs, Some(60));
+    }
+
+    #[test]
+    fn keepalive_defaults_when_unset() {
+        let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
+        assert_eq!(config.cluster.keepalive(), Keepalive::default());
+    }
+
+    #[test]
+    fn keepalive_settings_can_be_set_individually() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            [cluster]
+            cluster_secret = "shh"
+            keepalive_idle_secs = 60
+            keepalive_retries = 5
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.cluster.keepalive(),
+            Keepalive {
+                idle: Duration::from_secs(60),
+                interval: Keepalive::default().interval,
+                retries: 5,
+            }
+        );
+    }
+
+    #[test]
+    fn zero_keepalive_settings_are_rejected() {
+        for key in [
+            "keepalive_idle_secs",
+            "keepalive_interval_secs",
+            "keepalive_retries",
+        ] {
+            let err = Config::from_toml_str(&format!(
+                "admin_password = \"secret\"\n[cluster]\n{key} = 0\n"
+            ))
+            .unwrap_err();
+            assert!(err.contains(key), "{key}: {err}");
+        }
     }
 
     #[test]

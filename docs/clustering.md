@@ -19,10 +19,24 @@ cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
 # is set but this isn't). Distinct from http_port/binary_port.
 peer_port = 8082
 
+# How long a peer learned at runtime (it connected in, or was gossiped)
+# may stay unreachable before it's dropped from the peer set. Default
+# 300 (five minutes); 0 never drops anyone. Configured [[peers]] are never
+# dropped regardless.
+dead_peer_timeout_secs = 300
+
+# TCP keepalive on every peer link, so a peer that vanishes without
+# closing its connection is still noticed: probe a link idle for
+# keepalive_idle_secs, every keepalive_interval_secs, and drop it after
+# keepalive_retries unanswered probes. All optional (defaults below);
+# each must be greater than 0.
+keepalive_idle_secs = 30
+keepalive_interval_secs = 10
+keepalive_retries = 3
+
 # Other servers to replicate with -- "address" is that peer's own
-# peer_port, not its HTTP or binary-protocol port. Use IP addresses: a
-# peer that connects in is identified by its source IP (see "Peers are
-# symmetric" below).
+# peer_port, not its HTTP or binary-protocol port. One reachable peer is
+# enough: the rest of the cluster is discovered by gossip (see below).
 [[peers]]
 address = "10.0.0.2:8082"
 
@@ -43,19 +57,54 @@ connecting server's `peer_port`, so the accepting side dials back to
 pair of servers, only *one* side has to list the other: if A's config names
 B, B learns A the moment A connects and starts sending to A as well.
 
-There's still no gossip: a server only knows peers it's configured with or
-that connected to it directly. For a full mesh (every node replicating to
-every other), each *pair* of nodes needs one side to list the other -- e.g.
-point every node at one seed node, and every node except the seed at each
-other, or simply list every other node everywhere.
+### Gossip
 
-Learned peers live for the life of the process: a peer that goes away
-stays known (shown as not connected, its link retrying with backoff), and
-learned peers aren't written back to the config -- after a restart a
-server dials only its configured peers and relearns the rest as they
-reconnect. Peers are identified by address string, so a peer configured
-by hostname and later seen connecting from its IP shows up twice --
-configure peers by IP.
+Peers share their peer lists. Over each of its links, a server sends a
+`PeerList` of every peer it's *currently connected to* -- right after the
+link comes up, and again whenever its own peer set changes (a peer added,
+dropped, or newly connected). The receiver adds any address it doesn't
+know, which starts a link to it, and so on. So the cluster converges on a
+**full mesh** as long as the configured peers form one connected graph:
+give every node a single seed node to start from, and they'll all find
+each other. Only connected peers are gossiped, so an address nobody can
+reach isn't spread around.
+
+Each process picks a random **node id** at startup and the two sides of
+every link swap them in `Hello`/`HelloOk`. That catches the two ways
+gossip can hand a server a bad address: its *own* address (it dials
+itself) or a *second* address for a peer it's already linked to (say a
+hostname for a peer it learned by IP). Either way the link sees a node id
+it already has, drops that address, and ignores it from then on -- so
+there's no self-link and no duplicate link, and the Cluster view shows
+each peer once, under the address it was first reached at.
+
+### Dead peers
+
+A peer that goes away stays known for a while -- shown as not connected,
+its link retrying with backoff -- so a restart or a short network blip
+doesn't lose it. But a peer *learned* at runtime (it connected in, or
+arrived by gossip) that stays unreachable for `dead_peer_timeout_secs`
+straight (default five minutes) is dropped: its link task stops, it
+disappears from `/rest/cluster` and the Cluster tab, and it's no longer
+gossiped. The clock is "continuously down": any successful reconnect
+resets it. It starts as soon as the link notices the peer is gone -- right
+away when the peer's process exits or its socket is closed or reset. A
+host that vanishes *silently* (power loss, a network partition that drops
+packets) sends nothing, so it's caught by TCP keepalive instead: both
+ends of every peer link enable it, by default probing a link idle for 30s
+every 10s and dropping it after 3 unanswered probes -- so such a peer
+shows as not connected about a minute after it disappears. Tune this with
+the `keepalive_*` settings in `[cluster]` (see "Config", and
+`kblockdbcluster/src/socket.rs`; on platforms that don't support setting
+the probe interval and count, the OS defaults apply and it takes longer).
+
+Peers listed in this server's own `[[peers]]` are **never** dropped --
+the operator asked for them explicitly, so they're retried forever.
+A dropped peer isn't blacklisted either: if it comes back and connects
+in, or another node gossips it again, it's simply learned afresh.
+
+Nothing is written back to the config -- after a restart a server dials
+its configured peers and relearns the rest by gossip.
 
 ## How it works
 
@@ -71,9 +120,12 @@ against its matching database (auto-creating it, with its own default
 shape, the first time it sees a database name it doesn't have yet).
 
 A write is **never relayed onward** by the node that receives it -- only
-locally-originated writes are published to the hub, so in a full mesh
-every node already has a direct connection to every other node and
-nothing needs multi-hop forwarding.
+locally-originated writes are published to the hub. Gossip makes the
+cluster a full mesh, so every node has a direct link to every other and
+nothing needs multi-hop forwarding. The flip side: a write made while the
+mesh is still forming, before a node has its direct link to some peer,
+never reaches that peer (same live-forward-only rule as a reconnect, see
+"Limitations").
 
 Two endpoints report cluster membership, both live:
 
@@ -147,3 +199,19 @@ This is a v1, intentionally minimal design:
   a database auto-created this way can end up differently shaped on
   different nodes. Create databases with an explicit, matching shape up
   front if your peers' defaults differ.
+- **Full mesh, small clusters.** Every node links to every other, so a
+  cluster of N nodes holds N*(N-1) peer connections and every write is
+  sent N-1 times by its origin. Fine for a handful of nodes, not for
+  hundreds.
+- **Gossiped addresses are as the gossiper sees them.** A peer learned by
+  connecting in is recorded as `<source IP>:<peer_port>` -- that's the
+  address passed on by gossip. Across NAT or between networks where
+  nodes see each other at different addresses, a gossiped address may be
+  unreachable from the receiver; it then just shows "not connected" and
+  keeps retrying. Configure peers with addresses every node can reach.
+- **Configured peers are never forgotten.** Learned peers are dropped
+  after `dead_peer_timeout_secs` unreachable (see "Dead peers"), but a
+  permanently-gone node that's listed in some server's `[[peers]]` stays
+  in *that* server's peer set, retrying with backoff, until it's removed
+  from the config and the server restarted. Since only connected peers
+  are gossiped, it doesn't spread back to anyone else.

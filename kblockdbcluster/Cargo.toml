@@ -19,5 +19,6 @@ name = "kblockdbcluster"
 path = "src/lib.rs"
 
 [dependencies]
+socket2 = "0.6"
 kblockdblib = { path = "../kblockdblib" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util"] }

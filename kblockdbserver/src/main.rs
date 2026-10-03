@@ -395,9 +395,21 @@ async fn main() {
                     .unwrap_or(peer_addr.port()),
             },
             hub.clone(),
-        );
+        )
+        .with_keepalive(config.cluster.keepalive());
         for peer in &config.peers {
-            peers.add(peer.address.clone());
+            peers.add_configured(peer.address.clone());
+        }
+        let dead_peer_timeout = config
+            .cluster
+            .dead_peer_timeout_secs
+            .unwrap_or(config::DEFAULT_DEAD_PEER_TIMEOUT_SECS);
+        if dead_peer_timeout > 0 {
+            tokio::spawn(
+                peers
+                    .clone()
+                    .prune_forever(std::time::Duration::from_secs(dead_peer_timeout)),
+            );
         }
         state = state.with_replication(hub).with_peers(peers.clone());
 

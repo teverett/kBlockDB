@@ -26,8 +26,9 @@
 //!
 //! **Message shape.** Unlike a request/response protocol, this one is
 //! push-only: after `Hello`/`HelloOk`, the connecting side just streams
-//! `ChangeBatch` frames at its own pace, and the accepting side never
-//! replies to them at all (no acks, no pipelining concerns -- see
+//! `ChangeBatch` frames (its writes) and `PeerList` frames (gossip -- see
+//! `peers.rs`) at its own pace, and the accepting side never replies to
+//! them at all (no acks, no pipelining concerns -- see
 //! `client`/`server`'s own doc comments on why no-backfill/best-effort
 //! delivery is an accepted v1 trade-off).
 
@@ -45,7 +46,7 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// Bumped whenever this module's wire format changes in a way an older
 /// peer couldn't decode. Mirrors `kblockdbserver::wire::PROTOCOL_VERSION`'s
 /// reasoning, applied here to peer links instead of end-user ones.
-pub const PEER_PROTOCOL_VERSION: u8 = 1;
+pub const PEER_PROTOCOL_VERSION: u8 = 2;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -77,11 +78,24 @@ pub enum PeerMessage {
         /// combined with the connection's source IP, the address the
         /// accepting side dials back to (see `peers::PeerSet`).
         peer_port: u16,
+        /// The connecting process's random per-run identity -- lets the
+        /// accepting side tell it's been dialed by itself (see
+        /// `peers::PeerSet::claim`).
+        node_id: u64,
         protocol_version: u8,
     },
-    HelloOk,
+    /// Carries the *accepting* process's node id, so the connecting side
+    /// can tell when the address it dialed turned out to be itself, or a
+    /// node it's already linked to under another address.
+    HelloOk {
+        node_id: u64,
+    },
     HelloRejected(String),
     ChangeBatch(Vec<ChangeEntry>),
+    /// Gossip: the addresses of every peer the sender is currently
+    /// connected to (see `peers::PeerSet::gossip_list`). The receiver adds
+    /// any it doesn't already know.
+    PeerList(Vec<String>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -105,6 +119,7 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
             secret,
             server_id,
             peer_port,
+            node_id,
             protocol_version,
         } => {
             buf.push(0);
@@ -112,8 +127,19 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
             put_string(&mut buf, secret);
             put_string(&mut buf, server_id);
             buf.extend_from_slice(&peer_port.to_le_bytes());
+            buf.extend_from_slice(&node_id.to_le_bytes());
         }
-        PeerMessage::HelloOk => buf.push(1),
+        PeerMessage::HelloOk { node_id } => {
+            buf.push(1);
+            buf.extend_from_slice(&node_id.to_le_bytes());
+        }
+        PeerMessage::PeerList(addresses) => {
+            buf.push(4);
+            buf.extend_from_slice(&(addresses.len() as u32).to_le_bytes());
+            for address in addresses {
+                put_string(&mut buf, address);
+            }
+        }
         PeerMessage::HelloRejected(reason) => {
             buf.push(2);
             put_string(&mut buf, reason);
@@ -152,8 +178,9 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
             secret: r.string()?,
             server_id: r.string()?,
             peer_port: r.u16()?,
+            node_id: r.u64()?,
         }),
-        1 => Ok(PeerMessage::HelloOk),
+        1 => Ok(PeerMessage::HelloOk { node_id: r.u64()? }),
         2 => Ok(PeerMessage::HelloRejected(r.string()?)),
         3 => {
             let count = r.u32()? as usize;
@@ -179,6 +206,13 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
                 })
                 .collect::<Result<Vec<_>, DecodeError>>()?;
             Ok(PeerMessage::ChangeBatch(entries))
+        }
+        4 => {
+            let count = r.u32()? as usize;
+            let addresses = (0..count)
+                .map(|_| r.string())
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(PeerMessage::PeerList(addresses))
         }
         other => Err(DecodeError::UnknownTag(other)),
     }
@@ -362,13 +396,14 @@ mod tests {
             secret: "shh".to_string(),
             server_id: "node-a".to_string(),
             peer_port: 8082,
+            node_id: 0xDEAD_BEEF_1234_5678,
             protocol_version: PEER_PROTOCOL_VERSION,
         });
     }
 
     #[test]
     fn hello_ok_round_trips() {
-        roundtrip(PeerMessage::HelloOk);
+        roundtrip(PeerMessage::HelloOk { node_id: 7 });
     }
 
     #[test]
@@ -425,6 +460,15 @@ mod tests {
                 version: 0,
             },
         ]));
+    }
+
+    #[test]
+    fn peer_list_round_trips() {
+        roundtrip(PeerMessage::PeerList(vec![
+            "10.0.0.2:8082".to_string(),
+            "10.0.0.3:8082".to_string(),
+        ]));
+        roundtrip(PeerMessage::PeerList(vec![]));
     }
 
     #[test]
