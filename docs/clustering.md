@@ -34,6 +34,15 @@ keepalive_idle_secs = 30
 keepalive_interval_secs = 10
 keepalive_retries = 3
 
+# How long a deleted cell's tombstone is kept (default 604800, a week;
+# must be > 0). A node offline longer than this can't safely catch up --
+# see "Deletes and tombstones".
+tombstone_retention_secs = 604800
+
+# How far before its watermark a catch-up starts, to cover writes still in
+# flight and slow clocks elsewhere (default 60; 0 allowed).
+catch_up_margin_secs = 60
+
 # Other servers to replicate with -- "address" is that peer's own
 # peer_port, not its HTTP or binary-protocol port. One reachable peer is
 # enough: the rest of the cluster is discovered by gossip (see below).
@@ -106,6 +115,70 @@ in, or another node gossips it again, it's simply learned afresh.
 Nothing is written back to the config -- after a restart a server dials
 its configured peers and relearns the rest by gossip.
 
+### Catch-up
+
+A server that's new, restarting, or whose link to one peer dropped for a
+while gets what it missed when the link comes back. Each peer's changes
+arrive on the connection *that peer* dials in, so the catch-up is
+requested there:
+
+1. Right after `HelloOk`, the receiving server sends
+   `CatchUpRequest{since_ms}`: its **watermark** for that peer, minus
+   `catch_up_margin_secs`.
+2. The sending server replies with every change it holds -- every
+   database, whoever originally made each write, deletes included --
+   with `modified_at_ms` after `since_ms`. These go out as ordinary
+   `ChangeBatch` frames, interleaved with live ones and applied with the
+   same last-write-wins rule, so the overlap is harmless.
+3. When it's done, the sender sends `Synced{through_ms}`: everything up
+   to that time has been sent. While the link stays up and caught up, it
+   sends `Synced` again every few seconds.
+
+The watermark is the latest `through_ms` a peer has sent. It's in the
+*sender's* clock, so clock differences between the two servers don't
+matter, and it only moves when the sender confirms. A link that drops
+mid-catch-up asks again from the old watermark next time. Watermarks are
+saved in `<data_dir>/.cluster/watermarks`, so a restarted server picks up
+where it left off. A peer with no watermark gets `since_ms` 0: a full
+copy. A brand-new node therefore needs no copying of data directories --
+point it at one peer and it fills itself from every peer it finds.
+
+Every peer is asked, not just one. That's simplest and most robust (a
+peer that also missed something doesn't leave a gap), but it costs
+bandwidth: a new node joining an N-node cluster receives N-1 full copies,
+and each existing node receives a full copy of what the new node then
+holds. Fine for the small clusters this is meant for.
+
+The margin covers what a watermark can't: a write in the moment between
+being stored and being published, and writes whose timestamps came from a
+third server with a slow clock.
+
+A sender whose link falls behind its in-memory buffer (more than 4096
+unsent writes) no longer just loses them: it runs a catch-up of its own
+from its last `Synced` point.
+
+### Deletes and tombstones
+
+A delete has to be replicated too, including to a server that was offline
+when it happened -- so with clustering on, deleting a value leaves a
+**tombstone** recording when. Tombstones are never visible to reads,
+queries or the data browser. They let last-write-wins refuse an older
+write that arrives after the delete, and let a catch-up include deletes.
+Only a cell that actually held a value gets one, so deleting a large,
+mostly empty region doesn't fill the disk with them.
+
+Tombstones are kept for `tombstone_retention_secs` (default a week), then
+removed the next time their chunk is written. That makes the retention
+the longest a server can be offline and still catch up correctly: after
+that, the tombstones for deletes it missed may be gone, so the data they
+deleted would stay on that server. The server warns at startup if a
+peer's watermark is older than the retention. In that case, stop it,
+delete its data directory (including `.cluster/`), and start it again to
+take a fresh copy.
+
+Without clustering, no tombstones are kept and a delete just erases, as
+before.
+
 ## How it works
 
 Every local write -- a REST `PUT`/`DELETE` on a cell or region, the
@@ -119,13 +192,13 @@ TCP connection to that peer, authenticated once per connection with
 against its matching database (auto-creating it, with its own default
 shape, the first time it sees a database name it doesn't have yet).
 
-A write is **never relayed onward** by the node that receives it -- only
-locally-originated writes are published to the hub. Gossip makes the
+A write is **never relayed onward** live by the node that receives it --
+only locally-originated writes are published to the hub. Gossip makes the
 cluster a full mesh, so every node has a direct link to every other and
-nothing needs multi-hop forwarding. The flip side: a write made while the
-mesh is still forming, before a node has its direct link to some peer,
-never reaches that peer (same live-forward-only rule as a reconnect, see
-"Limitations").
+nothing needs multi-hop forwarding. A write made while the mesh is still
+forming, before a node has its direct link to some peer, reaches it when
+that link comes up, through catch-up (which does include other nodes'
+writes the sender holds).
 
 Two endpoints report cluster membership, both live:
 
@@ -146,8 +219,9 @@ The protocol, the hub, and both sides of a peer link live in their own
 crate, `kblockdbcluster`, not in `kblockdbserver` itself. That crate is
 storage-agnostic -- it knows nothing about `World`/databases/accounts, only
 "apply this set/remove, report success or a message" (its
-`server::ReplicationSink` trait). `kblockdbserver/src/cluster.rs`
-implements that trait for its own `AppState` (the one place auto-create-
+`server::ReplicationSink` trait) and "list every change since T" (its
+`source::ChangeSource` trait). `kblockdbserver/src/cluster.rs`
+implements both for its own `AppState` (the one place auto-create-
 on-unseen-database and similar server-specific behavior lives), and
 `main.rs` wires `kblockdbcluster::server::serve`/`client::run` into this
 server's config and startup. The dependency only ever goes one way --
@@ -160,8 +234,9 @@ in-memory sink rather than any real storage.
 If two nodes each write the same cell/key without coordinating, the
 receiving side applies **last-write-wins by `modified_at_ms`**: an
 incoming write/removal is only applied if its timestamp is strictly newer
-than whatever that cell/key currently holds (locally or from an earlier
-replicated write); otherwise it's silently discarded. A tie (equal
+than whatever that cell/key currently holds -- a value, or a tombstone
+recording when it was deleted (locally or from an earlier replicated
+write); otherwise it's silently discarded. A tie (equal
 millisecond timestamps) keeps whatever is already there -- an accepted
 imprecision, not a bug, given millisecond resolution. This is the same
 mechanism `SELECT`'s `created`/`updated`/`version` keywords expose (see
@@ -172,17 +247,25 @@ than queried.
 
 This is a v1, intentionally minimal design:
 
-- **No backfill.** A peer only receives changes made *after* its
-  connection is established. Nothing missed while disconnected, or made
-  before the peer link ever existed, is replayed. Bootstrap a new node's
-  starting data by other means (copying the data directory, say) before
-  pointing it at peers.
-- **No durability guarantee for the replication stream itself.** Entries
-  are held in a bounded in-process buffer; a peer connection that falls
-  far enough behind (or is down for a while) can simply miss entries
-  rather than catching up on them. The *local* write itself is always
-  durable (written to disk before the response is sent) -- only its
-  propagation to a lagging/disconnected peer isn't guaranteed.
+- **Catch-up is bounded by tombstone retention.** A server offline for
+  longer than `tombstone_retention_secs` must be wiped and re-copied (see
+  "Deletes and tombstones").
+- **A delete for a key a server has never seen is dropped.** A tombstone
+  is recorded under the server's own id for that key, so if no cell in
+  that database has ever had the key, there's nothing to record it under.
+  A later, older write of the key from a peer that missed the delete
+  would then be accepted. This needs a key's very first write anywhere to
+  arrive after its delete, so it's rare.
+- **Upgrade every node before relying on catch-up.** A server rejects a
+  peer speaking a newer protocol version, and an older server never asks
+  for or confirms a catch-up. Mixed-version clusters only replicate live
+  changes, and only from the older servers to the newer ones.
+- **Chunk files are upgraded one way.** Tombstones needed a new chunk
+  file format. Old files are still read, but every chunk this version
+  writes is in the new format, which an older build can't read.
+- **No database-level replication.** Creating or removing a database, and
+  adding or removing a column, aren't replicated; a database a peer
+  hasn't seen is auto-created on its first incoming write.
 - **No quorum or strong consistency.** This is eventually-consistent,
   best-effort replication, not a consensus protocol -- there's no
   guarantee all nodes agree at any given instant, only that they tend to

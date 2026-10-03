@@ -270,19 +270,22 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
             };
             let replication = state.replication.clone();
             let (db2, coord2, key2) = (db.clone(), coord.clone(), key.clone());
-            let modified_at_ms = kblockdbcluster::hub::now_ms();
             match state
                 .with_database(&db, move |w| w.remove(&coord, &key))
                 .await
             {
-                Ok(()) => {
-                    kblockdbcluster::hub::publish_remove(
-                        &replication,
-                        &db2,
-                        &coord2,
-                        &key2,
-                        modified_at_ms,
-                    );
+                Ok(removed_at) => {
+                    // Only a value that was actually there is replicated, at
+                    // the time `remove` recorded for it.
+                    if let Some(removed_at) = removed_at {
+                        kblockdbcluster::hub::publish_remove(
+                            &replication,
+                            &db2,
+                            &coord2,
+                            &key2,
+                            removed_at,
+                        );
+                    }
                     Response::Ok
                 }
                 Err(e) => response_from_error(e),
@@ -376,20 +379,19 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
             };
             let region = kblockdblib::Region::new(origin, extent);
             let replication = state.replication.clone();
-            let (db2, region2, key2) = (db.clone(), region.clone(), key.clone());
-            let modified_at_ms = kblockdbcluster::hub::now_ms();
+            let (db2, key2) = (db.clone(), key.clone());
             match state
                 .with_database(&db, move |w| w.remove_region(&region, &key))
                 .await
             {
-                Ok(()) => {
-                    for coord in region2.iter() {
+                Ok(removed) => {
+                    for coord in &removed.coords {
                         kblockdbcluster::hub::publish_remove(
                             &replication,
                             &db2,
-                            &coord,
+                            coord,
                             &key2,
-                            modified_at_ms,
+                            removed.at_ms,
                         );
                     }
                     Response::Ok

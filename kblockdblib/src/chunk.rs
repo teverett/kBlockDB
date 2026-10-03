@@ -142,7 +142,9 @@ enum ColumnData {
 /// since (0 for the initial `set`, incremented on every one after that).
 /// Cleared along with the value on `remove` -- a cell set again later after
 /// being removed starts a brand new history, not a continuation of the old
-/// one.
+/// one. (A *tombstone* may record when it was removed -- see
+/// `Chunk::tombstones` -- but that's separate from, and never visible as,
+/// a `CellMeta`.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CellMeta {
     pub created_at_ms: u64,
@@ -175,6 +177,30 @@ struct Column {
 pub struct Chunk {
     columns: HashMap<u32, Column>,
     presence_bytes: usize,
+    /// When each removed cell/key was removed, by key id then local cell
+    /// index -- only recorded when the owning world keeps tombstones (see
+    /// `World::with_tombstone_retention`), so a replicated cluster can
+    /// tell "deleted at T" apart from "never written" and ship deletes in
+    /// a catch-up. Kept outside `columns` on purpose: `get`/`get_meta`/
+    /// `entries_by_local_idx` never see a tombstone, so no read path has
+    /// to filter one out. A cell/key never has both a value and a
+    /// tombstone: setting it clears the tombstone.
+    tombstones: HashMap<u32, BTreeMap<usize, u64>>,
+    /// The highest `modified_at_ms` or tombstone time ever stored in this
+    /// chunk. Never decreases (not even when that value is later removed
+    /// or its tombstone purged), so it's always a safe upper bound for
+    /// "has anything here changed since T" -- see `World::changes_since`,
+    /// which reads it from the file header alone to skip whole chunks.
+    newest_ms: u64,
+}
+
+/// One cell/key's state as reported by `Chunk::changes_since` /
+/// `World::changes_since`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ChangeKind {
+    Set(Value, CellMeta),
+    /// Removed at this time (ms since the Unix epoch).
+    Removed(u64),
 }
 
 impl Chunk {
@@ -182,7 +208,89 @@ impl Chunk {
         Chunk {
             columns: HashMap::new(),
             presence_bytes: cell_count.div_ceil(8),
+            tombstones: HashMap::new(),
+            newest_ms: 0,
         }
+    }
+
+    /// See the `newest_ms` field.
+    pub fn newest_ms(&self) -> u64 {
+        self.newest_ms
+    }
+
+    /// When this cell/key was removed, if a tombstone records it.
+    pub fn tombstone_at(&self, local_idx: usize, key_id: u32) -> Option<u64> {
+        self.tombstones.get(&key_id)?.get(&local_idx).copied()
+    }
+
+    /// Records that this cell/key was removed at `at_ms`, replacing any
+    /// older tombstone. Doesn't touch a value -- callers remove that
+    /// first (see `remove_with_tombstone`).
+    pub fn put_tombstone(&mut self, local_idx: usize, key_id: u32, at_ms: u64) {
+        self.tombstones
+            .entry(key_id)
+            .or_default()
+            .insert(local_idx, at_ms);
+        self.newest_ms = self.newest_ms.max(at_ms);
+    }
+
+    fn clear_tombstone(&mut self, local_idx: usize, key_id: u32) {
+        if let Some(cells) = self.tombstones.get_mut(&key_id) {
+            cells.remove(&local_idx);
+            if cells.is_empty() {
+                self.tombstones.remove(&key_id);
+            }
+        }
+    }
+
+    /// `remove`, plus a tombstone at `at_ms` -- but only if there was a
+    /// value to remove, so deleting a large, mostly empty region doesn't
+    /// fill chunks with markers for cells that never held anything.
+    /// Returns whether a value was removed.
+    pub fn remove_with_tombstone(&mut self, local_idx: usize, key_id: u32, at_ms: u64) -> bool {
+        let removed = self.remove(local_idx, key_id);
+        if removed {
+            self.put_tombstone(local_idx, key_id, at_ms);
+        }
+        removed
+    }
+
+    /// Drops every tombstone older than `cutoff_ms`, returning whether any
+    /// were dropped.
+    pub fn purge_tombstones_older_than(&mut self, cutoff_ms: u64) -> bool {
+        let mut purged = false;
+        self.tombstones.retain(|_, cells| {
+            let before = cells.len();
+            cells.retain(|_, at| *at >= cutoff_ms);
+            purged |= cells.len() != before;
+            !cells.is_empty()
+        });
+        purged
+    }
+
+    /// Every value set, and every tombstone recorded, after `since_ms`
+    /// (strictly), as `(local_idx, key_id, change)`. O(chunk contents),
+    /// like `entries_by_local_idx`.
+    pub fn changes_since(&self, since_ms: u64) -> Vec<(usize, u32, ChangeKind)> {
+        let mut out = Vec::new();
+        if self.newest_ms <= since_ms {
+            return out;
+        }
+        for (local_idx, entries) in self.entries_by_local_idx() {
+            for (key_id, value, meta) in entries {
+                if meta.modified_at_ms > since_ms {
+                    out.push((local_idx, key_id, ChangeKind::Set(value, meta)));
+                }
+            }
+        }
+        for (&key_id, cells) in &self.tombstones {
+            for (&local_idx, &at) in cells {
+                if at > since_ms {
+                    out.push((local_idx, key_id, ChangeKind::Removed(at)));
+                }
+            }
+        }
+        out
     }
 
     pub fn get(&self, local_idx: usize, key_id: u32) -> Option<Value> {
@@ -277,6 +385,8 @@ impl Chunk {
     /// function of its arguments -- deterministic and easy to test without
     /// depending on wall-clock time.
     pub fn set(&mut self, local_idx: usize, key_id: u32, value: Value, now_ms: u64) -> CellMeta {
+        self.clear_tombstone(local_idx, key_id);
+        self.newest_ms = self.newest_ms.max(now_ms);
         let (already_present, rank) = self.store_value(local_idx, key_id, value);
         let col = self
             .columns
@@ -305,6 +415,8 @@ impl Chunk {
     /// on the same `CellMeta` for a given write everywhere, not a new one
     /// per node that received it.
     pub fn set_with_meta(&mut self, local_idx: usize, key_id: u32, value: Value, meta: CellMeta) {
+        self.clear_tombstone(local_idx, key_id);
+        self.newest_ms = self.newest_ms.max(meta.modified_at_ms);
         let (already_present, rank) = self.store_value(local_idx, key_id, value);
         let col = self
             .columns
@@ -317,7 +429,9 @@ impl Chunk {
         }
     }
 
-    pub fn remove(&mut self, local_idx: usize, key_id: u32) {
+    /// Removes this cell/key's value (no tombstone -- see
+    /// `remove_with_tombstone`), returning whether there was one.
+    pub fn remove(&mut self, local_idx: usize, key_id: u32) -> bool {
         if let Some(col) = self.columns.get_mut(&key_id) {
             if col.presence.get(local_idx) {
                 let rank = col.presence.rank(local_idx);
@@ -337,8 +451,10 @@ impl Chunk {
                     }
                 }
                 col.meta.remove(rank);
+                return true;
             }
         }
+        false
     }
 
     /// Drops `key_id`'s entire column from this chunk -- every cell's
@@ -346,14 +462,17 @@ impl Chunk {
     /// was one to drop. Unlike `remove`, which clears a single cell, this
     /// is what `World::remove_column` uses to erase a key world-wide.
     pub fn remove_column(&mut self, key_id: u32) -> bool {
-        self.columns.remove(&key_id).is_some()
+        let had_tombstones = self.tombstones.remove(&key_id).is_some();
+        self.columns.remove(&key_id).is_some() || had_tombstones
     }
 
-    /// True if no cell in this chunk has any value set -- such chunks aren't
-    /// written to disk at all (see `World::flush_one`), which is how a mostly
-    /// empty 10,000^3 world avoids allocating 30 million chunk files.
+    /// True if no cell in this chunk has any value set and no tombstone is
+    /// recorded -- such chunks aren't written to disk at all (see
+    /// `World::flush_one`), which is how a mostly empty 10,000^3 world
+    /// avoids allocating 30 million chunk files. A chunk holding only
+    /// tombstones isn't empty: its file is what keeps them.
     pub fn is_empty(&self) -> bool {
-        self.columns.values().all(|c| c.presence.count() == 0)
+        self.columns.values().all(|c| c.presence.count() == 0) && self.tombstones.is_empty()
     }
 
     /// Every `(key_id, value, meta)` set anywhere in this chunk, grouped by
@@ -383,6 +502,7 @@ impl Chunk {
 
     // --- Binary format ---
     //
+    //   [4 bytes CHUNK_MAGIC][u8 format = CHUNK_FORMAT][u64 newest_ms]
     //   [u32 num_columns]
     //   repeated num_columns times, sorted by key_id:
     //     [u32 key_id]
@@ -395,11 +515,26 @@ impl Chunk {
     //         Str:     [u32 len][len bytes, utf-8]
     //         Bool:    1 byte (0 or 1)
     //
+    //   [u32 num_tombstone_keys]
+    //   repeated num_tombstone_keys times, sorted by key_id:
+    //     [u32 key_id][u32 count]
+    //     count times, ascending: [u32 local_idx][u64 removed_at_ms]
+    //
     // There is no per-cell overhead beyond 1 bit in the presence map plus
     // CellMeta's 24 bytes: a cell that doesn't use a key costs nothing but
     // that bit.
+    //
+    // Files written before tombstones existed have no header (they start
+    // straight at `num_columns`) and no tombstone section. `read_from`
+    // still reads them -- CHUNK_MAGIC read as a little-endian `num_columns`
+    // would be ~1.1 billion columns, which no real file has -- but this
+    // always writes the current format, so a chunk rewritten by this
+    // version can't be read by an older one.
 
     pub fn write_to<W: Write>(&self, w: &mut W) -> io::Result<()> {
+        w.write_all(&CHUNK_MAGIC)?;
+        w.write_all(&[CHUNK_FORMAT])?;
+        w.write_all(&self.newest_ms.to_le_bytes())?;
         w.write_all(&(self.columns.len() as u32).to_le_bytes())?;
 
         let mut ids: Vec<&u32> = self.columns.keys().collect();
@@ -445,7 +580,33 @@ impl Chunk {
                 }
             }
         }
+
+        let mut ids: Vec<&u32> = self.tombstones.keys().collect();
+        ids.sort();
+        w.write_all(&(ids.len() as u32).to_le_bytes())?;
+        for &key_id in ids {
+            let cells = &self.tombstones[&key_id];
+            w.write_all(&key_id.to_le_bytes())?;
+            w.write_all(&(cells.len() as u32).to_le_bytes())?;
+            for (&local_idx, &at) in cells {
+                w.write_all(&(local_idx as u32).to_le_bytes())?;
+                w.write_all(&at.to_le_bytes())?;
+            }
+        }
         Ok(())
+    }
+
+    /// Reads just a chunk file's `newest_ms` from its header, without
+    /// decoding the rest -- `None` for a file in the old, header-less
+    /// format (the caller then has to load it to find out).
+    pub fn read_newest_ms<R: Read>(r: &mut R) -> io::Result<Option<u64>> {
+        if read_arr4(r)? != CHUNK_MAGIC {
+            return Ok(None);
+        }
+        let mut format = [0u8; 1];
+        r.read_exact(&mut format)?;
+        check_format(format[0])?;
+        Ok(Some(u64::from_le_bytes(read_arr8(r)?)))
     }
 
     /// `cell_count` must be the owning world's `chunk_cells(axes, chunk_dim)`
@@ -454,7 +615,15 @@ impl Chunk {
     /// chunk file.
     pub fn read_from<R: Read>(r: &mut R, cell_count: usize) -> io::Result<Self> {
         let presence_bytes = cell_count.div_ceil(8);
-        let num_columns = read_u32(r)?;
+        let first = read_arr4(r)?;
+        let (header_newest_ms, num_columns) = if first == CHUNK_MAGIC {
+            let mut format = [0u8; 1];
+            r.read_exact(&mut format)?;
+            check_format(format[0])?;
+            (Some(u64::from_le_bytes(read_arr8(r)?)), read_u32(r)?)
+        } else {
+            (None, u32::from_le_bytes(first))
+        };
         let mut columns = HashMap::with_capacity(num_columns as usize);
 
         for _ in 0..num_columns {
@@ -528,16 +697,47 @@ impl Chunk {
             );
         }
 
+        let mut tombstones: HashMap<u32, BTreeMap<usize, u64>> = HashMap::new();
+        if header_newest_ms.is_some() {
+            for _ in 0..read_u32(r)? {
+                let key_id = read_u32(r)?;
+                let cells = tombstones.entry(key_id).or_default();
+                for _ in 0..read_u32(r)? {
+                    let local_idx = read_u32(r)? as usize;
+                    if local_idx >= cell_count {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("corrupt chunk: tombstone cell {local_idx} out of range"),
+                        ));
+                    }
+                    cells.insert(local_idx, u64::from_le_bytes(read_arr8(r)?));
+                }
+            }
+            tombstones.retain(|_, cells| !cells.is_empty());
+        }
+
+        // An old-format file has no header: derive `newest_ms` from what
+        // it holds (it can't hold tombstones).
+        let newest_ms = header_newest_ms.unwrap_or_else(|| {
+            columns
+                .values()
+                .flat_map(|c: &Column| c.meta.iter().map(|m| m.modified_at_ms))
+                .max()
+                .unwrap_or(0)
+        });
+
         Ok(Chunk {
             columns,
             presence_bytes,
+            tombstones,
+            newest_ms,
         })
     }
 
     /// Exact on-disk size in bytes, for reporting/benchmarking.
     #[cfg(test)]
     pub fn byte_len(&self) -> usize {
-        let mut n = 4;
+        let mut n = 4 + 1 + 8 + 4; // header, num_columns
         for col in self.columns.values() {
             n += 4 + 1 + self.presence_bytes;
             n += col.meta.len() * 24; // CellMeta: 3 u64 fields
@@ -548,7 +748,31 @@ impl Chunk {
                 ColumnData::Bool(v) => v.len(),
             };
         }
+        n += 4; // num_tombstone_keys
+        for cells in self.tombstones.values() {
+            n += 4 + 4 + cells.len() * (4 + 8);
+        }
         n
+    }
+}
+
+/// Starts every chunk file written since tombstones were added -- see the
+/// format comment on `Chunk::write_to`. The leading 0xFF keeps it from
+/// ever matching an old file's little-endian `num_columns`, and from
+/// matching the zstd frame magic (`world::ZSTD_MAGIC`).
+pub const CHUNK_MAGIC: [u8; 4] = [0xFF, b'K', b'B', b'C'];
+
+/// The chunk file format `write_to` writes.
+const CHUNK_FORMAT: u8 = 1;
+
+fn check_format(format: u8) -> io::Result<()> {
+    if format == CHUNK_FORMAT {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("chunk file format {format} is newer than this build supports"),
+        ))
     }
 }
 
@@ -1009,5 +1233,201 @@ mod tests {
         for idx in (0..CELLS).step_by(211) {
             assert_eq!(c2.get(idx, 5), Some(Value::I64(idx as i64)));
         }
+    }
+
+    fn round_trip(c: &Chunk) -> Chunk {
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        assert_eq!(buf.len(), c.byte_len());
+        Chunk::read_from(&mut &buf[..], CELLS).unwrap()
+    }
+
+    #[test]
+    fn remove_with_tombstone_only_records_one_where_a_value_existed() {
+        let mut c = Chunk::new(CELLS);
+        c.set(3, 1, Value::I64(7), 1000);
+        assert!(c.remove_with_tombstone(3, 1, 2000));
+        assert_eq!(c.get(3, 1), None);
+        assert_eq!(c.tombstone_at(3, 1), Some(2000));
+
+        assert!(!c.remove_with_tombstone(4, 1, 2000));
+        assert_eq!(c.tombstone_at(4, 1), None);
+    }
+
+    #[test]
+    fn setting_a_cell_clears_its_tombstone() {
+        let mut c = Chunk::new(CELLS);
+        c.put_tombstone(3, 1, 1000);
+        c.set(3, 1, Value::I64(7), 2000);
+        assert_eq!(c.tombstone_at(3, 1), None);
+
+        c.put_tombstone(5, 1, 1000);
+        let meta = CellMeta {
+            created_at_ms: 3000,
+            modified_at_ms: 3000,
+            version: 0,
+        };
+        c.set_with_meta(5, 1, Value::I64(8), meta);
+        assert_eq!(c.tombstone_at(5, 1), None);
+    }
+
+    #[test]
+    fn tombstones_are_invisible_to_reads() {
+        let mut c = Chunk::new(CELLS);
+        c.set(3, 1, Value::I64(7), 1000);
+        c.remove_with_tombstone(3, 1, 2000);
+        assert_eq!(c.get(3, 1), None);
+        assert_eq!(c.get_meta(3, 1), None);
+        assert!(c.entries_by_local_idx().is_empty());
+    }
+
+    #[test]
+    fn a_chunk_holding_only_tombstones_is_not_empty() {
+        let mut c = Chunk::new(CELLS);
+        c.set(3, 1, Value::I64(7), 1000);
+        c.remove_with_tombstone(3, 1, 2000);
+        assert!(!c.is_empty());
+        c.purge_tombstones_older_than(u64::MAX);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn purge_drops_only_tombstones_older_than_the_cutoff() {
+        let mut c = Chunk::new(CELLS);
+        c.put_tombstone(1, 1, 1000);
+        c.put_tombstone(2, 1, 3000);
+        c.put_tombstone(3, 2, 500);
+        assert!(c.purge_tombstones_older_than(2000));
+        assert_eq!(c.tombstone_at(1, 1), None);
+        assert_eq!(c.tombstone_at(2, 1), Some(3000));
+        assert_eq!(c.tombstone_at(3, 2), None);
+        assert!(!c.purge_tombstones_older_than(2000));
+    }
+
+    #[test]
+    fn remove_column_drops_its_tombstones_too() {
+        let mut c = Chunk::new(CELLS);
+        c.put_tombstone(1, 9, 1000);
+        assert!(c.remove_column(9));
+        assert_eq!(c.tombstone_at(1, 9), None);
+        assert!(c.is_empty());
+    }
+
+    #[test]
+    fn newest_ms_tracks_sets_and_tombstones_and_never_decreases() {
+        let mut c = Chunk::new(CELLS);
+        assert_eq!(c.newest_ms(), 0);
+        c.set(1, 1, Value::I64(1), 1000);
+        assert_eq!(c.newest_ms(), 1000);
+        c.remove_with_tombstone(1, 1, 2000);
+        assert_eq!(c.newest_ms(), 2000);
+        c.set(2, 1, Value::I64(1), 1500);
+        assert_eq!(c.newest_ms(), 2000);
+        c.purge_tombstones_older_than(u64::MAX);
+        assert_eq!(c.newest_ms(), 2000);
+    }
+
+    #[test]
+    fn tombstones_and_newest_ms_round_trip_through_write_to_and_read_from() {
+        let mut c = Chunk::new(CELLS);
+        c.set(1, 1, Value::Str("a".into()), 1000);
+        c.set(2, 1, Value::Str("b".into()), 1000);
+        c.remove_with_tombstone(2, 1, 4000);
+        c.put_tombstone(CELLS - 1, 7, 3000);
+
+        let back = round_trip(&c);
+        assert_eq!(back.get(1, 1), Some(Value::Str("a".into())));
+        assert_eq!(back.get(2, 1), None);
+        assert_eq!(back.tombstone_at(2, 1), Some(4000));
+        assert_eq!(back.tombstone_at(CELLS - 1, 7), Some(3000));
+        assert_eq!(back.newest_ms(), 4000);
+    }
+
+    #[test]
+    fn read_newest_ms_reads_just_the_header() {
+        let mut c = Chunk::new(CELLS);
+        c.set(1, 1, Value::I64(1), 1234);
+        let mut buf = Vec::new();
+        c.write_to(&mut buf).unwrap();
+        // Only the header is needed: the rest can be missing.
+        assert_eq!(Chunk::read_newest_ms(&mut &buf[..13]).unwrap(), Some(1234));
+    }
+
+    /// The format before tombstones: no header, starts at `num_columns`,
+    /// no tombstone section.
+    fn old_format_bytes() -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&1u32.to_le_bytes()); // num_columns
+        buf.extend_from_slice(&5u32.to_le_bytes()); // key_id
+        buf.push(Value::TAG_I64);
+        let mut bits = vec![0u8; CELLS.div_ceil(8)];
+        bits[0] = 0b0000_0100; // cell 2
+        buf.extend_from_slice(&bits);
+        for x in [100u64, 900, 3] {
+            buf.extend_from_slice(&x.to_le_bytes()); // created, modified, version
+        }
+        buf.extend_from_slice(&42i64.to_le_bytes());
+        buf
+    }
+
+    #[test]
+    fn an_old_format_file_still_loads_with_newest_ms_derived_from_its_meta() {
+        let buf = old_format_bytes();
+        let c = Chunk::read_from(&mut &buf[..], CELLS).unwrap();
+        assert_eq!(c.get(2, 5), Some(Value::I64(42)));
+        assert_eq!(
+            c.get_meta(2, 5),
+            Some(CellMeta {
+                created_at_ms: 100,
+                modified_at_ms: 900,
+                version: 3,
+            })
+        );
+        assert_eq!(c.newest_ms(), 900);
+        assert_eq!(Chunk::read_newest_ms(&mut &buf[..]).unwrap(), None);
+        // Rewritten, it's in the current format.
+        assert_eq!(round_trip(&c).get(2, 5), Some(Value::I64(42)));
+    }
+
+    #[test]
+    fn a_newer_format_byte_is_rejected() {
+        let mut buf = Vec::new();
+        Chunk::new(CELLS).write_to(&mut buf).unwrap();
+        buf[4] = CHUNK_FORMAT + 1;
+        assert!(Chunk::read_from(&mut &buf[..], CELLS).is_err());
+        assert!(Chunk::read_newest_ms(&mut &buf[..]).is_err());
+    }
+
+    #[test]
+    fn changes_since_reports_newer_sets_and_tombstones_only() {
+        let mut c = Chunk::new(CELLS);
+        c.set(1, 1, Value::I64(1), 1000);
+        c.set(2, 1, Value::I64(2), 3000);
+        c.set(3, 1, Value::I64(3), 1000);
+        c.remove_with_tombstone(3, 1, 4000);
+        c.put_tombstone(4, 2, 500);
+
+        let mut changes = c.changes_since(2000);
+        changes.sort_by_key(|(idx, key, _)| (*idx, *key));
+        assert_eq!(
+            changes,
+            vec![
+                (
+                    2,
+                    1,
+                    ChangeKind::Set(
+                        Value::I64(2),
+                        CellMeta {
+                            created_at_ms: 3000,
+                            modified_at_ms: 3000,
+                            version: 0,
+                        }
+                    )
+                ),
+                (3, 1, ChangeKind::Removed(4000)),
+            ]
+        );
+        assert!(c.changes_since(4000).is_empty());
+        assert_eq!(c.changes_since(0).len(), 4);
     }
 }

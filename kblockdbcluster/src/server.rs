@@ -37,6 +37,19 @@ pub trait ReplicationSink: Clone + Send + Sync + 'static {
         key: String,
         modified_at_ms: u64,
     ) -> impl Future<Output = Result<(), String>> + Send;
+
+    /// Applies a whole `ChangeBatch`, in order. The default calls
+    /// `apply_set`/`apply_remove` once per entry, logging any failure; an
+    /// embedder that can apply many changes more cheaply together (one
+    /// write per storage chunk, say -- a catch-up is thousands of
+    /// entries) overrides this, and then logs its own failures.
+    fn apply_batch(&self, entries: Vec<ChangeEntry>) -> impl Future<Output = ()> + Send {
+        async move {
+            for entry in entries {
+                apply_entry(self, entry).await;
+            }
+        }
+    }
 }
 
 /// Accepts connections forever, spawning one task per connection -- same
@@ -71,9 +84,10 @@ pub async fn serve<S: ReplicationSink>(listener: TcpListener, sink: S, peers: Pe
 }
 
 /// One peer's connection: `Hello` (checked against `cluster_secret`),
-/// then an unbounded stream of `ChangeBatch` frames applied as they
-/// arrive -- no responses are ever sent back for those (see `wire.rs`'s
-/// doc comment on why this protocol is push-only).
+/// a `CatchUpRequest` from this process's watermark for that peer (see
+/// `peers.rs`'s "Catch-up"), then an unbounded stream of `ChangeBatch`
+/// frames applied as they arrive -- no responses are ever sent back for
+/// those -- with the occasional `Synced` advancing the watermark.
 async fn handle_connection<S: ReplicationSink>(
     mut stream: TcpStream,
     sink: S,
@@ -156,6 +170,21 @@ async fn handle_connection<S: ReplicationSink>(
         eprintln!("peer protocol: learned new peer {dial_back}");
     }
 
+    // Ask for everything missed since we last heard it was synced. An
+    // older peer wouldn't understand the request (and would never confirm
+    // it), so it just gets live changes, as before.
+    if protocol_version >= crate::wire::CATCH_UP_PROTOCOL_VERSION {
+        let since_ms = peers.catch_up_since(&dial_back);
+        eprintln!("peer protocol: asking {dial_back} for changes since {since_ms}");
+        let request = PeerMessage::CatchUpRequest { since_ms };
+        if crate::wire::write_message(&mut stream, &request)
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
     loop {
         let msg = match crate::wire::read_message(&mut stream).await {
             Ok(Some(msg)) => msg,
@@ -163,11 +192,7 @@ async fn handle_connection<S: ReplicationSink>(
             Err(_) => return,
         };
         match msg {
-            PeerMessage::ChangeBatch(entries) => {
-                for entry in entries {
-                    apply_entry(&sink, entry).await;
-                }
-            }
+            PeerMessage::ChangeBatch(entries) => sink.apply_batch(entries).await,
             // Gossip: learn any peer the sender is connected to that we
             // don't know yet -- `add` spawns our link to it.
             PeerMessage::PeerList(addresses) => {
@@ -177,7 +202,8 @@ async fn handle_connection<S: ReplicationSink>(
                     }
                 }
             }
-            // Only Hello/ChangeBatch/PeerList ever travel this direction --
+            PeerMessage::Synced { through_ms } => peers.record_synced(&dial_back, through_ms),
+            // Only Hello/ChangeBatch/PeerList/Synced travel this direction --
             // anything else is a protocol error, but per this module's "one
             // bad frame doesn't end the connection" policy, just skip it
             // rather than disconnecting.
@@ -223,8 +249,11 @@ async fn apply_entry<S: ReplicationSink>(sink: &S, entry: ChangeEntry) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{spawn_node, wait_until, TestNode, CLUSTER_SECRET};
+    use crate::test_support::{
+        spawn_node, spawn_node_with, wait_until, RecordingSink, TestNode, CLUSTER_SECRET,
+    };
     use kblockdblib::Value;
+    use std::time::Duration;
     use tokio::net::TcpStream as ClientStream;
 
     const DB: &str = "db";
@@ -238,6 +267,14 @@ mod tests {
     const TEST_CLIENT_NODE_ID: u64 = 42;
 
     async fn hello(stream: &mut ClientStream, secret: &str) -> PeerMessage {
+        hello_as_version(stream, secret, crate::wire::PEER_PROTOCOL_VERSION).await
+    }
+
+    async fn hello_as_version(
+        stream: &mut ClientStream,
+        secret: &str,
+        protocol_version: u8,
+    ) -> PeerMessage {
         crate::wire::write_message(
             stream,
             &PeerMessage::Hello {
@@ -245,12 +282,168 @@ mod tests {
                 server_id: "test-peer".to_string(),
                 peer_port: UNREACHABLE_PEER_PORT,
                 node_id: TEST_CLIENT_NODE_ID,
-                protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
+                protocol_version,
             },
         )
         .await
         .unwrap();
         crate::wire::read_message(stream).await.unwrap().unwrap()
+    }
+
+    /// The address a raw test client is known by on the server: its
+    /// source IP plus the `peer_port` it claimed.
+    fn raw_client_address() -> String {
+        format!("127.0.0.1:{UNREACHABLE_PEER_PORT}")
+    }
+
+    /// Connects a raw client, says `Hello`, and returns the stream plus
+    /// the `CatchUpRequest` the server sends right after `HelloOk`.
+    async fn connect_and_read_catch_up_request(addr: std::net::SocketAddr) -> (ClientStream, u64) {
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        assert!(matches!(
+            hello(&mut stream, CLUSTER_SECRET).await,
+            PeerMessage::HelloOk { .. }
+        ));
+        match crate::wire::read_message(&mut stream).await.unwrap() {
+            Some(PeerMessage::CatchUpRequest { since_ms }) => (stream, since_ms),
+            other => panic!("expected CatchUpRequest, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_no_watermark_the_receiver_asks_for_everything() {
+        let TestNode { addr, .. } = spawn_node("node-b").await;
+        let (_stream, since_ms) = connect_and_read_catch_up_request(addr).await;
+        assert_eq!(since_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn the_receiver_asks_from_its_watermark_minus_the_margin() {
+        let TestNode { addr, .. } = spawn_node_with("node-b", RecordingSink::new(), |peers| {
+            peers.record_synced(&raw_client_address(), 50_000);
+            peers.with_catch_up_margin(Duration::from_secs(1))
+        })
+        .await;
+        let (_stream, since_ms) = connect_and_read_catch_up_request(addr).await;
+        assert_eq!(since_ms, 49_000);
+    }
+
+    #[tokio::test]
+    async fn synced_advances_the_watermark_but_a_dropped_catch_up_does_not() {
+        let TestNode { addr, peers, .. } = spawn_node_with("node-b", RecordingSink::new(), |p| {
+            p.with_catch_up_margin(Duration::ZERO)
+        })
+        .await;
+        let (mut stream, since_ms) = connect_and_read_catch_up_request(addr).await;
+        assert_eq!(since_ms, 0);
+        crate::wire::write_message(&mut stream, &PeerMessage::Synced { through_ms: 7_000 })
+            .await
+            .unwrap();
+        wait_until(|| peers.watermark(&raw_client_address()) == 7_000).await;
+        drop(stream);
+
+        // Asked again from 7000; drops before confirming anything ...
+        let (stream, since_ms) = connect_and_read_catch_up_request(addr).await;
+        assert_eq!(since_ms, 7_000);
+        drop(stream);
+
+        // ... so the next request still starts from 7000.
+        let (_stream, since_ms) = connect_and_read_catch_up_request(addr).await;
+        assert_eq!(since_ms, 7_000);
+    }
+
+    #[tokio::test]
+    async fn an_older_peer_gets_no_catch_up_request_but_is_still_applied() {
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        assert!(matches!(
+            hello_as_version(&mut stream, CLUSTER_SECRET, 2).await,
+            PeerMessage::HelloOk { .. }
+        ));
+        let next = tokio::time::timeout(
+            Duration::from_millis(300),
+            crate::wire::read_message(&mut stream),
+        )
+        .await;
+        assert!(
+            next.is_err(),
+            "expected nothing after HelloOk, got {next:?}"
+        );
+
+        let entry = ChangeEntry {
+            database: DB.to_string(),
+            coord: vec![1, 2, 3],
+            key: "material".to_string(),
+            op: ChangeOp::Set(Value::Str("stone".to_string())),
+            created_at_ms: 10,
+            modified_at_ms: 10,
+            version: 0,
+        };
+        crate::wire::write_message(&mut stream, &PeerMessage::ChangeBatch(vec![entry]))
+            .await
+            .unwrap();
+        wait_until(|| sink.get(DB, &[1, 2, 3], "material").is_some()).await;
+    }
+
+    #[tokio::test]
+    async fn a_new_node_gets_a_full_copy_and_a_restarted_one_only_what_it_missed() {
+        let watermarks = std::env::temp_dir().join(format!(
+            "kblockdbcluster-catch-up-{}/watermarks",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&watermarks);
+        let with_watermarks = |path: std::path::PathBuf| {
+            move |peers: PeerSet| {
+                peers
+                    .with_watermarks(&path)
+                    .unwrap()
+                    .with_catch_up_margin(Duration::ZERO)
+            }
+        };
+
+        // A holds data from before B ever existed.
+        let a_data = RecordingSink::new();
+        a_data.seed(DB, &[0, 0, 1], "material", Value::Str("one".into()), 1_000);
+        let a = spawn_node_with("node-a", a_data.clone(), |p| p).await;
+        let a_address = a.addr.to_string();
+
+        // B is new: it gets everything.
+        let b = spawn_node_with(
+            "node-b",
+            RecordingSink::new(),
+            with_watermarks(watermarks.clone()),
+        )
+        .await;
+        a.peers.add(b.addr.to_string());
+        wait_until(|| b.sink.get(DB, &[0, 0, 1], "material").is_some()).await;
+        wait_until(|| b.peers.watermark(&a_address) > 0).await;
+        let synced_through = b.peers.watermark(&a_address);
+
+        // While "B is down", A changes: an older write B already had (so
+        // it's before the watermark), a new write, and a delete.
+        a_data.seed(DB, &[0, 0, 0], "material", Value::Str("old".into()), 500);
+        a_data.seed(
+            DB,
+            &[0, 0, 2],
+            "material",
+            Value::Str("two".into()),
+            synced_through + 10,
+        );
+        a_data.seed_removed(DB, &[0, 0, 1], "material", synced_through + 20);
+
+        // B restarts with its data and its saved watermark.
+        let b_data = RecordingSink::new();
+        b_data.seed(DB, &[0, 0, 1], "material", Value::Str("one".into()), 1_000);
+        let b2 = spawn_node_with("node-b", b_data, with_watermarks(watermarks.clone())).await;
+        assert_eq!(b2.peers.watermark(&a_address), synced_through);
+        a.peers.add(b2.addr.to_string());
+        wait_until(|| {
+            b2.sink.get(DB, &[0, 0, 2], "material").is_some()
+                && b2.sink.is_removed(DB, &[0, 0, 1], "material")
+        })
+        .await;
+        assert_eq!(b2.sink.get(DB, &[0, 0, 0], "material"), None);
+        let _ = std::fs::remove_dir_all(watermarks.parent().unwrap());
     }
 
     #[tokio::test]

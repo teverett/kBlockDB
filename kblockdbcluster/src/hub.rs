@@ -10,11 +10,10 @@
 //! successful local write; every `client.rs` task subscribes its own
 //! [`tokio::sync::broadcast::Receiver`] and forwards what it receives to
 //! its one peer. Deliberately *not* a queue with per-consumer
-//! backpressure: a peer that's behind or disconnected just misses entries
-//! until it reconnects (see `client.rs`'s doc comment on `Lagged`) --
-//! acceptable for this feature's "live-forward only, no durability
-//! guarantee" v1 scope (see `docs/clustering.md`'s "Limitations"
-//! section).
+//! backpressure: a peer that's behind misses entries from here (see
+//! `client.rs`'s handling of `Lagged`) and one that's disconnected misses
+//! everything -- both get them back from storage instead, through
+//! catch-up (see `peers.rs`).
 
 use crate::wire::{ChangeEntry, ChangeOp};
 use kblockdblib::{CellMeta, Value};
@@ -35,7 +34,13 @@ pub struct ReplicationHub {
 
 impl ReplicationHub {
     pub fn new() -> Arc<Self> {
-        let (sender, _) = broadcast::channel(CHANGE_LOG_CAPACITY);
+        Self::with_capacity(CHANGE_LOG_CAPACITY)
+    }
+
+    /// A hub buffering only `capacity` entries -- for tests that need a
+    /// link to fall behind (`RecvError::Lagged`) quickly.
+    pub(crate) fn with_capacity(capacity: usize) -> Arc<Self> {
+        let (sender, _) = broadcast::channel(capacity);
         Arc::new(ReplicationHub { sender })
     }
 

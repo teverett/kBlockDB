@@ -1,6 +1,7 @@
 //! Wires `AppState` into `kblockdbcluster`'s generic peer protocol:
 //! implements `ReplicationSink` so `kblockdbcluster::server::serve` can
-//! apply an incoming change against this server's actual `World`s,
+//! apply an incoming change against this server's actual `World`s, and
+//! `ChangeSource` so a peer's catch-up can be read back out of them,
 //! without `kblockdbcluster` itself knowing anything about `AppState`/
 //! `ApiError`/auto-create-on-unseen-database semantics -- those live here,
 //! the one place that's specific to how *this* server manages databases.
@@ -11,7 +12,9 @@
 use crate::error::ApiError;
 use crate::state::AppState;
 use kblockdbcluster::server::ReplicationSink;
-use kblockdblib::{CellMeta, Value};
+use kblockdbcluster::source::ChangeSource;
+use kblockdbcluster::wire::{ChangeEntry, ChangeOp};
+use kblockdblib::{CellMeta, Change, ChangeKind, Value};
 
 impl ReplicationSink for AppState {
     async fn apply_set(
@@ -72,6 +75,128 @@ impl ReplicationSink for AppState {
             Err(e) => Err(format!("{e:?}")),
         }
     }
+
+    /// One `World::apply_changes` per database in the batch -- one write
+    /// per chunk touched, rather than one per entry. Same auto-create rule
+    /// as `apply_set`: an unseen database is created if the batch sets
+    /// anything in it, and skipped if it only removes.
+    async fn apply_batch(&self, entries: Vec<ChangeEntry>) {
+        let mut by_database: Vec<(String, Vec<Change>)> = Vec::new();
+        for entry in entries {
+            let change = change_from_entry(&entry);
+            match by_database.iter_mut().find(|(db, _)| *db == entry.database) {
+                Some((_, changes)) => changes.push(change),
+                None => by_database.push((entry.database, vec![change])),
+            }
+        }
+        for (database, changes) in by_database {
+            let sets_anything = changes
+                .iter()
+                .any(|c| matches!(c.kind, ChangeKind::Set(..)));
+            if sets_anything {
+                match self.create_database(&database, None).await {
+                    Ok(()) | Err(ApiError::Conflict(_)) => {}
+                    Err(e) => {
+                        eprintln!("peer protocol: couldn't create database '{database}': {e:?}");
+                        continue;
+                    }
+                }
+            }
+            let coords: Vec<Vec<i32>> = changes.iter().map(|c| c.coord.to_vec()).collect();
+            match self
+                .with_database(&database, move |w| Ok(w.apply_changes(changes)))
+                .await
+            {
+                Ok(results) => {
+                    for (coord, result) in coords.iter().zip(results) {
+                        if let Err(e) = result {
+                            eprintln!(
+                                "peer protocol: dropping entry for '{database}' at {coord:?}: {e}"
+                            );
+                        }
+                    }
+                }
+                Err(ApiError::NotFound(_)) => {}
+                Err(e) => eprintln!("peer protocol: dropping batch for '{database}': {e:?}"),
+            }
+        }
+    }
+}
+
+fn change_from_entry(entry: &ChangeEntry) -> Change {
+    Change {
+        coord: kblockdblib::Coord::from(entry.coord.clone()),
+        key: entry.key.clone(),
+        kind: match &entry.op {
+            ChangeOp::Set(value) => ChangeKind::Set(
+                value.clone(),
+                CellMeta {
+                    created_at_ms: entry.created_at_ms,
+                    modified_at_ms: entry.modified_at_ms,
+                    version: entry.version,
+                },
+            ),
+            ChangeOp::Remove => ChangeKind::Removed(entry.modified_at_ms),
+        },
+    }
+}
+
+/// Every database's changes since a time, read straight from each `World`
+/// (this runs on a blocking thread -- see `ChangeSource`). A database
+/// removed mid-scan is skipped.
+impl ChangeSource for AppState {
+    fn changes_since(
+        &self,
+        since_ms: u64,
+        emit: &mut dyn FnMut(Vec<ChangeEntry>) -> bool,
+    ) -> Result<(), String> {
+        let names = self.databases.list().map_err(|e| e.to_string())?;
+        for database in names {
+            let world = match self.databases.get(&database) {
+                Ok(world) => world,
+                Err(ApiError::NotFound(_)) => continue,
+                Err(e) => return Err(format!("{e:?}")),
+            };
+            let mut more = true;
+            world
+                .changes_since(since_ms, |batch| {
+                    let entries = batch
+                        .into_iter()
+                        .map(|change| change_entry(&database, change))
+                        .collect();
+                    more = emit(entries);
+                    more
+                })
+                .map_err(|e| format!("database '{database}': {e}"))?;
+            if !more {
+                break;
+            }
+        }
+        Ok(())
+    }
+}
+
+fn change_entry(database: &str, change: Change) -> ChangeEntry {
+    let (op, meta) = match change.kind {
+        ChangeKind::Set(value, meta) => (ChangeOp::Set(value), meta),
+        ChangeKind::Removed(at_ms) => (
+            ChangeOp::Remove,
+            CellMeta {
+                created_at_ms: 0,
+                modified_at_ms: at_ms,
+                version: 0,
+            },
+        ),
+    };
+    ChangeEntry {
+        database: database.to_string(),
+        coord: change.coord.to_vec(),
+        key: change.key,
+        op,
+        created_at_ms: meta.created_at_ms,
+        modified_at_ms: meta.modified_at_ms,
+        version: meta.version,
+    }
 }
 
 #[cfg(test)]
@@ -80,6 +205,148 @@ mod tests {
     use crate::state::{Account, Databases, WorldShape};
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    fn meta_at(ms: u64) -> CellMeta {
+        CellMeta {
+            created_at_ms: ms,
+            modified_at_ms: ms,
+            version: 0,
+        }
+    }
+
+    fn all_changes_since(state: &AppState, since_ms: u64) -> Vec<ChangeEntry> {
+        let mut out = Vec::new();
+        state
+            .changes_since(since_ms, &mut |batch| {
+                out.extend(batch);
+                true
+            })
+            .unwrap();
+        out.sort_by(|a, b| (&a.database, &a.coord).cmp(&(&b.database, &b.coord)));
+        out
+    }
+
+    #[test]
+    fn the_change_source_reports_every_databases_sets_and_removes() {
+        let dir = temp_dir("change-source");
+        let shape = WorldShape {
+            axes: 3,
+            world_dim: 100,
+            chunk_dim: 32,
+        };
+        let databases =
+            Databases::new(&dir.0, shape).with_tombstone_retention(Some(std::time::Duration::MAX));
+        let state = AppState::new(databases, Arc::new(HashMap::new()));
+        state.databases.create(DB, None).unwrap();
+        state.databases.create("other", None).unwrap();
+        let db = state.databases.get(DB).unwrap();
+        let other = state.databases.get("other").unwrap();
+        db.apply_replicated(&[1, 1, 1], "k", Value::I64(1), meta_at(100))
+            .unwrap();
+        db.apply_replicated(&[2, 2, 2], "k", Value::I64(2), meta_at(300))
+            .unwrap();
+        db.apply_replicated_remove(&[1, 1, 1], "k", 400).unwrap();
+        other
+            .apply_replicated(&[3, 3, 3], "k", Value::I64(3), meta_at(500))
+            .unwrap();
+
+        let changes = all_changes_since(&state, 200);
+        assert_eq!(changes.len(), 3);
+        assert_eq!(
+            (
+                changes[0].database.as_str(),
+                &changes[0].coord,
+                &changes[0].op
+            ),
+            (DB, &vec![1, 1, 1], &ChangeOp::Remove)
+        );
+        assert_eq!(changes[0].modified_at_ms, 400);
+        assert_eq!(
+            (
+                changes[1].database.as_str(),
+                &changes[1].coord,
+                &changes[1].op
+            ),
+            (DB, &vec![2, 2, 2], &ChangeOp::Set(Value::I64(2)))
+        );
+        assert_eq!(changes[1].modified_at_ms, 300);
+        assert_eq!(changes[2].database, "other");
+
+        let changes = all_changes_since(&state, 450);
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].database, "other");
+    }
+
+    fn entry(database: &str, coord: Vec<i32>, op: ChangeOp, ms: u64) -> ChangeEntry {
+        ChangeEntry {
+            database: database.to_string(),
+            coord,
+            key: "k".to_string(),
+            op,
+            created_at_ms: ms,
+            modified_at_ms: ms,
+            version: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_batch_applies_every_database_and_auto_creates_on_a_set() {
+        let dir = temp_dir("apply-batch");
+        let state = test_state(&dir.0);
+        let written_before = state.databases.get(DB).unwrap().chunks_written_to_disk();
+        state
+            .apply_batch(vec![
+                entry(DB, vec![1, 1, 1], ChangeOp::Set(Value::I64(1)), 100),
+                entry(DB, vec![2, 2, 2], ChangeOp::Set(Value::I64(2)), 100),
+                entry(DB, vec![1, 1, 1], ChangeOp::Remove, 200),
+                entry(DB, vec![1, 2], ChangeOp::Set(Value::I64(3)), 100), // bad: logged
+                entry("fresh", vec![0, 0, 0], ChangeOp::Set(Value::I64(4)), 100),
+                entry("removes-only", vec![0, 0, 0], ChangeOp::Remove, 100),
+            ])
+            .await;
+
+        let db = state.databases.get(DB).unwrap();
+        // Three good changes, all in one chunk: one write.
+        assert_eq!(db.chunks_written_to_disk() - written_before, 1);
+        assert_eq!(db.get(&[1, 1, 1], "k").unwrap(), None);
+        assert_eq!(db.get(&[2, 2, 2], "k").unwrap(), Some(Value::I64(2)));
+        assert_eq!(
+            state
+                .databases
+                .get("fresh")
+                .unwrap()
+                .get(&[0, 0, 0], "k")
+                .unwrap(),
+            Some(Value::I64(4))
+        );
+        assert!(matches!(
+            state.databases.get("removes-only"),
+            Err(ApiError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn the_change_source_stops_when_emit_returns_false() {
+        let dir = temp_dir("change-source-stop");
+        let state = test_state(&dir.0);
+        state.databases.create("other", None).unwrap();
+        for name in [DB, "other"] {
+            state
+                .databases
+                .get(name)
+                .unwrap()
+                .set(&[0, 0, 0], "k", Value::I64(1))
+                .unwrap();
+        }
+        let mut batches = 0;
+        state
+            .changes_since(0, &mut |_| {
+                batches += 1;
+                false
+            })
+            .unwrap();
+        assert_eq!(batches, 1);
+    }
 
     const DB: &str = "db";
 

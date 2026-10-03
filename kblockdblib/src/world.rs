@@ -1,4 +1,4 @@
-use crate::chunk::{self, CellMeta, Chunk};
+use crate::chunk::{self, CellMeta, ChangeKind, Chunk};
 use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
 use crate::params::WorldParams;
@@ -11,7 +11,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// Default number of spatial axes for a *new* world, i.e. what `main`'s demo
 /// calls `World::create` with. This is only a default: a world's real axis
@@ -332,6 +332,26 @@ pub struct CellEntry {
     pub values: Vec<(String, Value, CellMeta)>,
 }
 
+/// One cell/key changed after a given time, as reported by
+/// `World::changes_since`: its current value and metadata, or when it was
+/// removed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Change {
+    pub coord: Coord,
+    pub key: String,
+    pub kind: ChangeKind,
+}
+
+/// What `World::remove_region` actually removed: the time recorded for
+/// the removal (also every tombstone's time, when tombstones are kept),
+/// and the coordinates that held a value for the key -- cells that were
+/// already empty aren't listed.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct RemovedCells {
+    pub at_ms: u64,
+    pub coords: Vec<Coord>,
+}
+
 pub struct World {
     root: PathBuf,
     axes: usize,
@@ -369,6 +389,9 @@ pub struct World {
     /// from its own first bytes, so flipping this flag never strands data
     /// written under the other setting.
     compression: bool,
+    /// Whether removals leave a tombstone, and for how long -- see
+    /// `with_tombstone_retention`.
+    tombstone_retention: Option<Duration>,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -469,6 +492,7 @@ impl World {
             disk_io: Semaphore::new(DEFAULT_MAX_CONCURRENT_DISK_OPS),
             chunk_cache: ChunkCache::new(DEFAULT_MAX_CACHED_CHUNKS),
             compression: false,
+            tombstone_retention: None,
         })
     }
 
@@ -538,6 +562,26 @@ impl World {
     pub fn with_compression(mut self, compression: bool) -> Self {
         self.compression = compression;
         self
+    }
+
+    /// Makes every removal leave a tombstone -- when the value was
+    /// removed -- kept for `retention` and purged the next time its chunk
+    /// is written after that. `None` (the default) keeps none: a remove
+    /// just erases, as it always has.
+    ///
+    /// Tombstones exist for replication: they're what lets
+    /// `apply_replicated` refuse a late-arriving, older write to a key
+    /// that's since been deleted, and what lets `changes_since` report
+    /// deletes. They're never visible to `get`/`get_region`/`list_cells`.
+    /// Only a cell that actually held a value gets one.
+    pub fn with_tombstone_retention(mut self, retention: Option<Duration>) -> Self {
+        self.tombstone_retention = retention;
+        self
+    }
+
+    /// See `with_tombstone_retention`.
+    pub fn tombstone_retention(&self) -> Option<Duration> {
+        self.tombstone_retention
     }
 
     /// Whether this world zstd-compresses the chunk files it writes -- see
@@ -745,8 +789,11 @@ impl World {
 
         let mut cells = Vec::new();
         for ckey in &chunk_keys {
-            let chunk = self.load_chunk(ckey)?;
-            for (local_idx, entries) in chunk.entries_by_local_idx() {
+            // Through the cache, under the chunk's lock, not straight off
+            // disk: chunk files are rewritten in place, so reading one
+            // while a write to it is in flight could see half a file.
+            let entries_by_cell = self.with_chunk_read(ckey, Chunk::entries_by_local_idx)?;
+            for (local_idx, entries) in entries_by_cell {
                 let coord = self.unsplit(ckey, local_idx);
                 let mut values: Vec<(String, Value, CellMeta)> = entries
                     .into_iter()
@@ -768,6 +815,81 @@ impl World {
         }
         cells.sort_by(|a, b| a.coord.iter().cmp(b.coord.iter()));
         Ok(cells)
+    }
+
+    /// Every cell/key whose value was set, or which was removed (see
+    /// `with_tombstone_retention`), strictly after `since_ms`, handed to
+    /// `emit` one chunk's worth at a time. `emit` returning `false` stops
+    /// the walk early. This is what a replication peer's catch-up is
+    /// built from.
+    ///
+    /// Cheaper than `list_cells` for a recent `since_ms`: each chunk
+    /// file's header records the newest change in it, so a chunk with
+    /// nothing newer is skipped after reading a few bytes, without being
+    /// decoded. A chunk that does need reading goes through the cache
+    /// (like `get`), so it never sees a file mid-write. Old-format files
+    /// (no header) are always read.
+    pub fn changes_since(
+        &self,
+        since_ms: u64,
+        mut emit: impl FnMut(Vec<Change>) -> bool,
+    ) -> io::Result<()> {
+        let mut chunk_keys = Vec::new();
+        collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
+        for ckey in &chunk_keys {
+            // Any error peeking (a file being rewritten, or deleted, right
+            // now) just means "can't tell" -- fall through to a real read.
+            if let Ok(Some(newest)) = self.peek_newest_ms(ckey) {
+                if newest <= since_ms {
+                    continue;
+                }
+            }
+            let changes = self.with_chunk_read(ckey, |chunk| chunk.changes_since(since_ms))?;
+            if changes.is_empty() {
+                continue;
+            }
+            let batch: Vec<Change> = {
+                let schema = self.schema();
+                changes
+                    .into_iter()
+                    // A removed column's leftovers aren't reported -- see
+                    // `list_cells`.
+                    .filter_map(|(local_idx, key_id, kind)| {
+                        Some(Change {
+                            coord: self.unsplit(ckey, local_idx),
+                            key: schema.key_for_id(key_id)?.to_string(),
+                            kind,
+                        })
+                    })
+                    .collect()
+            };
+            if !batch.is_empty() && !emit(batch) {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Chunk `ckey`'s `newest_ms` from its file header alone (see
+    /// `Chunk::read_newest_ms`): `Some(0)` if there's no file, `None` for
+    /// an old-format file.
+    fn peek_newest_ms(&self, ckey: &ChunkKey) -> io::Result<Option<u64>> {
+        let _permit = self.disk_io.acquire();
+        let f = match File::open(self.chunk_path(ckey)) {
+            Ok(f) => f,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(0)),
+            Err(e) => return Err(e),
+        };
+        let mut r = BufReader::new(f);
+        let mut head = [0u8; ZSTD_MAGIC.len()];
+        let head_len = read_up_to(&mut r, &mut head)?;
+        let compressed = head[..head_len] == ZSTD_MAGIC;
+        let mut r = io::Cursor::new(&head[..head_len]).chain(r);
+        if compressed {
+            Chunk::read_newest_ms(&mut zstd::stream::read::Decoder::new(r)?)
+        } else {
+            Chunk::read_newest_ms(&mut r)
+        }
     }
 
     fn chunk_path(&self, ckey: &ChunkKey) -> PathBuf {
@@ -909,6 +1031,11 @@ impl World {
         if !changed {
             return Ok(result);
         }
+        if let Some(retention) = self.tombstone_retention {
+            let retention_ms = u64::try_from(retention.as_millis()).unwrap_or(u64::MAX);
+            let cutoff = now_ms().saturating_sub(retention_ms);
+            chunk.purge_tombstones_older_than(cutoff);
+        }
 
         let chunk_path = self.chunk_path(ckey);
         if chunk.is_empty() {
@@ -1048,8 +1175,9 @@ impl World {
     /// peer that originated it -- with last-write-wins conflict
     /// resolution: if this cell/key already holds a value whose
     /// `modified_at_ms` is greater than or equal to `meta.modified_at_ms`,
-    /// the incoming write is simply discarded (a tie keeps whatever is
-    /// already here -- an accepted, documented imprecision of
+    /// or a tombstone at least that recent (it was deleted later than
+    /// this write), the incoming write is simply discarded (a tie keeps
+    /// whatever is already here -- an accepted, documented imprecision of
     /// millisecond-resolution timestamps, not a correctness bug). Returns
     /// whether the write was actually applied.
     ///
@@ -1071,23 +1199,21 @@ impl World {
         let (ckey, local_idx) = self.split(coord)?;
         let key_id = self.schema().intern(key, value.value_type())?;
         self.with_chunk_maybe_write(&ckey, |chunk| {
-            let wins = match chunk.get_meta(local_idx, key_id) {
-                Some(existing) => meta.modified_at_ms > existing.modified_at_ms,
-                None => true,
-            };
-            if wins {
-                chunk.set_with_meta(local_idx, key_id, value, meta);
-            }
+            let wins = apply_set_if_newer(chunk, local_idx, key_id, value, meta);
             (wins, wins)
         })
     }
 
     /// `apply_replicated`'s counterpart for a replicated removal: applies
     /// last-write-wins the same way, comparing `modified_at_ms` against
-    /// whatever this cell/key currently holds (a cell with nothing set for
-    /// `key` is removed "for free" -- there's nothing to compare against,
-    /// so the remove always "wins" but has no effect either way). Returns
-    /// whether anything was actually removed.
+    /// whatever this cell/key currently holds -- a value, or a tombstone.
+    ///
+    /// When this world keeps tombstones, a winning removal records one at
+    /// `modified_at_ms`, even if there was no value here yet: a delete
+    /// that arrives before the write it deletes then still beats it. A
+    /// key this world has never interned at all is a no-op either way
+    /// (there's no id to record a tombstone under). Without tombstones, a
+    /// cell with nothing set is a no-op. Returns whether anything changed.
     pub fn apply_replicated_remove(
         &self,
         coord: &[i32],
@@ -1098,19 +1224,106 @@ impl World {
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(false); // never interned anywhere: nothing to remove
         };
+        let keep_tombstones = self.tombstone_retention.is_some();
         self.with_chunk_maybe_write(&ckey, |chunk| {
-            let wins = match chunk.get_meta(local_idx, key_id) {
-                Some(existing) => modified_at_ms > existing.modified_at_ms,
-                None => false, // nothing set here -- no-op, not an error
-            };
-            if wins {
-                chunk.remove(local_idx, key_id);
-            }
+            let wins =
+                apply_remove_if_newer(chunk, local_idx, key_id, modified_at_ms, keep_tombstones);
             (wins, wins)
         })
     }
 
-    pub fn remove(&self, coord: &[i32], key: &str) -> io::Result<()> {
+    /// `apply_replicated`/`apply_replicated_remove` for a whole batch, in
+    /// order, with each chunk the batch touches read and written once
+    /// rather than once per change -- a catch-up streams thousands of
+    /// changes, often many to the same chunk, and rewriting the whole
+    /// chunk file for each one would make that quadratic. Returns one
+    /// result per change, in input order: whether it was applied, or why
+    /// it couldn't be (a bad coordinate, a type mismatch, a failed write).
+    pub fn apply_changes(&self, changes: Vec<Change>) -> Vec<io::Result<bool>> {
+        let mut results: Vec<Option<io::Result<bool>>> = (0..changes.len()).map(|_| None).collect();
+        // Chunks in first-touched order; each one's changes in input order.
+        let mut chunk_order: Vec<ChunkKey> = Vec::new();
+        let mut by_chunk: HashMap<ChunkKey, Vec<(usize, usize, u32, ChangeKind)>> = HashMap::new();
+        for (i, change) in changes.into_iter().enumerate() {
+            let (ckey, local_idx) = match self.split(&change.coord) {
+                Ok(split) => split,
+                Err(e) => {
+                    results[i] = Some(Err(e));
+                    continue;
+                }
+            };
+            let key_id = match &change.kind {
+                ChangeKind::Set(value, _) => {
+                    match self.schema().intern(&change.key, value.value_type()) {
+                        Ok(key_id) => key_id,
+                        Err(e) => {
+                            results[i] = Some(Err(e));
+                            continue;
+                        }
+                    }
+                }
+                // Same as `apply_replicated_remove`: a key never interned
+                // here has nothing to remove and no id for a tombstone.
+                ChangeKind::Removed(_) => match self.schema().id_for_key(&change.key) {
+                    Some(key_id) => key_id,
+                    None => {
+                        results[i] = Some(Ok(false));
+                        continue;
+                    }
+                },
+            };
+            by_chunk
+                .entry(ckey.clone())
+                .or_insert_with(|| {
+                    chunk_order.push(ckey);
+                    Vec::new()
+                })
+                .push((i, local_idx, key_id, change.kind));
+        }
+
+        let keep_tombstones = self.tombstone_retention.is_some();
+        for ckey in chunk_order {
+            let group = by_chunk.remove(&ckey).unwrap_or_default();
+            let indices: Vec<usize> = group.iter().map(|(i, ..)| *i).collect();
+            let applied = self.with_chunk_maybe_write(&ckey, |chunk| {
+                let applied: Vec<bool> = group
+                    .into_iter()
+                    .map(|(_, local_idx, key_id, kind)| match kind {
+                        ChangeKind::Set(value, meta) => {
+                            apply_set_if_newer(chunk, local_idx, key_id, value, meta)
+                        }
+                        ChangeKind::Removed(at_ms) => {
+                            apply_remove_if_newer(chunk, local_idx, key_id, at_ms, keep_tombstones)
+                        }
+                    })
+                    .collect();
+                let changed = applied.iter().any(|&a| a);
+                (applied, changed)
+            });
+            match applied {
+                Ok(applied) => {
+                    for (i, applied) in indices.into_iter().zip(applied) {
+                        results[i] = Some(Ok(applied));
+                    }
+                }
+                Err(e) => {
+                    for i in indices {
+                        results[i] = Some(Err(io::Error::new(e.kind(), e.to_string())));
+                    }
+                }
+            }
+        }
+        results
+            .into_iter()
+            .map(|r| r.expect("every change gets a result"))
+            .collect()
+    }
+
+    /// Removes `key` from this cell, returning when -- the time also
+    /// recorded in its tombstone, if this world keeps them (see
+    /// `with_tombstone_retention`), and the timestamp a replicating caller
+    /// should ship -- or `None` if there was no value to remove.
+    pub fn remove(&self, coord: &[i32], key: &str) -> io::Result<Option<u64>> {
         // See `get`: validate the coordinate before the key-existence
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
@@ -1123,11 +1336,20 @@ impl World {
             crate::logger::warn(format!(
                 "remove() called with unknown key '{key}' at {coord:?} -- no-op"
             ));
-            return Ok(());
+            return Ok(None);
         };
-        self.with_chunk_write(&ckey, |chunk| chunk.remove(local_idx, key_id))?;
+        let at_ms = now_ms();
+        let keep_tombstones = self.tombstone_retention.is_some();
+        let removed = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let removed = if keep_tombstones {
+                chunk.remove_with_tombstone(local_idx, key_id, at_ms)
+            } else {
+                chunk.remove(local_idx, key_id)
+            };
+            (removed, removed)
+        })?;
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
-        Ok(())
+        Ok(removed.then_some(at_ms))
     }
 
     /// Checks that `region`'s origin and extent both have this world's axis
@@ -1279,30 +1501,53 @@ impl World {
     /// partial chunks exactly like `get_region`. Unlike the single-cell
     /// `remove`, this logs one summary line for the whole region rather
     /// than one line per cell, so clearing a large region doesn't flood
-    /// `kblockdblib.log`.
-    pub fn remove_region(&self, region: &Region, key: &str) -> io::Result<()> {
+    /// `kblockdblib.log`. Reports which cells actually held a value (see
+    /// `RemovedCells`); every removal shares one timestamp.
+    pub fn remove_region(&self, region: &Region, key: &str) -> io::Result<RemovedCells> {
         self.check_region(region)?;
+        let at_ms = now_ms();
+        let mut removed = RemovedCells {
+            at_ms,
+            coords: Vec::new(),
+        };
         if region.volume() == 0 {
-            return Ok(());
+            return Ok(removed);
         }
         let Some(key_id) = self.schema().id_for_key(key) else {
             crate::logger::warn(format!(
                 "remove_region() called with unknown key '{key}' at {region:?} -- no-op"
             ));
-            return Ok(());
+            return Ok(removed);
         };
+        let keep_tombstones = self.tombstone_retention.is_some();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            self.with_chunk_write(&ckey, |chunk| {
-                for (_, local_idx) in cells {
-                    chunk.remove(local_idx, key_id);
-                }
+            let removed_here = self.with_chunk_maybe_write(&ckey, |chunk| {
+                let removed_here: Vec<usize> = cells
+                    .into_iter()
+                    .map(|(_, local_idx)| local_idx)
+                    .filter(|&local_idx| {
+                        if keep_tombstones {
+                            chunk.remove_with_tombstone(local_idx, key_id, at_ms)
+                        } else {
+                            chunk.remove(local_idx, key_id)
+                        }
+                    })
+                    .collect();
+                let changed = !removed_here.is_empty();
+                (removed_here, changed)
             })?;
+            removed.coords.extend(
+                removed_here
+                    .into_iter()
+                    .map(|local_idx| self.unsplit(&ckey, local_idx)),
+            );
         }
         crate::logger::info(format!(
-            "removed region {region:?} key '{key}' ({} cells)",
-            region.volume()
+            "removed region {region:?} key '{key}' ({} cells, {} held a value)",
+            region.volume(),
+            removed.coords.len()
         ));
-        Ok(())
+        Ok(removed)
     }
 
     /// Groups every coordinate in `region` by which chunk it falls in, so
@@ -1324,6 +1569,56 @@ impl World {
         }
         Ok(by_chunk)
     }
+}
+
+/// Last-write-wins for a replicated set: applies it if it's newer than
+/// this cell/key's current value, or its tombstone. Returns whether it
+/// was applied. Shared by `apply_replicated` and `apply_changes`.
+fn apply_set_if_newer(
+    chunk: &mut Chunk,
+    local_idx: usize,
+    key_id: u32,
+    value: Value,
+    meta: CellMeta,
+) -> bool {
+    let wins = match (
+        chunk.get_meta(local_idx, key_id),
+        chunk.tombstone_at(local_idx, key_id),
+    ) {
+        (Some(existing), _) => meta.modified_at_ms > existing.modified_at_ms,
+        (None, Some(removed_at)) => meta.modified_at_ms > removed_at,
+        (None, None) => true,
+    };
+    if wins {
+        chunk.set_with_meta(local_idx, key_id, value, meta);
+    }
+    wins
+}
+
+/// Last-write-wins for a replicated removal -- see
+/// `World::apply_replicated_remove`. Shared with `apply_changes`.
+fn apply_remove_if_newer(
+    chunk: &mut Chunk,
+    local_idx: usize,
+    key_id: u32,
+    modified_at_ms: u64,
+    keep_tombstones: bool,
+) -> bool {
+    let wins = match (
+        chunk.get_meta(local_idx, key_id),
+        chunk.tombstone_at(local_idx, key_id),
+    ) {
+        (Some(existing), _) => modified_at_ms > existing.modified_at_ms,
+        (None, Some(removed_at)) => modified_at_ms > removed_at,
+        (None, None) => keep_tombstones,
+    };
+    if wins {
+        chunk.remove(local_idx, key_id);
+        if keep_tombstones {
+            chunk.put_tombstone(local_idx, key_id, modified_at_ms);
+        }
+    }
+    wins
 }
 
 /// Recursively walks `dir` (a world's `root`, or one of its nested
@@ -3778,5 +4073,376 @@ mod tests {
         let err = w.add_column("has\ttab", ValueType::Str).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         assert!(w.columns().is_empty());
+    }
+
+    /// Tombstones kept "forever", so tests can use small, fixed
+    /// timestamps without them being purged as expired.
+    fn create_with_tombstones(dir: &TempDir) -> World {
+        create(dir).with_tombstone_retention(Some(Duration::MAX))
+    }
+
+    fn meta_at(ms: u64) -> CellMeta {
+        CellMeta {
+            created_at_ms: ms,
+            modified_at_ms: ms,
+            version: 0,
+        }
+    }
+
+    #[test]
+    fn remove_returns_its_time_only_when_a_value_was_removed() {
+        let dir = TempDir::new("remove-returns-time");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.set(&c, "material", Value::Str("stone".into())).unwrap();
+        let before = now_ms();
+        let at = w
+            .remove(&c, "material")
+            .unwrap()
+            .expect("a value was removed");
+        assert!(at >= before);
+        assert_eq!(w.remove(&c, "material").unwrap(), None);
+        assert_eq!(w.remove(&c, "never-set").unwrap(), None);
+    }
+
+    #[test]
+    fn without_retention_a_remove_leaves_no_tombstone() {
+        let dir = TempDir::new("no-tombstones");
+        let w = create(&dir);
+        let c = coord3(1, 2, 3);
+        w.apply_replicated(&c, "material", Value::Str("stone".into()), meta_at(100))
+            .unwrap();
+        w.remove(&c, "material").unwrap();
+        // With no tombstone, an older replicated write is accepted again.
+        assert!(w
+            .apply_replicated(&c, "material", Value::Str("old".into()), meta_at(50))
+            .unwrap());
+        // ... and the chunk file is gone after the remove, as before.
+        let mut seen = 0;
+        w.changes_since(0, |batch| {
+            seen += batch.len();
+            true
+        })
+        .unwrap();
+        assert_eq!(seen, 1);
+    }
+
+    #[test]
+    fn a_late_older_write_loses_to_a_tombstone() {
+        let dir = TempDir::new("tombstone-beats-late-write");
+        let w = create_with_tombstones(&dir);
+        let c = coord3(1, 2, 3);
+        w.apply_replicated(&c, "material", Value::Str("stone".into()), meta_at(100))
+            .unwrap();
+        assert!(w.apply_replicated_remove(&c, "material", 200).unwrap());
+        assert!(!w
+            .apply_replicated(&c, "material", Value::Str("late".into()), meta_at(150))
+            .unwrap());
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+        // A write newer than the delete still wins.
+        assert!(w
+            .apply_replicated(&c, "material", Value::Str("new".into()), meta_at(300))
+            .unwrap());
+        assert_eq!(
+            w.get(&c, "material").unwrap(),
+            Some(Value::Str("new".into()))
+        );
+    }
+
+    #[test]
+    fn a_delete_arriving_before_its_write_still_wins() {
+        let dir = TempDir::new("delete-before-write");
+        let w = create_with_tombstones(&dir);
+        // Interns the key, as any other write of it anywhere would have.
+        w.apply_replicated(
+            &coord3(9, 9, 9),
+            "material",
+            Value::Str("x".into()),
+            meta_at(1),
+        )
+        .unwrap();
+        let c = coord3(1, 2, 3);
+        assert!(w.apply_replicated_remove(&c, "material", 200).unwrap());
+        assert!(!w
+            .apply_replicated(&c, "material", Value::Str("stone".into()), meta_at(100))
+            .unwrap());
+        assert_eq!(w.get(&c, "material").unwrap(), None);
+    }
+
+    #[test]
+    fn tombstones_survive_a_reopen() {
+        let dir = TempDir::new("tombstones-reopen");
+        let c = coord3(1, 2, 3);
+        {
+            let w = create_with_tombstones(&dir);
+            w.apply_replicated(&c, "material", Value::Str("stone".into()), meta_at(100))
+                .unwrap();
+            w.apply_replicated_remove(&c, "material", 200).unwrap();
+        }
+        let w = World::open(&dir)
+            .unwrap()
+            .with_tombstone_retention(Some(Duration::MAX));
+        assert!(!w
+            .apply_replicated(&c, "material", Value::Str("late".into()), meta_at(150))
+            .unwrap());
+    }
+
+    #[test]
+    fn expired_tombstones_are_purged_on_the_next_write_to_their_chunk() {
+        let dir = TempDir::new("tombstones-expire");
+        let w = create(&dir).with_tombstone_retention(Some(Duration::from_secs(60)));
+        let c = coord3(1, 2, 3);
+        w.apply_replicated(&c, "material", Value::Str("stone".into()), meta_at(100))
+            .unwrap();
+        // Long expired by the wall clock: purged as part of this very write.
+        w.apply_replicated_remove(&c, "material", 200).unwrap();
+        assert!(w
+            .apply_replicated(&c, "material", Value::Str("late".into()), meta_at(150))
+            .unwrap());
+    }
+
+    #[test]
+    fn remove_region_reports_only_cells_that_held_a_value() {
+        let dir = TempDir::new("remove-region-reports");
+        let w = create_with_tombstones(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("a".into()))
+            .unwrap();
+        w.set(&coord3(40, 0, 0), "material", Value::Str("b".into()))
+            .unwrap();
+        let region = Region::new(coord3(0, 0, 0), coord3(64, 1, 1));
+        let removed = w.remove_region(&region, "material").unwrap();
+        let mut coords = removed.coords.clone();
+        coords.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(coords, vec![coord3(0, 0, 0), coord3(40, 0, 0)]);
+        assert!(removed.at_ms > 0);
+
+        let mut tombstones = Vec::new();
+        w.changes_since(0, |batch| {
+            tombstones.extend(batch);
+            true
+        })
+        .unwrap();
+        assert_eq!(tombstones.len(), 2);
+        assert!(tombstones
+            .iter()
+            .all(|c| c.kind == ChangeKind::Removed(removed.at_ms)));
+
+        assert!(w
+            .remove_region(&region, "material")
+            .unwrap()
+            .coords
+            .is_empty());
+    }
+
+    fn all_changes_since(w: &World, since_ms: u64) -> Vec<Change> {
+        let mut out = Vec::new();
+        w.changes_since(since_ms, |batch| {
+            out.extend(batch);
+            true
+        })
+        .unwrap();
+        out.sort_by(|a, b| a.coord.iter().cmp(b.coord.iter()));
+        out
+    }
+
+    #[test]
+    fn changes_since_reports_newer_sets_and_removes_by_key_name() {
+        let dir = TempDir::new("changes-since");
+        let w = create_with_tombstones(&dir);
+        w.apply_replicated(
+            &coord3(1, 0, 0),
+            "material",
+            Value::Str("old".into()),
+            meta_at(100),
+        )
+        .unwrap();
+        w.apply_replicated(
+            &coord3(2, 0, 0),
+            "material",
+            Value::Str("new".into()),
+            meta_at(300),
+        )
+        .unwrap();
+        w.apply_replicated(
+            &coord3(3, 0, 0),
+            "material",
+            Value::Str("gone".into()),
+            meta_at(100),
+        )
+        .unwrap();
+        w.apply_replicated_remove(&coord3(3, 0, 0), "material", 400)
+            .unwrap();
+
+        assert_eq!(
+            all_changes_since(&w, 200),
+            vec![
+                Change {
+                    coord: coord3(2, 0, 0),
+                    key: "material".into(),
+                    kind: ChangeKind::Set(Value::Str("new".into()), meta_at(300)),
+                },
+                Change {
+                    coord: coord3(3, 0, 0),
+                    key: "material".into(),
+                    kind: ChangeKind::Removed(400),
+                },
+            ]
+        );
+        assert_eq!(all_changes_since(&w, 0).len(), 3);
+        assert!(all_changes_since(&w, 400).is_empty());
+    }
+
+    #[test]
+    fn changes_since_skips_unchanged_chunks_without_decoding_them() {
+        let dir = TempDir::new("changes-since-skips");
+        {
+            let w = create_with_tombstones(&dir);
+            // Three chunks (DEFAULT_CHUNK_DIM apart); only one changed late.
+            for (x, ms) in [(0, 100), (64, 100), (128, 500)] {
+                w.apply_replicated(&coord3(x, 0, 0), "material", Value::I64(1), meta_at(ms))
+                    .unwrap();
+            }
+        }
+        let w = World::open(&dir).unwrap();
+        assert_eq!(all_changes_since(&w, 200).len(), 1);
+        assert_eq!(w.chunks_read_from_disk(), 1);
+    }
+
+    #[test]
+    fn changes_since_reads_compressed_and_old_format_chunks() {
+        let dir = TempDir::new("changes-since-formats");
+        let w = create_with_tombstones(&dir).with_compression(true);
+        w.apply_replicated(&coord3(0, 0, 0), "material", Value::I64(1), meta_at(500))
+            .unwrap();
+        assert_eq!(all_changes_since(&w, 200).len(), 1);
+        assert!(all_changes_since(&w, 500).is_empty());
+
+        // An old-format (header-less) file can't be skipped by its header,
+        // but is still reported correctly.
+        let c = coord3(64, 0, 0);
+        w.apply_replicated(&c, "material", Value::I64(2), meta_at(100))
+            .unwrap();
+        let (ckey, _) = w.split(&c).unwrap();
+        let path = w.chunk_path(&ckey);
+        let mut chunk = w.load_chunk(&ckey).unwrap();
+        let mut buf = Vec::new();
+        chunk.write_to(&mut buf).unwrap();
+        // Strip the header: magic + format + newest_ms.
+        fs::write(&path, &buf[13..buf.len() - 4]).unwrap();
+        chunk = w.load_chunk(&ckey).unwrap();
+        assert_eq!(chunk.newest_ms(), 100);
+        let reopened = World::open(&dir).unwrap();
+        assert_eq!(all_changes_since(&reopened, 50).len(), 2);
+        assert_eq!(all_changes_since(&reopened, 200).len(), 1);
+    }
+
+    #[test]
+    fn changes_since_stops_when_emit_returns_false() {
+        let dir = TempDir::new("changes-since-stop");
+        let w = create(&dir);
+        for x in [0, 64, 128] {
+            w.set(&coord3(x, 0, 0), "material", Value::I64(1)).unwrap();
+        }
+        let mut batches = 0;
+        w.changes_since(0, |_| {
+            batches += 1;
+            false
+        })
+        .unwrap();
+        assert_eq!(batches, 1);
+    }
+
+    /// Regression: `list_cells` used to read chunk files straight off disk,
+    /// so a write rewriting the same file at the same moment could hand it
+    /// half a file ("failed to fill whole buffer").
+    #[test]
+    fn list_cells_never_sees_a_half_written_chunk() {
+        let dir = TempDir::new("list-cells-vs-writes");
+        let w = std::sync::Arc::new(create(&dir));
+        // A large chunk, so each rewrite takes long enough to overlap.
+        let region = Region::new(coord3(0, 0, 0), coord3(32, 32, 16));
+        let cells = region.volume() as usize;
+        let values: Vec<Value> = (0..cells)
+            .map(|i| Value::Str(format!("value-{i:08}")))
+            .collect();
+        w.set_region(&region, "material", &values).unwrap();
+
+        let writer = {
+            let w = w.clone();
+            std::thread::spawn(move || {
+                for i in 0..40 {
+                    w.set(&coord3(0, 0, 0), "material", Value::Str(format!("v{i}")))
+                        .unwrap();
+                }
+            })
+        };
+        for _ in 0..40 {
+            assert_eq!(w.list_cells().unwrap().len(), cells);
+        }
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn apply_changes_applies_a_batch_with_one_write_per_chunk() {
+        let dir = TempDir::new("apply-changes");
+        let w = create_with_tombstones(&dir);
+        let set = |x: i32, ms: u64| Change {
+            coord: coord3(x, 0, 0),
+            key: "material".into(),
+            kind: ChangeKind::Set(Value::I64(i64::from(x)), meta_at(ms)),
+        };
+        let mut changes: Vec<Change> = (0..20).map(|x| set(x, 100)).collect();
+        changes.push(set(64, 100)); // a second chunk
+        changes.push(Change {
+            coord: coord3(3, 0, 0),
+            key: "material".into(),
+            kind: ChangeKind::Removed(200),
+        });
+        changes.push(set(3, 150)); // older than the removal just before it
+        let before = w.chunks_written_to_disk();
+        let results = w.apply_changes(changes);
+        assert_eq!(w.chunks_written_to_disk() - before, 2);
+        assert_eq!(results.len(), 23);
+        assert!(results[..22].iter().all(|r| *r.as_ref().unwrap()));
+        assert!(!results[22].as_ref().unwrap());
+        assert_eq!(w.get(&coord3(3, 0, 0), "material").unwrap(), None);
+        assert_eq!(
+            w.get(&coord3(64, 0, 0), "material").unwrap(),
+            Some(Value::I64(64))
+        );
+    }
+
+    #[test]
+    fn apply_changes_reports_a_bad_change_without_failing_the_rest() {
+        let dir = TempDir::new("apply-changes-errors");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let results = w.apply_changes(vec![
+            Change {
+                coord: Coord::from(vec![1, 2]), // wrong axis count
+                key: "material".into(),
+                kind: ChangeKind::Removed(1),
+            },
+            Change {
+                coord: coord3(1, 0, 0),
+                key: "material".into(), // a str key, given an i64
+                kind: ChangeKind::Set(Value::I64(1), meta_at(1)),
+            },
+            Change {
+                coord: coord3(2, 0, 0),
+                key: "never-set".into(),
+                kind: ChangeKind::Removed(1),
+            },
+            Change {
+                coord: coord3(3, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Set(Value::Str("sand".into()), meta_at(1)),
+            },
+        ]);
+        assert!(results[0].is_err());
+        assert!(results[1].is_err());
+        assert!(!results[2].as_ref().unwrap());
+        assert!(*results[3].as_ref().unwrap());
     }
 }

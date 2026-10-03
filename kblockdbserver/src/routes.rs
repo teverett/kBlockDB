@@ -539,11 +539,14 @@ async fn remove_cell(
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
     let (coord2, key2) = (coord.clone(), key.clone());
-    let modified_at_ms = kblockdbcluster::hub::now_ms();
-    state
+    let removed_at = state
         .with_database(&db, move |w| w.remove(&coord, &key))
         .await?;
-    kblockdbcluster::hub::publish_remove(&state.replication, &db, &coord2, &key2, modified_at_ms);
+    // Only a value that was actually there is replicated, at the time
+    // `remove` recorded for it.
+    if let Some(removed_at) = removed_at {
+        kblockdbcluster::hub::publish_remove(&state.replication, &db, &coord2, &key2, removed_at);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -662,19 +665,12 @@ async fn remove_region(
     let origin = parse_coords(&origin)?;
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
-    let (region2, key2) = (region.clone(), key.clone());
-    let modified_at_ms = kblockdbcluster::hub::now_ms();
-    state
+    let key2 = key.clone();
+    let removed = state
         .with_database(&db, move |w| w.remove_region(&region, &key))
         .await?;
-    for coord in region2.iter() {
-        kblockdbcluster::hub::publish_remove(
-            &state.replication,
-            &db,
-            &coord,
-            &key2,
-            modified_at_ms,
-        );
+    for coord in &removed.coords {
+        kblockdbcluster::hub::publish_remove(&state.replication, &db, coord, &key2, removed.at_ms);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -952,28 +948,21 @@ pub(crate) async fn execute_query(
                 })
                 .collect();
             let affected = matching.len();
-            let modified_at_ms = kblockdbcluster::hub::now_ms();
-            let matching2 = matching.clone();
-            state
+            let removed = state
                 .with_database(db, move |w| {
-                    for (coord, keys) in &matching2 {
+                    let mut removed = Vec::new();
+                    for (coord, keys) in matching {
                         for key in keys {
-                            w.remove(coord, key)?;
+                            if let Some(at) = w.remove(&coord, &key)? {
+                                removed.push((coord.clone(), key, at));
+                            }
                         }
                     }
-                    Ok(())
+                    Ok(removed)
                 })
                 .await?;
-            for (coord, keys) in &matching {
-                for key in keys {
-                    kblockdbcluster::hub::publish_remove(
-                        &state.replication,
-                        db,
-                        coord,
-                        key,
-                        modified_at_ms,
-                    );
-                }
+            for (coord, key, at) in &removed {
+                kblockdbcluster::hub::publish_remove(&state.replication, db, coord, key, *at);
             }
             Ok(QueryResponse::affected(affected))
         }

@@ -1,17 +1,18 @@
 //! The connecting side of a peer link -- one long-running task per
 //! configured peer, kept running by the embedder for the life of the
 //! process, that keeps a connection to that one peer alive and streams it
-//! every local write (see `hub::ReplicationHub`) as `ChangeBatch` frames.
-//! See `wire.rs` for the wire format and `server.rs` for the accepting
-//! side.
+//! every local write (see `hub::ReplicationHub`) as `ChangeBatch` frames,
+//! plus whatever catch-up the peer asks for (see `peers.rs`'s
+//! "Catch-up"). See `wire.rs` for the wire format and `server.rs` for the
+//! accepting side.
 
 use crate::peers::PeerSet;
-use crate::wire::{PeerMessage, PEER_PROTOCOL_VERSION};
+use crate::wire::{ChangeEntry, PeerMessage, PEER_PROTOCOL_VERSION};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWrite};
+use tokio::io::AsyncWrite;
 use tokio::net::TcpStream;
-use tokio::sync::broadcast;
+use tokio::sync::{broadcast, mpsc};
 
 /// Whether a `run` task's connection to its one peer is currently up, and
 /// if not, since when -- cheap to clone (`Arc`-shared) and read from
@@ -98,13 +99,42 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 /// knob: correctness doesn't depend on the batch size.
 const MAX_BATCH_SIZE: usize = 256;
 
+/// How often a caught-up, idle link confirms with `Synced` -- the most a
+/// receiver's watermark for this process can lag behind.
+const SYNCED_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(5)
+};
+
+/// Catch-up batches buffered between the blocking scan and the link: a
+/// slow peer holds the scan back instead of it buffering a whole database.
+const CATCH_UP_BUFFER: usize = 4;
+
+/// A catch-up in progress: batches from `ChangeSource::changes_since`
+/// running on a blocking thread, and the time it started -- what the
+/// `Synced` sent once it finishes confirms.
+struct CatchUp {
+    batches: mpsc::Receiver<Result<Vec<ChangeEntry>, String>>,
+    through_ms: u64,
+}
+
+/// Aborts a spawned task when dropped -- this link's reader task, so it
+/// never outlives the link.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs until the process exits: connect, authenticate, then forward every
 /// entry the hub publishes -- plus a `PeerList` whenever `peers` changes
-/// (gossip, see `peers.rs`) -- until the connection breaks, at which point
-/// this reconnects with backoff and resumes. "Resumes" means picks up with
-/// whatever's published *after* reconnecting, not a replay of anything
-/// missed while disconnected (see docs/clustering.md's "Catch-up scope":
-/// live-forward only for v1). Stops for good, instead, if `address` turns
+/// (gossip, see `peers.rs`), and any catch-up the peer asks for -- until
+/// the connection breaks, at which point this reconnects with backoff and
+/// resumes. Anything missed while disconnected comes back through the
+/// peer's next `CatchUpRequest`, not from here. Stops for good, instead, if `address` turns
 /// out to reach this process itself or a node already linked under another
 /// address (see `PeerSet::claim`), or once its entry has been pruned from
 /// `peers` for being unreachable too long (see `PeerSet::prune`).
@@ -184,22 +214,91 @@ async fn connect_and_forward(
     peers.notify();
     eprintln!("peer client '{address}': connected");
 
-    // The far side never sends anything after `HelloOk`, so reading is
-    // purely to notice it going away: EOF or a reset ends the link (and
-    // starts the dead-peer clock) right away, instead of only on this
-    // side's next write -- which on a quiet cluster may never come.
-    let (mut reader, mut writer) = stream.split();
-    let mut scratch = [0u8; 64];
+    // The far side only ever sends `CatchUpRequest`s, but reading also
+    // notices it going away: EOF or a reset ends the link (and starts the
+    // dead-peer clock) right away, instead of only on this side's next
+    // write -- which on a quiet cluster may never come. Frames are read on
+    // their own task: a half-read frame can't be abandoned mid-`select!`.
+    let (mut reader, mut writer) = stream.into_split();
+    let (incoming_tx, mut incoming) = mpsc::channel::<std::io::Result<PeerMessage>>(8);
+    let _reader_task = AbortOnDrop(tokio::spawn(async move {
+        loop {
+            let msg = match crate::wire::read_message(&mut reader).await {
+                Ok(Some(msg)) => Ok(msg),
+                Ok(None) => Err(std::io::Error::other("closed by peer")),
+                Err(e) => Err(e),
+            };
+            let failed = msg.is_err();
+            if incoming_tx.send(msg).await.is_err() || failed {
+                return;
+            }
+        }
+    }));
 
     // Initial gossip, then again on every later change to `peers`.
     changes.borrow_and_update();
     send_peer_list(&mut writer, peers, address).await?;
 
+    let margin_ms = u64::try_from(peers.catch_up_margin().as_millis()).unwrap_or(u64::MAX);
+    let mut catch_up: Option<CatchUp> = None;
+    // Another catch-up to run once the current one finishes, from here.
+    let mut queued_since: Option<u64> = None;
+    // The last `Synced` sent -- `None` until the first catch-up finishes.
+    let mut last_through: Option<u64> = None;
+    let mut synced_tick = tokio::time::interval(SYNCED_INTERVAL);
+    synced_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
     loop {
         tokio::select! {
-            read = reader.read(&mut scratch) => {
-                if read? == 0 {
-                    return Err(std::io::Error::other("closed by peer"));
+            msg = incoming.recv() => {
+                match msg {
+                    Some(Ok(PeerMessage::CatchUpRequest { since_ms })) => {
+                        if catch_up.is_some() {
+                            queued_since = Some(queued_since.map_or(since_ms, |q| q.min(since_ms)));
+                        } else {
+                            catch_up = start_catch_up(peers, address, since_ms);
+                        }
+                    }
+                    // Nothing else is expected this direction; skip it.
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => return Err(e),
+                    None => return Err(std::io::Error::other("closed by peer")),
+                }
+            }
+            batch = next_catch_up_batch(&mut catch_up) => {
+                match batch {
+                    Some(Ok(entries)) => {
+                        crate::wire::write_message(&mut writer, &PeerMessage::ChangeBatch(entries))
+                            .await?;
+                    }
+                    Some(Err(e)) => {
+                        // The peer asks again when the link comes back.
+                        return Err(std::io::Error::other(format!("catch-up failed: {e}")));
+                    }
+                    None => {
+                        let through_ms = catch_up.take().map_or(0, |c| c.through_ms);
+                        if let Some(since_ms) = queued_since.take() {
+                            catch_up = start_catch_up(peers, address, since_ms);
+                        } else {
+                            crate::wire::write_message(&mut writer, &PeerMessage::Synced { through_ms })
+                                .await?;
+                            last_through = Some(through_ms);
+                        }
+                    }
+                }
+            }
+            _ = synced_tick.tick() => {
+                // Only once caught up, and only while nothing is pending:
+                // `Synced{t}` promises every change up to `t` has been sent.
+                // `t` is read *before* checking the hub is drained, so
+                // anything published before `t` has already gone out.
+                if catch_up.is_none() && queued_since.is_none() && last_through.is_some() {
+                    let now = crate::hub::now_ms();
+                    if rx.is_empty() {
+                        crate::wire::write_message(&mut writer, &PeerMessage::Synced { through_ms: now })
+                            .await?;
+                        last_through = Some(now);
+                    }
                 }
             }
             received = rx.recv() => {
@@ -209,11 +308,27 @@ async fn connect_and_forward(
                 let first = match received {
                     Ok(entry) => entry,
                     Err(broadcast::error::RecvError::Closed) => return Ok(()),
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        // Fell behind the hub's buffer -- some entries were
-                        // skipped. Accepted under this feature's
-                        // "best-effort, live-forward-only" v1 scope; just
-                        // resume with whatever comes next.
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        // Fell behind the hub's buffer -- `skipped` entries
+                        // are gone from it. They're still in storage, so
+                        // catch this peer up again from the last point it
+                        // was confirmed synced (or the running catch-up's
+                        // start). Before any catch-up was asked for (an
+                        // older peer), there's nothing to resume from.
+                        let base = catch_up.as_ref().map(|c| c.through_ms).or(last_through);
+                        if let Some(base) = base {
+                            eprintln!(
+                                "peer client '{address}': fell {skipped} entries behind -- \
+                                 catching up again"
+                            );
+                            let since_ms = base.saturating_sub(margin_ms);
+                            if catch_up.is_some() {
+                                queued_since =
+                                    Some(queued_since.map_or(since_ms, |q| q.min(since_ms)));
+                            } else {
+                                catch_up = start_catch_up(peers, address, since_ms);
+                            }
+                        }
                         continue;
                     }
                 };
@@ -237,6 +352,48 @@ async fn connect_and_forward(
     }
 }
 
+/// Starts streaming every change since `since_ms` from `peers`' change
+/// source on a blocking thread. `None` (logged) if there's no source.
+fn start_catch_up(peers: &PeerSet, address: &str, since_ms: u64) -> Option<CatchUp> {
+    let Some(source) = peers.change_source().cloned() else {
+        eprintln!("peer client '{address}': asked to catch up, but no change source is set");
+        return None;
+    };
+    eprintln!("peer client '{address}': catching up from {since_ms}");
+    let through_ms = crate::hub::now_ms();
+    let (tx, batches) = mpsc::channel(CATCH_UP_BUFFER);
+    tokio::task::spawn_blocking(move || {
+        let mut emit = |mut batch: Vec<ChangeEntry>| {
+            while !batch.is_empty() {
+                let rest = batch.split_off(batch.len().min(MAX_BATCH_SIZE));
+                if tx.blocking_send(Ok(batch)).is_err() {
+                    return false; // the link went away
+                }
+                batch = rest;
+            }
+            true
+        };
+        if let Err(e) = source.changes_since(since_ms, &mut emit) {
+            let _ = tx.blocking_send(Err(e));
+        }
+    });
+    Some(CatchUp {
+        batches,
+        through_ms,
+    })
+}
+
+/// The next batch of the running catch-up; `None` once it's finished.
+/// Never resolves when there's no catch-up running.
+async fn next_catch_up_batch(
+    catch_up: &mut Option<CatchUp>,
+) -> Option<Result<Vec<ChangeEntry>, String>> {
+    match catch_up {
+        Some(catch_up) => catch_up.batches.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
 async fn send_peer_list<W: AsyncWrite + Unpin>(
     stream: &mut W,
     peers: &PeerSet,
@@ -249,7 +406,8 @@ async fn send_peer_list<W: AsyncWrite + Unpin>(
 mod tests {
     use super::*;
     use crate::hub::{publish_remove, publish_set};
-    use crate::test_support::{spawn_node, wait_until, TestNode, CLUSTER_SECRET};
+    use crate::test_support::{spawn_node, wait_until, RecordingSink, TestNode, CLUSTER_SECRET};
+    use crate::wire::ChangeOp;
     use kblockdblib::{CellMeta, Value};
 
     const DB: &str = "db";
@@ -286,6 +444,140 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("condition was never met within 2s");
+    }
+
+    /// A `standalone_peers` link that catches up from `source`, through a
+    /// hub of `hub_capacity`.
+    fn catch_up_peers(source: &RecordingSink, hub_capacity: usize) -> PeerSet {
+        PeerSet::new(
+            crate::peers::LocalIdentity {
+                cluster_secret: CLUSTER_SECRET.to_string(),
+                server_id: "node-a".to_string(),
+                peer_port: 1,
+            },
+            crate::hub::ReplicationHub::with_capacity(hub_capacity),
+        )
+        .with_change_source(Arc::new(source.clone()))
+    }
+
+    /// Plays the receiving side by hand: accepts the link's connection,
+    /// answers `Hello`, and reads its initial `PeerList`.
+    async fn accept_link(listener: &tokio::net::TcpListener) -> TcpStream {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::Hello { .. })
+        ));
+        crate::wire::write_message(&mut stream, &PeerMessage::HelloOk { node_id: 42 })
+            .await
+            .unwrap();
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::PeerList(_))
+        ));
+        stream
+    }
+
+    /// Reads until a `Synced`, returning every entry received before it
+    /// and the `through_ms` it carried.
+    async fn read_until_synced(stream: &mut TcpStream) -> (Vec<ChangeEntry>, u64) {
+        let mut entries = Vec::new();
+        loop {
+            let msg =
+                tokio::time::timeout(Duration::from_secs(2), crate::wire::read_message(stream))
+                    .await
+                    .expect("no Synced within 2s")
+                    .unwrap();
+            match msg {
+                Some(PeerMessage::ChangeBatch(batch)) => entries.extend(batch),
+                Some(PeerMessage::Synced { through_ms }) => return (entries, through_ms),
+                Some(PeerMessage::PeerList(_)) => {}
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_catch_up_request_streams_every_change_since_then_then_synced() {
+        let source = RecordingSink::new();
+        source.seed(DB, &[1], "k", Value::I64(1), 100);
+        source.seed(DB, &[2], "k", Value::I64(2), 300);
+        source.seed_removed(DB, &[3], "k", 400);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = catch_up_peers(&source, 64);
+        peers.add(listener.local_addr().unwrap().to_string());
+        let mut stream = accept_link(&listener).await;
+
+        let before = crate::hub::now_ms();
+        crate::wire::write_message(&mut stream, &PeerMessage::CatchUpRequest { since_ms: 200 })
+            .await
+            .unwrap();
+        let (mut entries, through_ms) = read_until_synced(&mut stream).await;
+        entries.sort_by(|a, b| a.coord.cmp(&b.coord));
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].coord, vec![2]);
+        assert_eq!(entries[0].op, ChangeOp::Set(Value::I64(2)));
+        assert_eq!(entries[1].coord, vec![3]);
+        assert_eq!(entries[1].op, ChangeOp::Remove);
+        assert_eq!(entries[1].modified_at_ms, 400);
+        assert!(through_ms >= before);
+
+        // Then, idle and caught up, it keeps confirming.
+        let (entries, later) = read_until_synced(&mut stream).await;
+        assert!(entries.is_empty());
+        assert!(later >= through_ms);
+    }
+
+    #[tokio::test]
+    async fn no_synced_is_sent_before_a_catch_up_was_asked_for() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = catch_up_peers(&RecordingSink::new(), 64);
+        peers.add(listener.local_addr().unwrap().to_string());
+        let mut stream = accept_link(&listener).await;
+        let next =
+            tokio::time::timeout(SYNCED_INTERVAL * 4, crate::wire::read_message(&mut stream)).await;
+        assert!(next.is_err(), "expected nothing, got {next:?}");
+    }
+
+    #[tokio::test]
+    async fn a_link_that_falls_behind_the_hub_catches_itself_up() {
+        let source = RecordingSink::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = catch_up_peers(&source, 4);
+        let replication = Some(peers.hub().clone());
+        peers.add(listener.local_addr().unwrap().to_string());
+        let mut stream = accept_link(&listener).await;
+        crate::wire::write_message(&mut stream, &PeerMessage::CatchUpRequest { since_ms: 0 })
+            .await
+            .unwrap();
+        let (_, through_ms) = read_until_synced(&mut stream).await;
+
+        // 20 writes with no await in between: on this single-threaded
+        // runtime the link can't drain the 4-entry hub until they're all
+        // published, so it lags and loses most of them from the hub.
+        for i in 0..20 {
+            let meta = CellMeta {
+                created_at_ms: through_ms + 1,
+                modified_at_ms: through_ms + 1,
+                version: 0,
+            };
+            source.seed(DB, &[i], "k", Value::I64(i64::from(i)), through_ms + 1);
+            publish_set(&replication, DB, &[i], "k", Value::I64(i64::from(i)), meta);
+        }
+
+        let mut seen = std::collections::HashSet::new();
+        let all_seen = tokio::time::timeout(Duration::from_secs(3), async {
+            while seen.len() < 20 {
+                let (entries, _) = read_until_synced(&mut stream).await;
+                seen.extend(entries.into_iter().map(|e| e.coord));
+            }
+        })
+        .await;
+        assert!(
+            all_seen.is_ok(),
+            "only {} of 20 entries arrived",
+            seen.len()
+        );
     }
 
     /// Regression: the link used to notice a dead peer only on its next

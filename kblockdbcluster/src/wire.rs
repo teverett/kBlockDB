@@ -25,12 +25,12 @@
 //! otherwise replies `HelloOk`.
 //!
 //! **Message shape.** Unlike a request/response protocol, this one is
-//! push-only: after `Hello`/`HelloOk`, the connecting side just streams
-//! `ChangeBatch` frames (its writes) and `PeerList` frames (gossip -- see
-//! `peers.rs`) at its own pace, and the accepting side never replies to
-//! them at all (no acks, no pipelining concerns -- see
-//! `client`/`server`'s own doc comments on why no-backfill/best-effort
-//! delivery is an accepted v1 trade-off).
+//! mostly push-only: after `Hello`/`HelloOk`, the accepting side sends one
+//! `CatchUpRequest`, then the connecting side just streams `ChangeBatch`
+//! frames (its writes, and the catch-up), `PeerList` frames (gossip) and
+//! `Synced` confirmations at its own pace, and the accepting side never
+//! replies to them (no acks -- see `peers.rs`'s "Catch-up" for how
+//! `Synced` stands in for them).
 
 use kblockdblib::Value;
 use std::io;
@@ -46,7 +46,11 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// Bumped whenever this module's wire format changes in a way an older
 /// peer couldn't decode. Mirrors `kblockdbserver::wire::PROTOCOL_VERSION`'s
 /// reasoning, applied here to peer links instead of end-user ones.
-pub const PEER_PROTOCOL_VERSION: u8 = 2;
+pub const PEER_PROTOCOL_VERSION: u8 = 3;
+
+/// The first version with `CatchUpRequest`/`Synced`: the accepting side
+/// only sends a `CatchUpRequest` to a connecting side at least this new.
+pub const CATCH_UP_PROTOCOL_VERSION: u8 = 3;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -96,6 +100,19 @@ pub enum PeerMessage {
     /// connected to (see `peers::PeerSet::gossip_list`). The receiver adds
     /// any it doesn't already know.
     PeerList(Vec<String>),
+    /// Accepting side to connecting side, right after `HelloOk`: "send me
+    /// every change you hold made after `since_ms`" -- see `peers.rs`'s
+    /// catch-up doc. The reply is ordinary `ChangeBatch`es, then `Synced`.
+    CatchUpRequest {
+        since_ms: u64,
+    },
+    /// Connecting side to accepting side: every change the sender holds
+    /// with `modified_at_ms <= through_ms` (in the sender's clock) has now
+    /// been sent on this connection. The receiver keeps the latest one per
+    /// peer as its watermark for the next `CatchUpRequest`.
+    Synced {
+        through_ms: u64,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -139,6 +156,14 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
             for address in addresses {
                 put_string(&mut buf, address);
             }
+        }
+        PeerMessage::CatchUpRequest { since_ms } => {
+            buf.push(5);
+            buf.extend_from_slice(&since_ms.to_le_bytes());
+        }
+        PeerMessage::Synced { through_ms } => {
+            buf.push(6);
+            buf.extend_from_slice(&through_ms.to_le_bytes());
         }
         PeerMessage::HelloRejected(reason) => {
             buf.push(2);
@@ -214,6 +239,10 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
                 .collect::<Result<Vec<_>, DecodeError>>()?;
             Ok(PeerMessage::PeerList(addresses))
         }
+        5 => Ok(PeerMessage::CatchUpRequest { since_ms: r.u64()? }),
+        6 => Ok(PeerMessage::Synced {
+            through_ms: r.u64()?,
+        }),
         other => Err(DecodeError::UnknownTag(other)),
     }
 }
@@ -398,6 +427,21 @@ mod tests {
             peer_port: 8082,
             node_id: 0xDEAD_BEEF_1234_5678,
             protocol_version: PEER_PROTOCOL_VERSION,
+        });
+    }
+
+    #[test]
+    fn catch_up_request_round_trips() {
+        roundtrip(PeerMessage::CatchUpRequest { since_ms: 0 });
+        roundtrip(PeerMessage::CatchUpRequest {
+            since_ms: 1_790_000_000_123,
+        });
+    }
+
+    #[test]
+    fn synced_round_trips() {
+        roundtrip(PeerMessage::Synced {
+            through_ms: u64::MAX,
         });
     }
 

@@ -150,6 +150,8 @@ dead_peer_timeout_secs = 300  # optional; 0 never drops unreachable peers
 keepalive_idle_secs = 30      # optional peer-link TCP keepalive, all > 0
 keepalive_interval_secs = 10
 keepalive_retries = 3
+tombstone_retention_secs = 604800  # optional; how long deletes are remembered
+catch_up_margin_secs = 60     # optional
 
 [[peers]]
 address = "10.0.0.2:8082"
@@ -585,7 +587,9 @@ the frame/request/response byte layout.
 - `kblockdbserver/src/cluster.rs`    -- the only clustering-related code
   that lives in this crate: implements `kblockdbcluster::server::
   ReplicationSink` for `AppState` (applying an incoming change against
-  this server's actual `World`s, auto-creating an unseen database).
+  this server's actual `World`s, auto-creating an unseen database) and
+  `kblockdbcluster::source::ChangeSource` (every database's changes since
+  a time, for a peer's catch-up).
   Everything else -- the peer wire format, the in-process publish hub,
   the connecting and accepting sides of a peer link -- lives in the
   separate [`kblockdbcluster`](clustering.md) crate, which this crate

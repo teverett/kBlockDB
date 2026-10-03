@@ -317,7 +317,16 @@ async fn main() {
     let databases = state::Databases::new(&data_dir, default_shape)
         .with_compression(config.compression)
         .with_max_concurrent_disk_ops(max_concurrent_disk_ops)
-        .with_max_cached_chunks(max_cached_chunks);
+        .with_max_cached_chunks(max_cached_chunks)
+        // Tombstones only matter for replication -- see
+        // `World::with_tombstone_retention`.
+        .with_tombstone_retention(
+            config
+                .cluster
+                .cluster_secret
+                .as_ref()
+                .map(|_| config.cluster.tombstone_retention()),
+        );
     let existing = databases.list().unwrap_or_else(|e| {
         eprintln!("failed to read data directory {data_dir}: {e}");
         std::process::exit(1);
@@ -396,7 +405,27 @@ async fn main() {
             },
             hub.clone(),
         )
-        .with_keepalive(config.cluster.keepalive());
+        .with_keepalive(config.cluster.keepalive())
+        .with_change_source(std::sync::Arc::new(state.clone()))
+        .with_catch_up_margin(config.cluster.catch_up_margin())
+        .with_watermarks(
+            std::path::Path::new(&data_dir)
+                .join(".cluster")
+                .join("watermarks"),
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("failed to read cluster watermarks in {data_dir}/.cluster: {e}");
+            std::process::exit(1);
+        });
+        // A peer last synced longer ago than tombstones are kept may have
+        // missed deletes that no catch-up can now report.
+        for (address, through_ms) in peers.stale_watermarks(config.cluster.tombstone_retention()) {
+            eprintln!(
+                "kblockdbserver: warning: last synced with {address} at {through_ms} ms, longer \
+                 ago than tombstone_retention_secs -- deletes made since may be missing here; \
+                 see docs/clustering.md"
+            );
+        }
         for peer in &config.peers {
             peers.add_configured(peer.address.clone());
         }

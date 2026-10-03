@@ -18,12 +18,12 @@ mod semaphore;
 pub mod value;
 pub mod world;
 
-pub use chunk::CellMeta;
+pub use chunk::{CellMeta, ChangeKind};
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use schema::ColumnInfo;
 pub use value::{Value, ValueType};
 pub use world::{
-    CellEntry, Region, Stats, World, AXES, DEFAULT_CHUNK_DIM, DEFAULT_MAX_CACHED_CHUNKS,
-    DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM,
+    CellEntry, Change, Region, RemovedCells, Stats, World, AXES, DEFAULT_CHUNK_DIM,
+    DEFAULT_MAX_CACHED_CHUNKS, DEFAULT_MAX_CONCURRENT_DISK_OPS, WORLD_DIM,
 };

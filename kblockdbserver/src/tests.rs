@@ -425,6 +425,37 @@ async fn get_on_a_never_set_cell_is_404() {
 }
 
 #[tokio::test]
+async fn removing_a_cell_publishes_its_removal_time_and_nothing_when_absent() {
+    let (databases, _dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let mut published = hub.subscribe();
+    let app = router(test_state(databases).with_replication(hub));
+
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    published.try_recv().expect("the set is published");
+
+    let before = kblockdbcluster::hub::now_ms();
+    let (status, _) = send(app.clone(), delete("/rest/db/db/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let entry = published.try_recv().expect("the removal is published");
+    assert_eq!(entry.op, kblockdbcluster::wire::ChangeOp::Remove);
+    assert!(entry.modified_at_ms >= before);
+
+    // Nothing left to remove: nothing to replicate either.
+    let (status, _) = send(app, delete("/rest/db/db/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(published.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn set_then_get_a_cell_roundtrips() {
     let (app, _dir) = test_app();
 

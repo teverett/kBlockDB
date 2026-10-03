@@ -81,6 +81,7 @@ pub struct Databases {
     max_concurrent_disk_ops: Option<usize>,
     max_cached_chunks: Option<usize>,
     compression: bool,
+    tombstone_retention: Option<std::time::Duration>,
     open: Arc<Mutex<HashMap<String, Arc<World>>>>,
 }
 
@@ -92,6 +93,7 @@ impl Databases {
             max_concurrent_disk_ops: None,
             max_cached_chunks: None,
             compression: false,
+            tombstone_retention: None,
             open: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -111,6 +113,14 @@ impl Databases {
         self
     }
 
+    /// Makes every database keep tombstones for `retention` -- see
+    /// `World::with_tombstone_retention`. Set only when clustering is on;
+    /// `None` (the default) keeps none.
+    pub fn with_tombstone_retention(mut self, retention: Option<std::time::Duration>) -> Self {
+        self.tombstone_retention = retention;
+        self
+    }
+
     pub fn default_shape(&self) -> WorldShape {
         self.default_shape
     }
@@ -120,7 +130,9 @@ impl Databases {
     }
 
     fn apply_settings(&self, world: World) -> World {
-        let mut world = world.with_compression(self.compression);
+        let mut world = world
+            .with_compression(self.compression)
+            .with_tombstone_retention(self.tombstone_retention);
         if let Some(n) = self.max_concurrent_disk_ops {
             world = world.with_max_concurrent_disk_ops(n);
         }

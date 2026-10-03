@@ -29,16 +29,95 @@
 //! peers are never pruned: they're the operator's stated intent, and the
 //! seeds a node needs to rejoin. A pruned peer that comes back is simply
 //! relearned (it connects in, or a peer gossips it once connected).
-//! Nothing here is persisted; after a restart a server dials its
+//! The peer list isn't persisted; after a restart a server dials its
 //! configured peers and relearns the rest.
+//!
+//! **Catch-up.** Each peer's changes arrive on the connection *it* dials
+//! in (`server::serve`). Right after `HelloOk` the accepting side sends
+//! `CatchUpRequest{since_ms}`: its *watermark* for that peer minus a
+//! safety margin (`with_catch_up_margin`). The sending side replies with
+//! every change it holds since then (from the embedder's `ChangeSource`,
+//! as ordinary `ChangeBatch` frames interleaved with live ones), then
+//! `Synced{through_ms}`; while the link stays up and idle it repeats
+//! `Synced` every few seconds. The watermark is the latest `through_ms` a
+//! peer has sent -- in the *sender's* clock, so skew between the two
+//! nodes doesn't matter -- and it only moves when the sender confirms, so
+//! a link that drops mid-catch-up just asks again from the old one next
+//! time. Watermarks are persisted (`with_watermarks`), so a restarted
+//! server picks up where it left off; a peer with no watermark (a new
+//! node, or one never synced with) gets everything (`since_ms` 0). Every
+//! peer is asked, not just one, and last-write-wins makes the overlap
+//! harmless. The margin covers what the watermark can't: a write in
+//! flight between being stored and being published, and a third node's
+//! clock running slow.
 
 use crate::client::{self, ConnectionStatus};
 use crate::hub::ReplicationHub;
 use crate::socket::Keepalive;
+use crate::source::ChangeSource;
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::io;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::watch;
+
+/// `with_catch_up_margin`'s default.
+pub const DEFAULT_CATCH_UP_MARGIN: Duration = Duration::from_secs(60);
+
+/// Per-peer watermarks (see the module doc's "Catch-up"), optionally
+/// backed by a file of `address\tthrough_ms` lines.
+#[derive(Default)]
+struct Watermarks {
+    path: Option<PathBuf>,
+    marks: BTreeMap<String, u64>,
+}
+
+impl Watermarks {
+    fn load(path: &Path) -> io::Result<Self> {
+        let mut marks = BTreeMap::new();
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                for line in text.lines().filter(|l| !l.trim().is_empty()) {
+                    match line.split_once('\t').map(|(a, ms)| (a, ms.parse::<u64>())) {
+                        Some((address, Ok(ms))) => {
+                            marks.insert(address.to_string(), ms);
+                        }
+                        _ => eprintln!(
+                            "peer protocol: ignoring malformed line in {}: {line:?}",
+                            path.display()
+                        ),
+                    }
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(Watermarks {
+            path: Some(path.to_path_buf()),
+            marks,
+        })
+    }
+
+    /// Writes every mark to `path` (if any) via a temp file and a rename,
+    /// so a crash mid-write leaves the previous file intact.
+    fn save(&self) -> io::Result<()> {
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let text: String = self
+            .marks
+            .iter()
+            .map(|(address, ms)| format!("{address}\t{ms}\n"))
+            .collect();
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, text)?;
+        std::fs::rename(&tmp, path)
+    }
+}
 
 /// What this process tells every peer about itself in `Hello` -- shared by
 /// every `client::run` task, and checked against by `server::serve`.
@@ -81,6 +160,11 @@ pub struct PeerSet {
     /// Bumped on every change worth re-gossiping (a peer added, dropped,
     /// or newly connected); each link watches it.
     changes: Arc<watch::Sender<u64>>,
+    /// Where a catch-up a peer asks for is read from -- see
+    /// `with_change_source`.
+    change_source: Option<Arc<dyn ChangeSource>>,
+    watermarks: Arc<Mutex<Watermarks>>,
+    catch_up_margin: Duration,
 }
 
 impl PeerSet {
@@ -92,7 +176,90 @@ impl PeerSet {
             hub,
             keepalive: Keepalive::default(),
             changes: Arc::new(watch::channel(0).0),
+            change_source: None,
+            watermarks: Arc::new(Mutex::new(Watermarks::default())),
+            catch_up_margin: DEFAULT_CATCH_UP_MARGIN,
         }
+    }
+
+    /// Lets this process answer peers' `CatchUpRequest`s from `source`.
+    /// Without one, requests are ignored (and logged): peers then only
+    /// ever get live changes from this process. Call before adding any
+    /// peer, like `with_keepalive`.
+    pub fn with_change_source(mut self, source: Arc<dyn ChangeSource>) -> Self {
+        self.change_source = Some(source);
+        self
+    }
+
+    pub(crate) fn change_source(&self) -> Option<&Arc<dyn ChangeSource>> {
+        self.change_source.as_ref()
+    }
+
+    /// Loads per-peer watermarks from `path` (a missing file means none
+    /// yet) and saves them there as they advance. Without this they're
+    /// kept in memory only, so every restart catches up from scratch.
+    pub fn with_watermarks(self, path: impl AsRef<Path>) -> io::Result<Self> {
+        *self.watermarks.lock().unwrap() = Watermarks::load(path.as_ref())?;
+        Ok(self)
+    }
+
+    /// How far before its watermark a catch-up request starts -- see the
+    /// module doc. Defaults to `DEFAULT_CATCH_UP_MARGIN`.
+    pub fn with_catch_up_margin(mut self, margin: Duration) -> Self {
+        self.catch_up_margin = margin;
+        self
+    }
+
+    pub fn catch_up_margin(&self) -> Duration {
+        self.catch_up_margin
+    }
+
+    /// The latest `Synced{through_ms}` `address` has sent, or 0 if none.
+    pub fn watermark(&self, address: &str) -> u64 {
+        self.watermarks
+            .lock()
+            .unwrap()
+            .marks
+            .get(address)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Where the next catch-up from `address` should start: its watermark
+    /// minus the margin (0 -- everything -- if there's no watermark).
+    pub(crate) fn catch_up_since(&self, address: &str) -> u64 {
+        let margin = u64::try_from(self.catch_up_margin.as_millis()).unwrap_or(u64::MAX);
+        self.watermark(address).saturating_sub(margin)
+    }
+
+    /// Advances `address`'s watermark to `through_ms` (never backwards)
+    /// and saves it, if `with_watermarks` gave a file.
+    pub fn record_synced(&self, address: &str, through_ms: u64) {
+        let mut watermarks = self.watermarks.lock().unwrap();
+        let mark = watermarks.marks.entry(address.to_string()).or_insert(0);
+        if through_ms <= *mark {
+            return;
+        }
+        *mark = through_ms;
+        if let Err(e) = watermarks.save() {
+            eprintln!("peer protocol: couldn't save watermarks: {e}");
+        }
+    }
+
+    /// Peers whose watermark is older than `age` -- a catch-up from them
+    /// can no longer be trusted to include every delete once tombstones
+    /// that old have been purged. For an embedder's startup warning.
+    pub fn stale_watermarks(&self, age: Duration) -> Vec<(String, u64)> {
+        let age_ms = u64::try_from(age.as_millis()).unwrap_or(u64::MAX);
+        let cutoff = crate::hub::now_ms().saturating_sub(age_ms);
+        self.watermarks
+            .lock()
+            .unwrap()
+            .marks
+            .iter()
+            .filter(|(_, &ms)| ms > 0 && ms < cutoff)
+            .map(|(address, &ms)| (address.clone(), ms))
+            .collect()
     }
 
     /// Replaces the default TCP keepalive settings. Call before adding any
@@ -305,6 +472,82 @@ mod tests {
     #[test]
     fn a_fresh_set_is_empty() {
         assert!(peer_set().snapshot().is_empty());
+    }
+
+    struct TempFile(PathBuf);
+
+    impl TempFile {
+        fn new(tag: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            TempFile(std::env::temp_dir().join(format!(
+                "kblockdbcluster-{tag}-{}-{n}/watermarks",
+                std::process::id()
+            )))
+        }
+    }
+
+    impl Drop for TempFile {
+        fn drop(&mut self) {
+            if let Some(dir) = self.0.parent() {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+        }
+    }
+
+    #[test]
+    fn watermarks_start_at_zero_and_only_move_forward() {
+        let peers = peer_set();
+        assert_eq!(peers.watermark("10.0.0.2:8082"), 0);
+        peers.record_synced("10.0.0.2:8082", 500);
+        peers.record_synced("10.0.0.2:8082", 300);
+        assert_eq!(peers.watermark("10.0.0.2:8082"), 500);
+        assert_eq!(peers.watermark("10.0.0.3:8082"), 0);
+    }
+
+    #[test]
+    fn catch_up_starts_a_margin_before_the_watermark() {
+        let peers = peer_set().with_catch_up_margin(Duration::from_millis(100));
+        assert_eq!(peers.catch_up_since("10.0.0.2:8082"), 0);
+        peers.record_synced("10.0.0.2:8082", 50);
+        assert_eq!(peers.catch_up_since("10.0.0.2:8082"), 0);
+        peers.record_synced("10.0.0.2:8082", 1_000);
+        assert_eq!(peers.catch_up_since("10.0.0.2:8082"), 900);
+    }
+
+    #[test]
+    fn watermarks_persist_across_peer_sets() {
+        let file = TempFile::new("watermarks");
+        let peers = peer_set().with_watermarks(&file.0).unwrap();
+        assert_eq!(peers.watermark("10.0.0.2:8082"), 0);
+        peers.record_synced("10.0.0.2:8082", 1_234);
+        peers.record_synced("10.0.0.3:8082", 5_678);
+
+        let reloaded = peer_set().with_watermarks(&file.0).unwrap();
+        assert_eq!(reloaded.watermark("10.0.0.2:8082"), 1_234);
+        assert_eq!(reloaded.watermark("10.0.0.3:8082"), 5_678);
+    }
+
+    #[test]
+    fn malformed_watermark_lines_are_skipped() {
+        let file = TempFile::new("watermarks-malformed");
+        std::fs::create_dir_all(file.0.parent().unwrap()).unwrap();
+        std::fs::write(&file.0, "10.0.0.2:8082\t42\ngarbage\n10.0.0.3:8082\tnope\n").unwrap();
+        let peers = peer_set().with_watermarks(&file.0).unwrap();
+        assert_eq!(peers.watermark("10.0.0.2:8082"), 42);
+        assert_eq!(peers.watermark("10.0.0.3:8082"), 0);
+    }
+
+    #[test]
+    fn stale_watermarks_lists_only_old_ones() {
+        let peers = peer_set();
+        let now = crate::hub::now_ms();
+        peers.record_synced("old:1", now - 10_000);
+        peers.record_synced("fresh:1", now);
+        assert_eq!(
+            peers.stale_watermarks(Duration::from_secs(5)),
+            vec![("old:1".to_string(), now - 10_000)]
+        );
     }
 
     #[test]
