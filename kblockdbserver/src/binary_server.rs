@@ -21,6 +21,7 @@
 
 use crate::error::ApiError;
 use crate::state::{Account, AppState};
+use kblockdbcluster::hub::Stamper;
 use kblockdbserver::wire::{
     self, AggregateValue, Column, DatabaseShape, QueryResult, QueryRow, QueryValue, Request,
     Response,
@@ -242,22 +243,18 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Ok(db) => db.to_string(),
                 Err(response) => return response,
             };
-            let replication = state.replication.clone();
             let (db2, coord2, key2, value2) =
                 (db.clone(), coord.clone(), key.clone(), value.clone());
+            let stamper = Stamper::new(&state.replication);
+            let stamps = stamper.clone();
             match state
-                .with_database(&db, move |w| w.set(&coord, &key, value))
+                .with_database(&db, move |w| {
+                    w.set_stamped(&coord, &key, value, &mut || stamps.next())
+                })
                 .await
             {
-                Ok(meta) => {
-                    kblockdbcluster::hub::publish_set(
-                        &replication,
-                        &db2,
-                        &coord2,
-                        &key2,
-                        value2,
-                        meta,
-                    );
+                Ok((meta, stamp)) => {
+                    stamper.publish_set(&db2, &coord2, &key2, value2, meta, stamp);
                     Response::Ok
                 }
                 Err(e) => response_from_error(e),
@@ -268,23 +265,20 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Ok(db) => db.to_string(),
                 Err(response) => return response,
             };
-            let replication = state.replication.clone();
             let (db2, coord2, key2) = (db.clone(), coord.clone(), key.clone());
+            let stamper = Stamper::new(&state.replication);
+            let stamps = stamper.clone();
             match state
-                .with_database(&db, move |w| w.remove(&coord, &key))
+                .with_database(&db, move |w| {
+                    w.remove_stamped(&coord, &key, &mut || stamps.next())
+                })
                 .await
             {
-                Ok(removed_at) => {
+                Ok(removed) => {
                     // Only a value that was actually there is replicated, at
                     // the time `remove` recorded for it.
-                    if let Some(removed_at) = removed_at {
-                        kblockdbcluster::hub::publish_remove(
-                            &replication,
-                            &db2,
-                            &coord2,
-                            &key2,
-                            removed_at,
-                        );
+                    if let Some((removed_at, stamp)) = removed {
+                        stamper.publish_remove(&db2, &coord2, &key2, removed_at, stamp);
                     }
                     Response::Ok
                 }
@@ -345,23 +339,20 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Err(response) => return response,
             };
             let region = kblockdblib::Region::new(origin, extent);
-            let replication = state.replication.clone();
             let (db2, region2, key2, values2) =
                 (db.clone(), region.clone(), key.clone(), values.clone());
+            let stamper = Stamper::new(&state.replication);
+            let stamps = stamper.clone();
             match state
-                .with_database(&db, move |w| w.set_region(&region, &key, &values))
+                .with_database(&db, move |w| {
+                    w.set_region_stamped(&region, &key, &values, &mut || stamps.next())
+                })
                 .await
             {
-                Ok(metas) => {
-                    for ((coord, value), meta) in region2.iter().zip(values2).zip(metas) {
-                        kblockdbcluster::hub::publish_set(
-                            &replication,
-                            &db2,
-                            &coord,
-                            &key2,
-                            value,
-                            meta,
-                        );
+                Ok(written) => {
+                    for ((coord, value), (meta, stamp)) in region2.iter().zip(values2).zip(written)
+                    {
+                        stamper.publish_set(&db2, &coord, &key2, value, meta, stamp);
                     }
                     Response::Ok
                 }
@@ -378,21 +369,18 @@ async fn handle_request(req: Request, state: &AppState, session: &mut Session) -
                 Err(response) => return response,
             };
             let region = kblockdblib::Region::new(origin, extent);
-            let replication = state.replication.clone();
             let (db2, key2) = (db.clone(), key.clone());
+            let stamper = Stamper::new(&state.replication);
+            let stamps = stamper.clone();
             match state
-                .with_database(&db, move |w| w.remove_region(&region, &key))
+                .with_database(&db, move |w| {
+                    w.remove_region_stamped(&region, &key, &mut || stamps.next())
+                })
                 .await
             {
                 Ok(removed) => {
-                    for coord in &removed.coords {
-                        kblockdbcluster::hub::publish_remove(
-                            &replication,
-                            &db2,
-                            coord,
-                            &key2,
-                            removed.at_ms,
-                        );
+                    for (coord, stamp) in &removed.cells {
+                        stamper.publish_remove(&db2, coord, &key2, removed.at_ms, *stamp);
                     }
                     Response::Ok
                 }

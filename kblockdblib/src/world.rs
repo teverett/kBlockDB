@@ -4,6 +4,7 @@ pub use crate::coord::Coord;
 use crate::params::WorldParams;
 use crate::schema::{ColumnInfo, Schema};
 use crate::semaphore::Semaphore;
+use crate::stamp::{Stamp, VersionVector};
 use crate::value::{Value, ValueType};
 use std::collections::HashMap;
 use std::fs::{self, File};
@@ -332,24 +333,25 @@ pub struct CellEntry {
     pub values: Vec<(String, Value, CellMeta)>,
 }
 
-/// One cell/key changed after a given time, as reported by
-/// `World::changes_since`: its current value and metadata, or when it was
-/// removed.
+/// One cell/key's current state, as reported by `World::changes_since`
+/// (or handed to `World::apply_changes`): its value and metadata, or when
+/// it was removed -- plus who made that write.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Change {
     pub coord: Coord,
     pub key: String,
     pub kind: ChangeKind,
+    pub stamp: Stamp,
 }
 
 /// What `World::remove_region` actually removed: the time recorded for
 /// the removal (also every tombstone's time, when tombstones are kept),
-/// and the coordinates that held a value for the key -- cells that were
-/// already empty aren't listed.
+/// and each cell that held a value for the key, with the stamp its
+/// removal got -- cells that were already empty aren't listed.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RemovedCells {
     pub at_ms: u64,
-    pub coords: Vec<Coord>,
+    pub cells: Vec<(Coord, Stamp)>,
 }
 
 pub struct World {
@@ -817,34 +819,41 @@ impl World {
         Ok(cells)
     }
 
-    /// Every cell/key whose value was set, or which was removed (see
-    /// `with_tombstone_retention`), strictly after `since_ms`, handed to
-    /// `emit` one chunk's worth at a time. `emit` returning `false` stops
-    /// the walk early. This is what a replication peer's catch-up is
-    /// built from.
+    /// Every value and tombstone (see `with_tombstone_retention`) whose
+    /// stamp `known` doesn't cover -- every write the holder of `known`
+    /// hasn't seen -- handed to `emit` one chunk's worth at a time. `emit`
+    /// returning `false` stops the walk early. This is what a replication
+    /// peer's catch-up is built from.
     ///
-    /// Cheaper than `list_cells` for a recent `since_ms`: each chunk
-    /// file's header records the newest change in it, so a chunk with
-    /// nothing newer is skipped after reading a few bytes, without being
-    /// decoded. A chunk that does need reading goes through the cache
-    /// (like `get`), so it never sees a file mid-write. Old-format files
-    /// (no header) are always read.
+    /// Cheaper than `list_cells` when `known` is close to current: each
+    /// chunk file's header records the highest seq per origin stored in
+    /// it, so a chunk `known` already covers is skipped after reading a
+    /// few bytes, without being decoded. A chunk that does need reading
+    /// goes through the cache (like `get`), so it never sees a file
+    /// mid-write. Older-format files are always read.
+    ///
+    /// Legacy (`Stamp::NONE`) data counts as written by `legacy_origin`
+    /// -- the caller's `stamp::legacy_origin(node_id)` -- so it's sent only
+    /// when `known` lacks that entry. It's still reported with its real
+    /// stamp, `Stamp::NONE`.
     pub fn changes_since(
         &self,
-        since_ms: u64,
+        known: &VersionVector,
+        legacy_origin: u64,
         mut emit: impl FnMut(Vec<Change>) -> bool,
     ) -> io::Result<()> {
+        let legacy = Stamp::new(legacy_origin, 0);
         let mut chunk_keys = Vec::new();
         collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
         for ckey in &chunk_keys {
             // Any error peeking (a file being rewritten, or deleted, right
             // now) just means "can't tell" -- fall through to a real read.
-            if let Ok(Some(newest)) = self.peek_newest_ms(ckey) {
-                if newest <= since_ms {
+            if let Ok(Some(max_seq)) = self.peek_max_seq(ckey) {
+                if chunk::covers_max_seq(known, &max_seq, legacy) {
                     continue;
                 }
             }
-            let changes = self.with_chunk_read(ckey, |chunk| chunk.changes_since(since_ms))?;
+            let changes = self.with_chunk_read(ckey, |chunk| chunk.changes_since(known, legacy))?;
             if changes.is_empty() {
                 continue;
             }
@@ -854,11 +863,12 @@ impl World {
                     .into_iter()
                     // A removed column's leftovers aren't reported -- see
                     // `list_cells`.
-                    .filter_map(|(local_idx, key_id, kind)| {
+                    .filter_map(|(local_idx, key_id, kind, stamp)| {
                         Some(Change {
                             coord: self.unsplit(ckey, local_idx),
                             key: schema.key_for_id(key_id)?.to_string(),
                             kind,
+                            stamp,
                         })
                     })
                     .collect()
@@ -870,14 +880,14 @@ impl World {
         Ok(())
     }
 
-    /// Chunk `ckey`'s `newest_ms` from its file header alone (see
-    /// `Chunk::read_newest_ms`): `Some(0)` if there's no file, `None` for
-    /// an old-format file.
-    fn peek_newest_ms(&self, ckey: &ChunkKey) -> io::Result<Option<u64>> {
+    /// Chunk `ckey`'s `max_seq` from its file header alone (see
+    /// `Chunk::read_max_seq`): empty if there's no file, `None` for an
+    /// older-format file.
+    fn peek_max_seq(&self, ckey: &ChunkKey) -> io::Result<Option<VersionVector>> {
         let _permit = self.disk_io.acquire();
         let f = match File::open(self.chunk_path(ckey)) {
             Ok(f) => f,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(0)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Some(VersionVector::new())),
             Err(e) => return Err(e),
         };
         let mut r = BufReader::new(f);
@@ -886,9 +896,9 @@ impl World {
         let compressed = head[..head_len] == ZSTD_MAGIC;
         let mut r = io::Cursor::new(&head[..head_len]).chain(r);
         if compressed {
-            Chunk::read_newest_ms(&mut zstd::stream::read::Decoder::new(r)?)
+            Chunk::read_max_seq(&mut zstd::stream::read::Decoder::new(r)?)
         } else {
-            Chunk::read_newest_ms(&mut r)
+            Chunk::read_max_seq(&mut r)
         }
     }
 
@@ -1159,6 +1169,20 @@ impl World {
     /// ship the exact metadata a peer should apply, rather than needing a
     /// second lookup.
     pub fn set(&self, coord: &[i32], key: &str, value: Value) -> io::Result<CellMeta> {
+        Ok(self.set_stamped(coord, key, value, &mut || Stamp::NONE)?.0)
+    }
+
+    /// `set`, with the write's origin taken from `stamp` -- called exactly
+    /// once if the write happens, not at all if it fails before writing.
+    /// Returns the stamp alongside the `CellMeta`, for a replicating
+    /// caller to ship.
+    pub fn set_stamped(
+        &self,
+        coord: &[i32],
+        key: &str,
+        value: Value,
+        stamp: &mut dyn FnMut() -> Stamp,
+    ) -> io::Result<(CellMeta, Stamp)> {
         // Validate the coordinate before interning `key`: a failed `set`
         // shouldn't have the side effect of permanently registering a new
         // key that was never actually written anywhere.
@@ -1168,7 +1192,13 @@ impl World {
         // before touching any chunk, as a normal `InvalidInput` error.
         let key_id = self.schema().intern(key, value.value_type())?;
         let now_ms = now_ms();
-        self.with_chunk_write(&ckey, |chunk| chunk.set(local_idx, key_id, value, now_ms))
+        self.with_chunk_write(&ckey, |chunk| {
+            let stamp = stamp();
+            (
+                chunk.set_stamped(local_idx, key_id, value, now_ms, stamp),
+                stamp,
+            )
+        })
     }
 
     /// Applies a replicated write -- `value`/`meta` as reported by the
@@ -1196,10 +1226,23 @@ impl World {
         value: Value,
         meta: CellMeta,
     ) -> io::Result<bool> {
+        self.apply_replicated_stamped(coord, key, value, meta, Stamp::NONE)
+    }
+
+    /// `apply_replicated`, recording the write's origin `stamp` -- which
+    /// also breaks a tie between equal `modified_at_ms` (see `Stamp`).
+    pub fn apply_replicated_stamped(
+        &self,
+        coord: &[i32],
+        key: &str,
+        value: Value,
+        meta: CellMeta,
+        stamp: Stamp,
+    ) -> io::Result<bool> {
         let (ckey, local_idx) = self.split(coord)?;
         let key_id = self.schema().intern(key, value.value_type())?;
         self.with_chunk_maybe_write(&ckey, |chunk| {
-            let wins = apply_set_if_newer(chunk, local_idx, key_id, value, meta);
+            let wins = apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp);
             (wins, wins)
         })
     }
@@ -1220,14 +1263,31 @@ impl World {
         key: &str,
         modified_at_ms: u64,
     ) -> io::Result<bool> {
+        self.apply_replicated_remove_stamped(coord, key, modified_at_ms, Stamp::NONE)
+    }
+
+    /// `apply_replicated_remove`, recording the removal's origin `stamp`.
+    pub fn apply_replicated_remove_stamped(
+        &self,
+        coord: &[i32],
+        key: &str,
+        modified_at_ms: u64,
+        stamp: Stamp,
+    ) -> io::Result<bool> {
         let (ckey, local_idx) = self.split(coord)?;
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(false); // never interned anywhere: nothing to remove
         };
         let keep_tombstones = self.tombstone_retention.is_some();
         self.with_chunk_maybe_write(&ckey, |chunk| {
-            let wins =
-                apply_remove_if_newer(chunk, local_idx, key_id, modified_at_ms, keep_tombstones);
+            let wins = apply_remove_if_newer(
+                chunk,
+                local_idx,
+                key_id,
+                modified_at_ms,
+                stamp,
+                keep_tombstones,
+            );
             (wins, wins)
         })
     }
@@ -1243,7 +1303,7 @@ impl World {
         let mut results: Vec<Option<io::Result<bool>>> = (0..changes.len()).map(|_| None).collect();
         // Chunks in first-touched order; each one's changes in input order.
         let mut chunk_order: Vec<ChunkKey> = Vec::new();
-        let mut by_chunk: HashMap<ChunkKey, Vec<(usize, usize, u32, ChangeKind)>> = HashMap::new();
+        let mut by_chunk: HashMap<ChunkKey, Vec<PendingChange>> = HashMap::new();
         for (i, change) in changes.into_iter().enumerate() {
             let (ckey, local_idx) = match self.split(&change.coord) {
                 Ok(split) => split,
@@ -1278,7 +1338,7 @@ impl World {
                     chunk_order.push(ckey);
                     Vec::new()
                 })
-                .push((i, local_idx, key_id, change.kind));
+                .push((i, local_idx, key_id, change.kind, change.stamp));
         }
 
         let keep_tombstones = self.tombstone_retention.is_some();
@@ -1288,13 +1348,18 @@ impl World {
             let applied = self.with_chunk_maybe_write(&ckey, |chunk| {
                 let applied: Vec<bool> = group
                     .into_iter()
-                    .map(|(_, local_idx, key_id, kind)| match kind {
+                    .map(|(_, local_idx, key_id, kind, stamp)| match kind {
                         ChangeKind::Set(value, meta) => {
-                            apply_set_if_newer(chunk, local_idx, key_id, value, meta)
+                            apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp)
                         }
-                        ChangeKind::Removed(at_ms) => {
-                            apply_remove_if_newer(chunk, local_idx, key_id, at_ms, keep_tombstones)
-                        }
+                        ChangeKind::Removed(at_ms) => apply_remove_if_newer(
+                            chunk,
+                            local_idx,
+                            key_id,
+                            at_ms,
+                            stamp,
+                            keep_tombstones,
+                        ),
                     })
                     .collect();
                 let changed = applied.iter().any(|&a| a);
@@ -1324,6 +1389,21 @@ impl World {
     /// `with_tombstone_retention`), and the timestamp a replicating caller
     /// should ship -- or `None` if there was no value to remove.
     pub fn remove(&self, coord: &[i32], key: &str) -> io::Result<Option<u64>> {
+        Ok(self
+            .remove_stamped(coord, key, &mut || Stamp::NONE)?
+            .map(|(at_ms, _)| at_ms))
+    }
+
+    /// `remove`, with the removal's origin taken from `stamp` -- called
+    /// exactly once if there was a value to remove, not at all otherwise.
+    /// Returns the removal time and stamp, for a replicating caller to
+    /// ship.
+    pub fn remove_stamped(
+        &self,
+        coord: &[i32],
+        key: &str,
+        stamp: &mut dyn FnMut() -> Stamp,
+    ) -> io::Result<Option<(u64, Stamp)>> {
         // See `get`: validate the coordinate before the key-existence
         // short-circuit, so a bad coordinate is never silently absorbed
         // into remove's usual "unknown key is a harmless no-op" behavior.
@@ -1341,15 +1421,12 @@ impl World {
         let at_ms = now_ms();
         let keep_tombstones = self.tombstone_retention.is_some();
         let removed = self.with_chunk_maybe_write(&ckey, |chunk| {
-            let removed = if keep_tombstones {
-                chunk.remove_with_tombstone(local_idx, key_id, at_ms)
-            } else {
-                chunk.remove(local_idx, key_id)
-            };
-            (removed, removed)
+            let removed = remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp);
+            let changed = removed.is_some();
+            (removed, changed)
         })?;
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
-        Ok(removed.then_some(at_ms))
+        Ok(removed.map(|stamp| (at_ms, stamp)))
     }
 
     /// Checks that `region`'s origin and extent both have this world's axis
@@ -1448,6 +1525,23 @@ impl World {
         key: &str,
         values: &[Value],
     ) -> io::Result<Vec<CellMeta>> {
+        Ok(self
+            .set_region_stamped(region, key, values, &mut || Stamp::NONE)?
+            .into_iter()
+            .map(|(meta, _)| meta)
+            .collect())
+    }
+
+    /// `set_region`, with each cell's write stamped by a call to `stamp`
+    /// (once per cell written). Returns each cell's `CellMeta` and stamp,
+    /// in the same order as `values`.
+    pub fn set_region_stamped(
+        &self,
+        region: &Region,
+        key: &str,
+        values: &[Value],
+        stamp: &mut dyn FnMut() -> Stamp,
+    ) -> io::Result<Vec<(CellMeta, Stamp)>> {
         self.check_region(region)?;
         let volume = region.volume() as usize;
         if values.len() != volume {
@@ -1477,17 +1571,23 @@ impl World {
         let key_id = self.schema().intern(key, value_type)?;
         let now_ms = now_ms();
         let mut metas = vec![
-            CellMeta {
-                created_at_ms: 0,
-                modified_at_ms: 0,
-                version: 0
-            };
+            (
+                CellMeta {
+                    created_at_ms: 0,
+                    modified_at_ms: 0,
+                    version: 0
+                },
+                Stamp::NONE
+            );
             volume
         ];
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             self.with_chunk_write(&ckey, |chunk| {
                 for (i, local_idx) in cells {
-                    metas[i] = chunk.set(local_idx, key_id, values[i].clone(), now_ms);
+                    let stamp = stamp();
+                    let meta =
+                        chunk.set_stamped(local_idx, key_id, values[i].clone(), now_ms, stamp);
+                    metas[i] = (meta, stamp);
                 }
             })?;
         }
@@ -1504,11 +1604,22 @@ impl World {
     /// `kblockdblib.log`. Reports which cells actually held a value (see
     /// `RemovedCells`); every removal shares one timestamp.
     pub fn remove_region(&self, region: &Region, key: &str) -> io::Result<RemovedCells> {
+        self.remove_region_stamped(region, key, &mut || Stamp::NONE)
+    }
+
+    /// `remove_region`, with each removal stamped by a call to `stamp`
+    /// (once per cell that held a value).
+    pub fn remove_region_stamped(
+        &self,
+        region: &Region,
+        key: &str,
+        stamp: &mut dyn FnMut() -> Stamp,
+    ) -> io::Result<RemovedCells> {
         self.check_region(region)?;
         let at_ms = now_ms();
         let mut removed = RemovedCells {
             at_ms,
-            coords: Vec::new(),
+            cells: Vec::new(),
         };
         if region.volume() == 0 {
             return Ok(removed);
@@ -1522,30 +1633,26 @@ impl World {
         let keep_tombstones = self.tombstone_retention.is_some();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             let removed_here = self.with_chunk_maybe_write(&ckey, |chunk| {
-                let removed_here: Vec<usize> = cells
+                let removed_here: Vec<(usize, Stamp)> = cells
                     .into_iter()
-                    .map(|(_, local_idx)| local_idx)
-                    .filter(|&local_idx| {
-                        if keep_tombstones {
-                            chunk.remove_with_tombstone(local_idx, key_id, at_ms)
-                        } else {
-                            chunk.remove(local_idx, key_id)
-                        }
+                    .filter_map(|(_, local_idx)| {
+                        remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp)
+                            .map(|stamp| (local_idx, stamp))
                     })
                     .collect();
                 let changed = !removed_here.is_empty();
                 (removed_here, changed)
             })?;
-            removed.coords.extend(
+            removed.cells.extend(
                 removed_here
                     .into_iter()
-                    .map(|local_idx| self.unsplit(&ckey, local_idx)),
+                    .map(|(local_idx, stamp)| (self.unsplit(&ckey, local_idx), stamp)),
             );
         }
         crate::logger::info(format!(
             "removed region {region:?} key '{key}' ({} cells, {} held a value)",
             region.volume(),
-            removed.coords.len()
+            removed.cells.len()
         ));
         Ok(removed)
     }
@@ -1571,26 +1678,40 @@ impl World {
     }
 }
 
-/// Last-write-wins for a replicated set: applies it if it's newer than
-/// this cell/key's current value, or its tombstone. Returns whether it
-/// was applied. Shared by `apply_replicated` and `apply_changes`.
+/// One change in `World::apply_changes`, resolved against its chunk:
+/// (input index, local cell index, key id, the change, its stamp).
+type PendingChange = (usize, usize, u32, ChangeKind, Stamp);
+
+/// What last-write-wins compares a cell/key's current state by: when it
+/// was last written (a value's `modified_at_ms`, or a tombstone's removal
+/// time) then, to break a tie the same way on every node, the write's
+/// stamp. `None` if there's neither a value nor a tombstone.
+fn current_version(chunk: &Chunk, local_idx: usize, key_id: u32) -> Option<(u64, Stamp)> {
+    match chunk.get_meta(local_idx, key_id) {
+        Some(meta) => Some((
+            meta.modified_at_ms,
+            chunk.stamp_at(local_idx, key_id).unwrap_or_default(),
+        )),
+        None => chunk.tombstone_at(local_idx, key_id),
+    }
+}
+
+/// Last-write-wins for a replicated set: applies it if `(modified_at_ms,
+/// stamp)` is newer than this cell/key's current value or tombstone.
+/// Returns whether it was applied. Shared by `apply_replicated` and
+/// `apply_changes`.
 fn apply_set_if_newer(
     chunk: &mut Chunk,
     local_idx: usize,
     key_id: u32,
     value: Value,
     meta: CellMeta,
+    stamp: Stamp,
 ) -> bool {
-    let wins = match (
-        chunk.get_meta(local_idx, key_id),
-        chunk.tombstone_at(local_idx, key_id),
-    ) {
-        (Some(existing), _) => meta.modified_at_ms > existing.modified_at_ms,
-        (None, Some(removed_at)) => meta.modified_at_ms > removed_at,
-        (None, None) => true,
-    };
+    let wins = current_version(chunk, local_idx, key_id)
+        .is_none_or(|current| (meta.modified_at_ms, stamp) > current);
     if wins {
-        chunk.set_with_meta(local_idx, key_id, value, meta);
+        chunk.set_replicated(local_idx, key_id, value, meta, stamp);
     }
     wins
 }
@@ -1602,23 +1723,41 @@ fn apply_remove_if_newer(
     local_idx: usize,
     key_id: u32,
     modified_at_ms: u64,
+    stamp: Stamp,
     keep_tombstones: bool,
 ) -> bool {
-    let wins = match (
-        chunk.get_meta(local_idx, key_id),
-        chunk.tombstone_at(local_idx, key_id),
-    ) {
-        (Some(existing), _) => modified_at_ms > existing.modified_at_ms,
-        (None, Some(removed_at)) => modified_at_ms > removed_at,
-        (None, None) => keep_tombstones,
+    let wins = match current_version(chunk, local_idx, key_id) {
+        Some(current) => (modified_at_ms, stamp) > current,
+        None => keep_tombstones,
     };
     if wins {
         chunk.remove(local_idx, key_id);
         if keep_tombstones {
-            chunk.put_tombstone(local_idx, key_id, modified_at_ms);
+            chunk.put_tombstone(local_idx, key_id, modified_at_ms, stamp);
         }
     }
     wins
+}
+
+/// A local removal: removes the value (leaving a tombstone if the world
+/// keeps them) and, only if there was one, takes a stamp for it --
+/// returned for the caller to replicate.
+fn remove_stamping(
+    chunk: &mut Chunk,
+    local_idx: usize,
+    key_id: u32,
+    at_ms: u64,
+    keep_tombstones: bool,
+    stamp: &mut dyn FnMut() -> Stamp,
+) -> Option<Stamp> {
+    if !chunk.remove(local_idx, key_id) {
+        return None;
+    }
+    let stamp = stamp();
+    if keep_tombstones {
+        chunk.put_tombstone(local_idx, key_id, at_ms, stamp);
+    }
+    Some(stamp)
 }
 
 /// Recursively walks `dir` (a world's `root`, or one of its nested
@@ -4119,7 +4258,7 @@ mod tests {
             .unwrap());
         // ... and the chunk file is gone after the remove, as before.
         let mut seen = 0;
-        w.changes_since(0, |batch| {
+        w.changes_since(&VersionVector::new(), LEGACY, |batch| {
             seen += batch.len();
             true
         })
@@ -4211,13 +4350,13 @@ mod tests {
             .unwrap();
         let region = Region::new(coord3(0, 0, 0), coord3(64, 1, 1));
         let removed = w.remove_region(&region, "material").unwrap();
-        let mut coords = removed.coords.clone();
+        let mut coords: Vec<Coord> = removed.cells.iter().map(|(c, _)| c.clone()).collect();
         coords.sort_by(|a, b| a.iter().cmp(b.iter()));
         assert_eq!(coords, vec![coord3(0, 0, 0), coord3(40, 0, 0)]);
         assert!(removed.at_ms > 0);
 
         let mut tombstones = Vec::new();
-        w.changes_since(0, |batch| {
+        w.changes_since(&VersionVector::new(), LEGACY, |batch| {
             tombstones.extend(batch);
             true
         })
@@ -4230,13 +4369,22 @@ mod tests {
         assert!(w
             .remove_region(&region, "material")
             .unwrap()
-            .coords
+            .cells
             .is_empty());
     }
 
-    fn all_changes_since(w: &World, since_ms: u64) -> Vec<Change> {
+    const A: u64 = 0xA;
+    const B: u64 = 0xB;
+    /// The legacy pseudo-origin these tests' worlds report as.
+    const LEGACY: u64 = 0xC | crate::stamp::LEGACY_BIT;
+
+    fn vector(entries: &[(u64, u64)]) -> VersionVector {
+        entries.iter().copied().collect()
+    }
+
+    fn all_changes_since(w: &World, known: &VersionVector) -> Vec<Change> {
         let mut out = Vec::new();
-        w.changes_since(since_ms, |batch| {
+        w.changes_since(known, LEGACY, |batch| {
             out.extend(batch);
             true
         })
@@ -4245,95 +4393,217 @@ mod tests {
         out
     }
 
+    /// A stamp source handing out `origin`'s seqs from `next`, recording
+    /// how many it handed out.
+    fn stamps_from(origin: u64, next: &mut u64) -> impl FnMut() -> Stamp + '_ {
+        move || {
+            *next += 1;
+            Stamp::new(origin, *next - 1)
+        }
+    }
+
     #[test]
-    fn changes_since_reports_newer_sets_and_removes_by_key_name() {
+    fn stamped_writes_take_a_stamp_only_for_what_they_actually_write() {
+        let dir = TempDir::new("stamped-writes");
+        let w = create_with_tombstones(&dir);
+        let mut next = 1;
+        let (_, stamp) = w
+            .set_stamped(
+                &coord3(1, 0, 0),
+                "k",
+                Value::I64(1),
+                &mut stamps_from(A, &mut next),
+            )
+            .unwrap();
+        assert_eq!(stamp, Stamp::new(A, 1));
+
+        // A type mismatch fails before writing: no stamp taken.
+        assert!(w
+            .set_stamped(
+                &coord3(2, 0, 0),
+                "k",
+                Value::Bool(true),
+                &mut stamps_from(A, &mut next)
+            )
+            .is_err());
+        assert_eq!(next, 2);
+
+        // Removing an empty cell takes none; removing a value takes one.
+        assert_eq!(
+            w.remove_stamped(&coord3(9, 0, 0), "k", &mut stamps_from(A, &mut next))
+                .unwrap(),
+            None
+        );
+        let (_, stamp) = w
+            .remove_stamped(&coord3(1, 0, 0), "k", &mut stamps_from(A, &mut next))
+            .unwrap()
+            .unwrap();
+        assert_eq!(stamp, Stamp::new(A, 2));
+
+        let region = Region::new(coord3(0, 0, 0), coord3(3, 1, 1));
+        let written = w
+            .set_region_stamped(
+                &region,
+                "k",
+                &vec![Value::I64(7); 3],
+                &mut stamps_from(A, &mut next),
+            )
+            .unwrap();
+        let mut seqs: Vec<u64> = written.iter().map(|(_, s)| s.seq).collect();
+        seqs.sort();
+        assert_eq!(seqs, vec![3, 4, 5]);
+
+        w.remove(&coord3(1, 0, 0), "k").unwrap();
+        let removed = w
+            .remove_region_stamped(&region, "k", &mut stamps_from(A, &mut next))
+            .unwrap();
+        assert_eq!(removed.cells.len(), 2);
+        assert_eq!(next, 8);
+    }
+
+    #[test]
+    fn equal_timestamps_are_broken_by_stamp_the_same_in_either_order() {
+        let c = coord3(1, 0, 0);
+        let first = (Value::Str("from-a".into()), Stamp::new(A, 7));
+        let second = (Value::Str("from-b".into()), Stamp::new(B, 1));
+        for (tag, order) in [("ab", [&first, &second]), ("ba", [&second, &first])] {
+            let dir = TempDir::new(&format!("tie-break-{tag}"));
+            let w = create_with_tombstones(&dir);
+            for (value, stamp) in order {
+                w.apply_replicated_stamped(&c, "k", value.clone(), meta_at(100), *stamp)
+                    .unwrap();
+            }
+            // B > A as an origin, so B's write wins at the same ms.
+            assert_eq!(w.get(&c, "k").unwrap(), Some(Value::Str("from-b".into())));
+        }
+    }
+
+    #[test]
+    fn a_removal_at_the_same_ms_is_ordered_by_stamp_too() {
+        let dir = TempDir::new("tie-break-remove");
+        let w = create_with_tombstones(&dir);
+        let c = coord3(1, 0, 0);
+        w.apply_replicated_stamped(&c, "k", Value::I64(1), meta_at(100), Stamp::new(B, 1))
+            .unwrap();
+        assert!(!w
+            .apply_replicated_remove_stamped(&c, "k", 100, Stamp::new(A, 1))
+            .unwrap());
+        assert!(w
+            .apply_replicated_remove_stamped(&c, "k", 100, Stamp::new(B, 2))
+            .unwrap());
+        assert_eq!(w.get(&c, "k").unwrap(), None);
+    }
+
+    #[test]
+    fn changes_since_reports_what_the_vector_lacks_by_key_name() {
         let dir = TempDir::new("changes-since");
         let w = create_with_tombstones(&dir);
-        w.apply_replicated(
+        w.apply_replicated_stamped(
             &coord3(1, 0, 0),
             "material",
             Value::Str("old".into()),
             meta_at(100),
+            Stamp::new(A, 1),
         )
         .unwrap();
-        w.apply_replicated(
+        w.apply_replicated_stamped(
             &coord3(2, 0, 0),
             "material",
             Value::Str("new".into()),
             meta_at(300),
+            Stamp::new(A, 2),
         )
         .unwrap();
-        w.apply_replicated(
+        w.apply_replicated_stamped(
             &coord3(3, 0, 0),
             "material",
             Value::Str("gone".into()),
             meta_at(100),
+            Stamp::new(B, 1),
         )
         .unwrap();
-        w.apply_replicated_remove(&coord3(3, 0, 0), "material", 400)
+        w.apply_replicated_remove_stamped(&coord3(3, 0, 0), "material", 400, Stamp::new(B, 2))
             .unwrap();
 
         assert_eq!(
-            all_changes_since(&w, 200),
+            all_changes_since(&w, &vector(&[(A, 1), (B, 1)])),
             vec![
                 Change {
                     coord: coord3(2, 0, 0),
                     key: "material".into(),
                     kind: ChangeKind::Set(Value::Str("new".into()), meta_at(300)),
+                    stamp: Stamp::new(A, 2),
                 },
                 Change {
                     coord: coord3(3, 0, 0),
                     key: "material".into(),
                     kind: ChangeKind::Removed(400),
+                    stamp: Stamp::new(B, 2),
                 },
             ]
         );
-        assert_eq!(all_changes_since(&w, 0).len(), 3);
-        assert!(all_changes_since(&w, 400).is_empty());
+        assert_eq!(all_changes_since(&w, &VersionVector::new()).len(), 3);
+        assert!(all_changes_since(&w, &vector(&[(A, 2), (B, 2)])).is_empty());
     }
 
     #[test]
-    fn changes_since_skips_unchanged_chunks_without_decoding_them() {
+    fn changes_since_skips_chunks_the_vector_covers_without_decoding_them() {
         let dir = TempDir::new("changes-since-skips");
         {
             let w = create_with_tombstones(&dir);
-            // Three chunks (DEFAULT_CHUNK_DIM apart); only one changed late.
-            for (x, ms) in [(0, 100), (64, 100), (128, 500)] {
-                w.apply_replicated(&coord3(x, 0, 0), "material", Value::I64(1), meta_at(ms))
-                    .unwrap();
+            // Three chunks (DEFAULT_CHUNK_DIM apart); only one has seq 3.
+            for (x, seq) in [(0, 1), (64, 2), (128, 3)] {
+                w.apply_replicated_stamped(
+                    &coord3(x, 0, 0),
+                    "material",
+                    Value::I64(1),
+                    meta_at(100),
+                    Stamp::new(A, seq),
+                )
+                .unwrap();
             }
         }
         let w = World::open(&dir).unwrap();
-        assert_eq!(all_changes_since(&w, 200).len(), 1);
+        assert_eq!(all_changes_since(&w, &vector(&[(A, 2)])).len(), 1);
         assert_eq!(w.chunks_read_from_disk(), 1);
     }
 
     #[test]
-    fn changes_since_reads_compressed_and_old_format_chunks() {
+    fn changes_since_reads_compressed_and_older_format_chunks() {
         let dir = TempDir::new("changes-since-formats");
         let w = create_with_tombstones(&dir).with_compression(true);
-        w.apply_replicated(&coord3(0, 0, 0), "material", Value::I64(1), meta_at(500))
-            .unwrap();
-        assert_eq!(all_changes_since(&w, 200).len(), 1);
-        assert!(all_changes_since(&w, 500).is_empty());
+        w.apply_replicated_stamped(
+            &coord3(0, 0, 0),
+            "material",
+            Value::I64(1),
+            meta_at(500),
+            Stamp::new(A, 5),
+        )
+        .unwrap();
+        assert_eq!(all_changes_since(&w, &vector(&[(A, 4)])).len(), 1);
+        assert!(all_changes_since(&w, &vector(&[(A, 5)])).is_empty());
 
-        // An old-format (header-less) file can't be skipped by its header,
-        // but is still reported correctly.
+        // A header-less file can't be skipped by its header, and its data
+        // is legacy (`Stamp::NONE`): sent unless the vector has `0: 0`.
         let c = coord3(64, 0, 0);
-        w.apply_replicated(&c, "material", Value::I64(2), meta_at(100))
-            .unwrap();
+        w.set(&c, "material", Value::I64(2)).unwrap();
         let (ckey, _) = w.split(&c).unwrap();
         let path = w.chunk_path(&ckey);
-        let mut chunk = w.load_chunk(&ckey).unwrap();
+        let chunk = w.load_chunk(&ckey).unwrap();
         let mut buf = Vec::new();
         chunk.write_to(&mut buf).unwrap();
-        // Strip the header: magic + format + newest_ms.
-        fs::write(&path, &buf[13..buf.len() - 4]).unwrap();
-        chunk = w.load_chunk(&ckey).unwrap();
-        assert_eq!(chunk.newest_ms(), 100);
+        // Rebuild it header-less and stamp-less: num_columns, then the
+        // one column without its 16-byte stamp, then no tombstones.
+        let header = 4 + 1 + 4 + 16;
+        let column_head =
+            4 + 4 + 1 + crate::chunk::chunk_cells(AXES, DEFAULT_CHUNK_DIM).div_ceil(8);
+        let mut old = buf[header..header + column_head + 24].to_vec();
+        old.extend_from_slice(&buf[header + column_head + 24 + 16..buf.len() - 4]);
+        fs::write(&path, &old).unwrap();
         let reopened = World::open(&dir).unwrap();
-        assert_eq!(all_changes_since(&reopened, 50).len(), 2);
-        assert_eq!(all_changes_since(&reopened, 200).len(), 1);
+        assert_eq!(reopened.get(&c, "material").unwrap(), Some(Value::I64(2)));
+        assert_eq!(all_changes_since(&reopened, &vector(&[(A, 5)])).len(), 1);
+        assert!(all_changes_since(&reopened, &vector(&[(A, 5), (LEGACY, 0)])).is_empty());
     }
 
     #[test]
@@ -4344,7 +4614,7 @@ mod tests {
             w.set(&coord3(x, 0, 0), "material", Value::I64(1)).unwrap();
         }
         let mut batches = 0;
-        w.changes_since(0, |_| {
+        w.changes_since(&VersionVector::new(), LEGACY, |_| {
             batches += 1;
             false
         })
@@ -4390,6 +4660,7 @@ mod tests {
             coord: coord3(x, 0, 0),
             key: "material".into(),
             kind: ChangeKind::Set(Value::I64(i64::from(x)), meta_at(ms)),
+            stamp: Stamp::new(A, x as u64 + 1),
         };
         let mut changes: Vec<Change> = (0..20).map(|x| set(x, 100)).collect();
         changes.push(set(64, 100)); // a second chunk
@@ -4397,6 +4668,7 @@ mod tests {
             coord: coord3(3, 0, 0),
             key: "material".into(),
             kind: ChangeKind::Removed(200),
+            stamp: Stamp::new(B, 1),
         });
         changes.push(set(3, 150)); // older than the removal just before it
         let before = w.chunks_written_to_disk();
@@ -4410,6 +4682,9 @@ mod tests {
             w.get(&coord3(64, 0, 0), "material").unwrap(),
             Some(Value::I64(64))
         );
+        // Stamps are stored: covered by A's 20 (+65) and B's 1, nothing's new.
+        assert!(all_changes_since(&w, &vector(&[(A, 65), (B, 1)])).is_empty());
+        assert_eq!(all_changes_since(&w, &vector(&[(A, 65)])).len(), 1);
     }
 
     #[test]
@@ -4423,21 +4698,25 @@ mod tests {
                 coord: Coord::from(vec![1, 2]), // wrong axis count
                 key: "material".into(),
                 kind: ChangeKind::Removed(1),
+                stamp: Stamp::NONE,
             },
             Change {
                 coord: coord3(1, 0, 0),
                 key: "material".into(), // a str key, given an i64
                 kind: ChangeKind::Set(Value::I64(1), meta_at(1)),
+                stamp: Stamp::NONE,
             },
             Change {
                 coord: coord3(2, 0, 0),
                 key: "never-set".into(),
                 kind: ChangeKind::Removed(1),
+                stamp: Stamp::NONE,
             },
             Change {
                 coord: coord3(3, 0, 0),
                 key: "material".into(),
                 kind: ChangeKind::Set(Value::Str("sand".into()), meta_at(1)),
+                stamp: Stamp::NONE,
             },
         ]);
         assert!(results[0].is_err());

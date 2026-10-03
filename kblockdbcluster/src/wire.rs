@@ -32,7 +32,7 @@
 //! replies to them (no acks -- see `peers.rs`'s "Catch-up" for how
 //! `Synced` stands in for them).
 
-use kblockdblib::Value;
+use kblockdblib::{Value, VersionVector};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
@@ -46,16 +46,15 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// Bumped whenever this module's wire format changes in a way an older
 /// peer couldn't decode. Mirrors `kblockdbserver::wire::PROTOCOL_VERSION`'s
 /// reasoning, applied here to peer links instead of end-user ones.
-pub const PEER_PROTOCOL_VERSION: u8 = 3;
-
-/// The first version with `CatchUpRequest`/`Synced`: the accepting side
-/// only sends a `CatchUpRequest` to a connecting side at least this new.
-pub const CATCH_UP_PROTOCOL_VERSION: u8 = 3;
+/// Version 4 added stamps and version vectors; a server only links with a
+/// peer speaking exactly this version (see `server.rs`).
+pub const PEER_PROTOCOL_VERSION: u8 = 4;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
 /// `server::ReplicationSink`), not re-derived, so the whole cluster
-/// converges on the exact same metadata for a given logical write.
+/// converges on the exact same metadata for a given logical write -- plus
+/// its stamp (`origin`/`seq`, see `kblockdblib::Stamp`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ChangeEntry {
     pub database: String,
@@ -65,6 +64,14 @@ pub struct ChangeEntry {
     pub created_at_ms: u64,
     pub modified_at_ms: u64,
     pub version: u64,
+    pub origin: u64,
+    pub seq: u64,
+}
+
+impl ChangeEntry {
+    pub fn stamp(&self) -> kblockdblib::Stamp {
+        kblockdblib::Stamp::new(self.origin, self.seq)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -101,17 +108,20 @@ pub enum PeerMessage {
     /// any it doesn't already know.
     PeerList(Vec<String>),
     /// Accepting side to connecting side, right after `HelloOk`: "send me
-    /// every change you hold made after `since_ms`" -- see `peers.rs`'s
-    /// catch-up doc. The reply is ordinary `ChangeBatch`es, then `Synced`.
+    /// every change you hold that `known` doesn't cover" -- see
+    /// `peers.rs`'s "Catch-up". The reply is ordinary `ChangeBatch`es,
+    /// then `Synced`.
     CatchUpRequest {
-        since_ms: u64,
+        known: VersionVector,
     },
-    /// Connecting side to accepting side: every change the sender holds
-    /// with `modified_at_ms <= through_ms` (in the sender's clock) has now
-    /// been sent on this connection. The receiver keeps the latest one per
-    /// peer as its watermark for the next `CatchUpRequest`.
+    /// Connecting side to accepting side. `confirmed`: every write it
+    /// covers that the sender holds has now been sent on this connection
+    /// -- the receiver merges it into its own vector. `vector`: the
+    /// sender's whole current vector, for the receiver to show (no
+    /// promise attached).
     Synced {
-        through_ms: u64,
+        confirmed: VersionVector,
+        vector: VersionVector,
     },
 }
 
@@ -157,13 +167,14 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
                 put_string(&mut buf, address);
             }
         }
-        PeerMessage::CatchUpRequest { since_ms } => {
+        PeerMessage::CatchUpRequest { known } => {
             buf.push(5);
-            buf.extend_from_slice(&since_ms.to_le_bytes());
+            put_vector(&mut buf, known);
         }
-        PeerMessage::Synced { through_ms } => {
+        PeerMessage::Synced { confirmed, vector } => {
             buf.push(6);
-            buf.extend_from_slice(&through_ms.to_le_bytes());
+            put_vector(&mut buf, confirmed);
+            put_vector(&mut buf, vector);
         }
         PeerMessage::HelloRejected(reason) => {
             buf.push(2);
@@ -186,6 +197,8 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
                 buf.extend_from_slice(&entry.created_at_ms.to_le_bytes());
                 buf.extend_from_slice(&entry.modified_at_ms.to_le_bytes());
                 buf.extend_from_slice(&entry.version.to_le_bytes());
+                buf.extend_from_slice(&entry.origin.to_le_bytes());
+                buf.extend_from_slice(&entry.seq.to_le_bytes());
             }
         }
     }
@@ -227,6 +240,8 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
                         created_at_ms: r.u64()?,
                         modified_at_ms: r.u64()?,
                         version: r.u64()?,
+                        origin: r.u64()?,
+                        seq: r.u64()?,
                     })
                 })
                 .collect::<Result<Vec<_>, DecodeError>>()?;
@@ -239,9 +254,10 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
                 .collect::<Result<Vec<_>, DecodeError>>()?;
             Ok(PeerMessage::PeerList(addresses))
         }
-        5 => Ok(PeerMessage::CatchUpRequest { since_ms: r.u64()? }),
+        5 => Ok(PeerMessage::CatchUpRequest { known: r.vector()? }),
         6 => Ok(PeerMessage::Synced {
-            through_ms: r.u64()?,
+            confirmed: r.vector()?,
+            vector: r.vector()?,
         }),
         other => Err(DecodeError::UnknownTag(other)),
     }
@@ -316,6 +332,14 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
 fn put_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
+}
+
+fn put_vector(buf: &mut Vec<u8>, vector: &VersionVector) {
+    buf.extend_from_slice(&(vector.len() as u32).to_le_bytes());
+    for (origin, seq) in vector.iter() {
+        buf.extend_from_slice(&origin.to_le_bytes());
+        buf.extend_from_slice(&seq.to_le_bytes());
+    }
 }
 
 fn put_coord(buf: &mut Vec<u8>, coord: &[i32]) {
@@ -394,6 +418,13 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::InvalidUtf8)
     }
 
+    fn vector(&mut self) -> Result<VersionVector, DecodeError> {
+        let count = self.u32()? as usize;
+        (0..count)
+            .map(|_| Ok((self.u64()?, self.u64()?)))
+            .collect::<Result<VersionVector, DecodeError>>()
+    }
+
     fn coord(&mut self) -> Result<Vec<i32>, DecodeError> {
         let axes = self.u8()? as usize;
         (0..axes).map(|_| self.i32()).collect()
@@ -432,16 +463,19 @@ mod tests {
 
     #[test]
     fn catch_up_request_round_trips() {
-        roundtrip(PeerMessage::CatchUpRequest { since_ms: 0 });
         roundtrip(PeerMessage::CatchUpRequest {
-            since_ms: 1_790_000_000_123,
+            known: VersionVector::new(),
+        });
+        roundtrip(PeerMessage::CatchUpRequest {
+            known: [(0xABC, 42), (u64::MAX, 0)].into_iter().collect(),
         });
     }
 
     #[test]
     fn synced_round_trips() {
         roundtrip(PeerMessage::Synced {
-            through_ms: u64::MAX,
+            confirmed: [(1, 2)].into_iter().collect(),
+            vector: [(1, 9), (3, 4)].into_iter().collect(),
         });
     }
 
@@ -466,6 +500,8 @@ mod tests {
                 created_at_ms: 10,
                 modified_at_ms: 20,
                 version: 1,
+                origin: 0xABC,
+                seq: 17,
             },
             ChangeEntry {
                 database: "demo".to_string(),
@@ -475,6 +511,8 @@ mod tests {
                 created_at_ms: 10,
                 modified_at_ms: 10,
                 version: 0,
+                origin: 0,
+                seq: 0,
             },
             ChangeEntry {
                 database: "demo".to_string(),
@@ -484,6 +522,8 @@ mod tests {
                 created_at_ms: 10,
                 modified_at_ms: 10,
                 version: 0,
+                origin: 0,
+                seq: 0,
             },
             ChangeEntry {
                 database: "demo".to_string(),
@@ -493,6 +533,8 @@ mod tests {
                 created_at_ms: 10,
                 modified_at_ms: 10,
                 version: 0,
+                origin: 0,
+                seq: 0,
             },
             ChangeEntry {
                 database: "demo".to_string(),
@@ -502,6 +544,8 @@ mod tests {
                 created_at_ms: 0,
                 modified_at_ms: 30,
                 version: 0,
+                origin: 0,
+                seq: 0,
             },
         ]));
     }

@@ -283,6 +283,34 @@ async fn health_lists_only_connected_peers() {
 }
 
 #[tokio::test]
+async fn health_reports_this_nodes_id_and_version_vector() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[]);
+    let me = format!("{:016x}", peers.node_id());
+    let seq = peers.hub().sequencer().assign().seq;
+    peers.hub().sequencer().published(seq);
+    peers.vectors().merge(&[(0xB, 7)].into_iter().collect());
+    let state = AppState::new(databases, Arc::new(HashMap::new())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_id"], json!(me));
+    let mut expected = serde_json::Map::new();
+    expected.insert(me.clone(), json!(1));
+    expected.insert(format!("{me}-legacy"), json!(0));
+    expected.insert("000000000000000b".to_string(), json!(7));
+    assert_eq!(body["vector"], Json::Object(expected));
+}
+
+#[tokio::test]
+async fn health_reports_no_node_id_or_vector_when_unclustered() {
+    let (status, body) = send(test_app().0, get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["node_id"], json!(null));
+    assert_eq!(body["vector"], json!({}));
+}
+
+#[tokio::test]
 async fn cluster_requires_auth() {
     let req = Request::builder()
         .method("GET")
@@ -298,31 +326,121 @@ async fn cluster_is_empty_when_unclustered() {
     let (status, body) = send(test_app().0, get("/rest/cluster")).await;
     assert_eq!(status, StatusCode::OK);
     assert!(body["hostname"].is_string());
+    assert_eq!(body["node_id"], json!(null));
     assert_eq!(body["peers"], json!([]));
 }
 
 #[tokio::test]
 async fn cluster_reports_every_peer_with_its_connection_status() {
     let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("10.0.0.3:8082", false), ("10.0.0.2:8082", true)]);
+    let me = format!("{:016x}", peers.node_id());
     let state = AppState::new(databases, Arc::new(test_credentials()))
         .with_hostname("node-a".to_string())
-        .with_peers(peer_set(&[
-            ("10.0.0.3:8082", false),
-            ("10.0.0.2:8082", true),
-        ]));
+        .with_peers(peers);
 
     let (status, body) = send(router(state), get("/rest/cluster")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(
-        body,
+    let not_yet_linked = |host: &str, connected: bool| {
         json!({
-            "hostname": "node-a",
-            "peers": [
-                {"host": "10.0.0.2:8082", "connected": true},
-                {"host": "10.0.0.3:8082", "connected": false},
-            ]
+            "host": host,
+            "connected": connected,
+            "node_id": null,
+            "vector": null,
+            "sync": "unknown",
+            "behind_by": 0,
+            "ahead_by": 0,
         })
+    };
+    assert_eq!(body["hostname"], json!("node-a"));
+    assert_eq!(body["node_id"], json!(me));
+    assert_eq!(
+        body["peers"],
+        json!([
+            not_yet_linked("10.0.0.2:8082", true),
+            not_yet_linked("10.0.0.3:8082", false),
+        ])
     );
+}
+
+#[tokio::test]
+async fn cluster_compares_each_peers_vector_with_this_servers() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[
+        ("10.0.0.2:8082", true),
+        ("10.0.0.3:8082", true),
+        ("10.0.0.4:8082", true),
+        ("10.0.0.5:8082", false),
+    ]);
+    peers.vectors().merge(&[(0xF, 10)].into_iter().collect());
+    let mine = peers.local_vector();
+    let with = |changes: &[(u64, u64)]| {
+        let mut v = mine.clone();
+        for &(origin, seq) in changes {
+            v.set(origin, seq);
+        }
+        v
+    };
+    for (i, (address, vector)) in [
+        ("10.0.0.2:8082", with(&[])),                    // in sync
+        ("10.0.0.3:8082", with(&[(0xF, 4)])),            // behind by 6
+        ("10.0.0.4:8082", with(&[(0xF, 13)])),           // ahead by 3
+        ("10.0.0.5:8082", with(&[(0xF, 8), (0x10, 2)])), // 2 each way
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let node_id = 0xB0 + i as u64;
+        peers.insert_claim(address, node_id);
+        peers.vectors().record_peer(node_id, vector);
+    }
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    let summary: Vec<(Json, Json, Json, Json)> = body["peers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| {
+            (
+                p["node_id"].clone(),
+                p["sync"].clone(),
+                p["behind_by"].clone(),
+                p["ahead_by"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        vec![
+            (
+                json!("00000000000000b0"),
+                json!("in_sync"),
+                json!(0),
+                json!(0)
+            ),
+            (
+                json!("00000000000000b1"),
+                json!("behind"),
+                json!(6),
+                json!(0)
+            ),
+            (
+                json!("00000000000000b2"),
+                json!("ahead"),
+                json!(0),
+                json!(3)
+            ),
+            (
+                json!("00000000000000b3"),
+                json!("diverged"),
+                json!(2),
+                json!(2)
+            ),
+        ]
+    );
+    assert_eq!(body["peers"][1]["vector"]["000000000000000f"], json!(4));
 }
 
 /// `/rest/health` is what a load balancer polls, so it must stay
@@ -429,8 +547,9 @@ async fn removing_a_cell_publishes_its_removal_time_and_nothing_when_absent() {
     let (databases, _dir) = test_databases();
     databases.create(DB, None).unwrap();
     let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let me = hub.sequencer().node_id();
     let mut published = hub.subscribe();
-    let app = router(test_state(databases).with_replication(hub));
+    let app = router(test_state(databases).with_replication(hub.clone()));
 
     send(
         app.clone(),
@@ -440,7 +559,8 @@ async fn removing_a_cell_publishes_its_removal_time_and_nothing_when_absent() {
         ),
     )
     .await;
-    published.try_recv().expect("the set is published");
+    let entry = published.try_recv().expect("the set is published");
+    assert_eq!((entry.origin, entry.seq), (me, 1));
 
     let before = kblockdbcluster::hub::now_ms();
     let (status, _) = send(app.clone(), delete("/rest/db/db/cells/1,2,3/material")).await;
@@ -448,11 +568,26 @@ async fn removing_a_cell_publishes_its_removal_time_and_nothing_when_absent() {
     let entry = published.try_recv().expect("the removal is published");
     assert_eq!(entry.op, kblockdbcluster::wire::ChangeOp::Remove);
     assert!(entry.modified_at_ms >= before);
+    assert_eq!((entry.origin, entry.seq), (me, 2));
 
-    // Nothing left to remove: nothing to replicate either.
-    let (status, _) = send(app, delete("/rest/db/db/cells/1,2,3/material")).await;
+    // Nothing left to remove: nothing to replicate either, and no seq used.
+    let (status, _) = send(app.clone(), delete("/rest/db/db/cells/1,2,3/material")).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
     assert!(published.try_recv().is_err());
+
+    // A write that fails (a str key given an i64) takes no seq either, and
+    // leaves nothing in flight: everything up to seq 2 stays confirmed.
+    let (status, _) = send(
+        app,
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "i64", "value": 1}),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(published.try_recv().is_err());
+    assert_eq!(hub.sequencer().confirmed_through(), 2);
 }
 
 #[tokio::test]

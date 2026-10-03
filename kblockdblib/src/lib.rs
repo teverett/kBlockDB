@@ -15,6 +15,7 @@ pub mod logger;
 pub mod params;
 pub mod schema;
 mod semaphore;
+pub mod stamp;
 pub mod value;
 pub mod world;
 
@@ -22,6 +23,7 @@ pub use chunk::{CellMeta, ChangeKind};
 pub use coord::Coord;
 pub use params::WorldParams;
 pub use schema::ColumnInfo;
+pub use stamp::{legacy_origin, Stamp, VersionVector, LEGACY_BIT};
 pub use value::{Value, ValueType};
 pub use world::{
     CellEntry, Change, Region, RemovedCells, Stats, World, AXES, DEFAULT_CHUNK_DIM,

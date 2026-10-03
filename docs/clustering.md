@@ -39,10 +39,6 @@ keepalive_retries = 3
 # see "Deletes and tombstones".
 tombstone_retention_secs = 604800
 
-# How far before its watermark a catch-up starts, to cover writes still in
-# flight and slow clocks elsewhere (default 60; 0 allowed).
-catch_up_margin_secs = 60
-
 # Other servers to replicate with -- "address" is that peer's own
 # peer_port, not its HTTP or binary-protocol port. One reachable peer is
 # enough: the rest of the cluster is discovered by gossip (see below).
@@ -118,30 +114,44 @@ its configured peers and relearns the rest by gossip.
 ### Catch-up
 
 A server that's new, restarting, or whose link to one peer dropped for a
-while gets what it missed when the link comes back. Each peer's changes
-arrive on the connection *that peer* dials in, so the catch-up is
-requested there:
+while gets what it missed when the link comes back. That's tracked with
+**sequence numbers**, not clocks:
+
+- **Node id.** Each server has a random id, made once and kept in
+  `<data_dir>/.cluster/node_id`.
+- **Sequence numbers.** Every write a server makes -- set or delete -- is
+  numbered 1, 2, 3, ... by that server, and carries `(node id, seq)` (its
+  *stamp*) wherever it's stored or sent. The counter is saved in
+  `.cluster/sequence` in blocks of 1000, so a restart never reuses a
+  number (it may skip up to 1000, which is harmless).
+- **Version vector.** Every server keeps, per origin node, the highest
+  seq it's *guaranteed* to have -- e.g. `{a1b2...: 1042, c3d4...: 977}` --
+  saved in `.cluster/vector`. **Two servers with equal vectors have seen
+  exactly the same writes.** A lower entry means a server is missing that
+  origin's writes after it.
+
+Each peer's changes arrive on the connection *that peer* dials in, so
+the catch-up is requested there:
 
 1. Right after `HelloOk`, the receiving server sends
-   `CatchUpRequest{since_ms}`: its **watermark** for that peer, minus
-   `catch_up_margin_secs`.
+   `CatchUpRequest{known}`: its vector.
 2. The sending server replies with every change it holds -- every
    database, whoever originally made each write, deletes included --
-   with `modified_at_ms` after `since_ms`. These go out as ordinary
+   whose stamp `known` doesn't cover. These go out as ordinary
    `ChangeBatch` frames, interleaved with live ones and applied with the
    same last-write-wins rule, so the overlap is harmless.
-3. When it's done, the sender sends `Synced{through_ms}`: everything up
-   to that time has been sent. While the link stays up and caught up, it
-   sends `Synced` again every few seconds.
+3. When it's done, the sender sends `Synced`, confirming its own vector as
+   of when the catch-up started; the receiver merges that into its
+   vector. While the link stays up and caught up, the sender confirms
+   its own latest seq every few seconds.
 
-The watermark is the latest `through_ms` a peer has sent. It's in the
-*sender's* clock, so clock differences between the two servers don't
-matter, and it only moves when the sender confirms. A link that drops
-mid-catch-up asks again from the old watermark next time. Watermarks are
-saved in `<data_dir>/.cluster/watermarks`, so a restarted server picks up
-where it left off. A peer with no watermark gets `since_ms` 0: a full
-copy. A brand-new node therefore needs no copying of data directories --
-point it at one peer and it fills itself from every peer it finds.
+A vector entry only ever advances on such a confirmation, and a sender
+only confirms a seq once every write up to it has actually been sent
+(writes are numbered when stored and published just after, so they can
+go out slightly out of order). A link that drops mid-catch-up therefore
+just asks again from the old vector. A new server's vector is empty, so
+it gets a full copy: point it at one peer and it fills itself from every
+peer it finds -- no copying of data directories.
 
 Every peer is asked, not just one. That's simplest and most robust (a
 peer that also missed something doesn't leave a gap), but it costs
@@ -149,13 +159,15 @@ bandwidth: a new node joining an N-node cluster receives N-1 full copies,
 and each existing node receives a full copy of what the new node then
 holds. Fine for the small clusters this is meant for.
 
-The margin covers what a watermark can't: a write in the moment between
-being stored and being published, and writes whose timestamps came from a
-third server with a slow clock.
+**Data from before clustering** (or before this version) has no stamp. Each
+server's unstamped data is tracked as its own pseudo-origin -- shown as
+`<node id>-legacy` -- so it's sent to each peer once, even when different
+servers hold different unstamped data, as in a cluster being upgraded.
 
 A sender whose link falls behind its in-memory buffer (more than 4096
-unsent writes) no longer just loses them: it runs a catch-up of its own
-from its last `Synced` point.
+unsent writes), or whose write was stored but failed before being sent,
+doesn't lose those writes either: it catches its peer up again from the
+last vector it confirmed.
 
 ### Deletes and tombstones
 
@@ -171,10 +183,10 @@ Tombstones are kept for `tombstone_retention_secs` (default a week), then
 removed the next time their chunk is written. That makes the retention
 the longest a server can be offline and still catch up correctly: after
 that, the tombstones for deletes it missed may be gone, so the data they
-deleted would stay on that server. The server warns at startup if a
-peer's watermark is older than the retention. In that case, stop it,
-delete its data directory (including `.cluster/`), and start it again to
-take a fresh copy.
+deleted would stay on that server. The server warns at startup if its
+vector was last updated longer ago than the retention. In that case, stop
+it, delete its data directory (including `.cluster/`), and start it again
+to take a fresh copy.
 
 Without clustering, no tombstones are kept and a delete just erases, as
 before.
@@ -184,8 +196,8 @@ before.
 Every local write -- a REST `PUT`/`DELETE` on a cell or region, the
 binary protocol's equivalent requests, or the query language's
 `SET`/`UPDATE`/`DELETE` -- publishes a `ChangeEntry` (database, coordinate,
-key, the new value or a removal, and the write's own `created_at_ms`/
-`modified_at_ms`/`version`) to an in-process hub. One long-running task
+key, the new value or a removal, the write's own `created_at_ms`/
+`modified_at_ms`/`version`, and its stamp) to an in-process hub. One long-running task
 per known peer drains that hub and streams the entries over its own
 TCP connection to that peer, authenticated once per connection with
 `Hello`/`cluster_secret`. The accepting side applies each entry directly
@@ -200,14 +212,26 @@ forming, before a node has its direct link to some peer, reaches it when
 that link comes up, through catch-up (which does include other nodes'
 writes the sender holds).
 
-Two endpoints report cluster membership, both live:
+Two endpoints report cluster membership and sync state, both live:
 
 - `GET /rest/health`'s `"peers": [...]` lists the address of every known
   peer this server's link to is *currently up*. A peer that's down or
-  still being retried isn't listed.
+  still being retried isn't listed. `"node_id"` is this server's node id
+  and `"vector"` its version vector (see "Catch-up"), keyed by node id
+  (hex). Compare two servers' `vector`s: equal means in sync.
 - `GET /rest/cluster` lists every known peer, connected or not:
-  `{"host": <address>, "connected": <bool>}`. The data browser's
-  **Cluster** tab renders this.
+  `{"host", "connected", "node_id", "vector", "sync", "behind_by",
+  "ahead_by"}`. `vector` is the peer's own vector as it last reported it
+  (every few seconds while its link to this server is up). `sync`
+  compares it with this server's: `in_sync`, `behind` (the peer is
+  missing writes this server has -- it's catching up), `ahead` (this
+  server is missing writes the peer has), `diverged` (both), or `unknown`
+  (no vector reported yet). `behind_by`/`ahead_by` are roughly how many
+  writes -- approximate, since a restart can skip sequence numbers. A
+  peer's reported vector trails by up to ~10 seconds (a confirmation
+  every 5s each way), so right after a write, or under steady writes,
+  peers show `behind`/`ahead` briefly before settling on `in_sync`. The
+  data browser's **Cluster** tab renders this, with a **Sync** column.
 
 Both read `kblockdbcluster::peers::PeerSet`, where each peer's
 `connected` flag is flipped by its `client::run` task as the link comes
@@ -233,12 +257,13 @@ in-memory sink rather than any real storage.
 
 If two nodes each write the same cell/key without coordinating, the
 receiving side applies **last-write-wins by `modified_at_ms`**: an
-incoming write/removal is only applied if its timestamp is strictly newer
-than whatever that cell/key currently holds -- a value, or a tombstone
+incoming write/removal is only applied if its timestamp is newer than
+whatever that cell/key currently holds -- a value, or a tombstone
 recording when it was deleted (locally or from an earlier replicated
-write); otherwise it's silently discarded. A tie (equal
-millisecond timestamps) keeps whatever is already there -- an accepted
-imprecision, not a bug, given millisecond resolution. This is the same
+write); otherwise it's silently discarded. A tie (equal millisecond
+timestamps) is broken by the writes' stamps (origin node id, then seq), so
+every server picks the same winner whatever order the writes arrive in --
+which is what makes equal vectors mean equal data. This is the same
 mechanism `SELECT`'s `created`/`updated`/`version` keywords expose (see
 [query-language.md](query-language.md)), applied automatically rather
 than queried.
@@ -256,16 +281,20 @@ This is a v1, intentionally minimal design:
   A later, older write of the key from a peer that missed the delete
   would then be accepted. This needs a key's very first write anywhere to
   arrive after its delete, so it's rare.
-- **Upgrade every node before relying on catch-up.** A server rejects a
-  peer speaking a newer protocol version, and an older server never asks
-  for or confirms a catch-up. Mixed-version clusters only replicate live
-  changes, and only from the older servers to the newer ones.
-- **Chunk files are upgraded one way.** Tombstones needed a new chunk
-  file format. Old files are still read, but every chunk this version
-  writes is in the new format, which an older build can't read.
+- **Upgrade every node together.** Servers only link with a peer speaking
+  exactly the same peer protocol version (4), so a mixed-version cluster
+  doesn't replicate at all between old and new servers.
+- **Never copy `.cluster/` to another server.** It holds the node id;
+  two servers sharing one would each take the other for itself and
+  refuse to link. (Copying a data directory *without* `.cluster/` is
+  fine, though no longer needed -- catch-up fills a new server.)
+- **Chunk files are upgraded one way.** Stamps and tombstones needed a
+  new chunk file format. Older files are still read, but every chunk this
+  version writes is in the new format, which an older build can't read.
 - **No database-level replication.** Creating or removing a database, and
   adding or removing a column, aren't replicated; a database a peer
-  hasn't seen is auto-created on its first incoming write.
+  hasn't seen is auto-created on its first incoming write. Equal vectors
+  say nothing about these.
 - **No quorum or strong consistency.** This is eventually-consistent,
   best-effort replication, not a consensus protocol -- there's no
   guarantee all nodes agree at any given instant, only that they tend to

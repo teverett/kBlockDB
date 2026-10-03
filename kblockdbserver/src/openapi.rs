@@ -12,7 +12,7 @@ use crate::routes::{
     self, AddColumnBody, AggregateResponse, CellResponse, ClusterPeer, ClusterResponse,
     ColumnResponse, ColumnsResponse, CreateDatabaseBody, DatabasesResponse, HealthResponse,
     QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody,
-    StatsResponse,
+    StatsResponse, SyncState,
 };
 use crate::value_json::{ValueJson, ValueTypeJson};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -51,6 +51,7 @@ use utoipa::{Modify, OpenApi};
         HealthResponse,
         ClusterResponse,
         ClusterPeer,
+        SyncState,
         DatabasesResponse,
         CreateDatabaseBody,
         StatsResponse,

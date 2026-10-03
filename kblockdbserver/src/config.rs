@@ -79,11 +79,6 @@ pub struct ClusterConfig {
     /// `DEFAULT_TOMBSTONE_RETENTION_SECS`; must be greater than 0.
     #[serde(default)]
     pub tombstone_retention_secs: Option<u64>,
-    /// How far before a peer's watermark a catch-up starts -- see
-    /// `kblockdbcluster::peers::PeerSet::with_catch_up_margin`. Defaults to
-    /// 60.
-    #[serde(default)]
-    pub catch_up_margin_secs: Option<u64>,
 }
 
 /// `ClusterConfig::tombstone_retention_secs`' default: a week.
@@ -109,13 +104,6 @@ impl ClusterConfig {
         Duration::from_secs(
             self.tombstone_retention_secs
                 .unwrap_or(DEFAULT_TOMBSTONE_RETENTION_SECS),
-        )
-    }
-
-    pub fn catch_up_margin(&self) -> Duration {
-        self.catch_up_margin_secs.map_or(
-            kblockdbcluster::peers::DEFAULT_CATCH_UP_MARGIN,
-            Duration::from_secs,
         )
     }
 }
@@ -648,27 +636,22 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_settings_default_when_unset() {
+    fn tombstone_retention_defaults_when_unset() {
         let config = Config::from_toml_str(r#"admin_password = "secret""#).unwrap();
         assert_eq!(
             config.cluster.tombstone_retention(),
             Duration::from_secs(DEFAULT_TOMBSTONE_RETENTION_SECS)
         );
-        assert_eq!(
-            config.cluster.catch_up_margin(),
-            kblockdbcluster::peers::DEFAULT_CATCH_UP_MARGIN
-        );
     }
 
     #[test]
-    fn catch_up_settings_can_be_set() {
+    fn tombstone_retention_can_be_set() {
         let config = Config::from_toml_str(
             r#"
             admin_password = "secret"
             [cluster]
             cluster_secret = "shh"
             tombstone_retention_secs = 3600
-            catch_up_margin_secs = 0
             "#,
         )
         .unwrap();
@@ -676,8 +659,22 @@ mod tests {
             config.cluster.tombstone_retention(),
             Duration::from_secs(3600)
         );
-        // 0 is allowed: no margin at all.
-        assert_eq!(config.cluster.catch_up_margin(), Duration::ZERO);
+    }
+
+    /// `catch_up_margin_secs` was removed when catch-up moved from time
+    /// watermarks to version vectors; a config still setting it loads
+    /// fine (unknown keys are ignored), the setting just does nothing.
+    #[test]
+    fn the_removed_catch_up_margin_key_is_ignored() {
+        assert!(Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+            [cluster]
+            cluster_secret = "shh"
+            catch_up_margin_secs = 60
+            "#,
+        )
+        .is_ok());
     }
 
     #[test]

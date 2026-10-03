@@ -151,7 +151,6 @@ keepalive_idle_secs = 30      # optional peer-link TCP keepalive, all > 0
 keepalive_interval_secs = 10
 keepalive_retries = 3
 tombstone_retention_secs = 604800  # optional; how long deletes are remembered
-catch_up_margin_secs = 60     # optional
 
 [[peers]]
 address = "10.0.0.2:8082"
@@ -268,8 +267,8 @@ A cell value on the wire is a small tagged JSON object:
 
 | Method | Path | Body | Response |
 |---|---|---|---|
-| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[]}` |
-| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","peers":[{"host":"10.0.0.2:8082","connected":true}]}` |
+| `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[],"node_id":null,"vector":{}}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","node_id":"1f2e3d4c5b6a7980","vector":{...},"peers":[{"host":"10.0.0.2:8082","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"sync":"in_sync","behind_by":0,"ahead_by":0}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -298,11 +297,20 @@ shape to report the way the old single-world `/rest/health` once did; ask
 database's shape. `peers` lists the address of every known peer (see
 [clustering.md](clustering.md)) this instance's link to is *currently
 up*; a peer that's down or still being retried isn't listed. Empty unless
-clustering is configured.
+clustering is configured. `node_id` (16 hex digits) and `vector` are this
+instance's cluster node id and version vector -- per origin node, the
+highest of its writes this instance is guaranteed to have (see
+clustering.md's "Catch-up"); two instances with equal `vector`s have seen
+exactly the same writes. Both are `null`/empty unless clustering is
+configured.
 
 `GET /rest/cluster` (auth required, unlike `/rest/health`) reports
-`{"hostname": ..., "peers": [{"host": ..., "connected": true | false},
-...]}` -- every peer this instance knows about, connected or not. A peer
+`{"hostname": ..., "node_id": ..., "vector": {...}, "peers": [{"host":
+..., "connected": true | false, "node_id": ..., "vector": {...}, "sync":
+"in_sync" | "behind" | "ahead" | "diverged" | "unknown", "behind_by": N,
+"ahead_by": N}, ...]}` -- every peer this instance knows about, connected
+or not, with its version vector as it last reported it and how that
+compares with this instance's (see clustering.md). A peer
 is known once it's configured in `[[peers]]` *or* has connected in; either
 way it's replicated to and from (peers have no direction -- see
 clustering.md's "Peers are symmetric").

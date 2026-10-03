@@ -390,7 +390,19 @@ async fn main() {
             config.peers.len()
         );
 
-        let hub = kblockdbcluster::hub::ReplicationHub::new();
+        // This node's identity and write counter, and what it's known to
+        // have from everyone else -- see docs/clustering.md's "Catch-up".
+        let cluster_dir = std::path::Path::new(&data_dir).join(".cluster");
+        let sequencer = kblockdbcluster::sequence::Sequencer::load_or_create(&cluster_dir)
+            .unwrap_or_else(|e| {
+                eprintln!("failed to load this node's id/sequence from {data_dir}/.cluster: {e}");
+                std::process::exit(1);
+            });
+        println!(
+            "kblockdbserver: cluster node id {:016x}",
+            sequencer.node_id()
+        );
+        let hub = kblockdbcluster::hub::ReplicationHub::with_sequencer(sequencer);
         // Every known peer -- configured below, or learned when one
         // connects in -- is replicated to as well as from (see
         // `kblockdbcluster::peers`); `add` spawns the outbound link.
@@ -407,24 +419,25 @@ async fn main() {
         )
         .with_keepalive(config.cluster.keepalive())
         .with_change_source(std::sync::Arc::new(state.clone()))
-        .with_catch_up_margin(config.cluster.catch_up_margin())
-        .with_watermarks(
-            std::path::Path::new(&data_dir)
-                .join(".cluster")
-                .join("watermarks"),
-        )
+        .with_vectors(cluster_dir.join("vector"))
         .unwrap_or_else(|e| {
-            eprintln!("failed to read cluster watermarks in {data_dir}/.cluster: {e}");
+            eprintln!("failed to read this node's version vector in {data_dir}/.cluster: {e}");
             std::process::exit(1);
         });
-        // A peer last synced longer ago than tombstones are kept may have
-        // missed deletes that no catch-up can now report.
-        for (address, through_ms) in peers.stale_watermarks(config.cluster.tombstone_retention()) {
-            eprintln!(
-                "kblockdbserver: warning: last synced with {address} at {through_ms} ms, longer \
-                 ago than tombstone_retention_secs -- deletes made since may be missing here; \
-                 see docs/clustering.md"
-            );
+        // Last caught up longer ago than tombstones are kept: deletes made
+        // since may never reach this node.
+        if let Ok(age) = std::fs::metadata(cluster_dir.join("vector"))
+            .and_then(|m| m.modified())
+            .map(|modified| modified.elapsed().unwrap_or_default())
+        {
+            if age > config.cluster.tombstone_retention() {
+                eprintln!(
+                    "kblockdbserver: warning: this node last caught up {}s ago, longer than \
+                     tombstone_retention_secs -- deletes made since may be missing here; see \
+                     docs/clustering.md",
+                    age.as_secs()
+                );
+            }
         }
         for peer in &config.peers {
             peers.add_configured(peer.address.clone());

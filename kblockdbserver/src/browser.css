@@ -88,6 +88,11 @@ tbody tr.row:hover { background: rgba(64, 128, 255, 0.08); }
 td.coord { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 td.status-up { color: #2e8b57; font-weight: 600; }
 td.status-down { color: #c0392b; font-weight: 600; }
+td.node-id { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; color: #555; }
+td.sync-in_sync { color: #2e8b57; font-weight: 600; }
+td.sync-behind, td.sync-ahead { color: #b8860b; font-weight: 600; }
+td.sync-diverged { color: #c0392b; font-weight: 600; }
+td.sync-unknown { color: #888; font-style: italic; }
 .pager {
   display: flex;
   align-items: center;

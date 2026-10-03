@@ -8,6 +8,7 @@
 
 use crate::peers::PeerSet;
 use crate::wire::{ChangeEntry, PeerMessage, PEER_PROTOCOL_VERSION};
+use kblockdblib::{Stamp, VersionVector};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWrite;
@@ -100,7 +101,7 @@ const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(30);
 const MAX_BATCH_SIZE: usize = 256;
 
 /// How often a caught-up, idle link confirms with `Synced` -- the most a
-/// receiver's watermark for this process can lag behind.
+/// receiver's vector entry for this process can lag behind.
 const SYNCED_INTERVAL: Duration = if cfg!(test) {
     Duration::from_millis(100)
 } else {
@@ -112,11 +113,14 @@ const SYNCED_INTERVAL: Duration = if cfg!(test) {
 const CATCH_UP_BUFFER: usize = 4;
 
 /// A catch-up in progress: batches from `ChangeSource::changes_since`
-/// running on a blocking thread, and the time it started -- what the
-/// `Synced` sent once it finishes confirms.
+/// running on a blocking thread, and this process's own vector as of just
+/// before it started -- what the `Synced` sent once it finishes confirms:
+/// every write that vector covers is either in the scan or (if it landed
+/// after the scan passed its chunk) one of this node's own, published
+/// live.
 struct CatchUp {
     batches: mpsc::Receiver<Result<Vec<ChangeEntry>, String>>,
-    through_ms: u64,
+    start: VersionVector,
 }
 
 /// Aborts a spawned task when dropped -- this link's reader task, so it
@@ -175,6 +179,7 @@ async fn connect_and_forward(
     // slow to drain.
     let mut rx = peers.hub().subscribe();
     let mut changes = peers.subscribe_changes();
+    let mut resync = peers.hub().sequencer().subscribe_resync();
 
     let mut stream = TcpStream::connect(address).await?;
     crate::socket::tune(&stream, peers.keepalive());
@@ -239,25 +244,34 @@ async fn connect_and_forward(
     changes.borrow_and_update();
     send_peer_list(&mut writer, peers, address).await?;
 
-    let margin_ms = u64::try_from(peers.catch_up_margin().as_millis()).unwrap_or(u64::MAX);
+    let node_id = peers.node_id();
     let mut catch_up: Option<CatchUp> = None;
     // Another catch-up to run once the current one finishes, from here.
-    let mut queued_since: Option<u64> = None;
-    // The last `Synced` sent -- `None` until the first catch-up finishes.
-    let mut last_through: Option<u64> = None;
+    let mut queued: Option<VersionVector> = None;
+    // The last vector confirmed to this peer -- `None` until its first
+    // catch-up finishes.
+    let mut confirmed: Option<VersionVector> = None;
     let mut synced_tick = tokio::time::interval(SYNCED_INTERVAL);
     synced_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    resync.borrow_and_update();
 
     loop {
+        // Catch the peer up from `known`: now, or after the running one.
+        let mut request_catch_up = |known: VersionVector, catch_up: &mut Option<CatchUp>| {
+            if catch_up.is_some() {
+                queued = Some(match queued.take() {
+                    Some(q) => q.meet(&known),
+                    None => known,
+                });
+            } else {
+                *catch_up = start_catch_up(peers, address, known);
+            }
+        };
         tokio::select! {
             msg = incoming.recv() => {
                 match msg {
-                    Some(Ok(PeerMessage::CatchUpRequest { since_ms })) => {
-                        if catch_up.is_some() {
-                            queued_since = Some(queued_since.map_or(since_ms, |q| q.min(since_ms)));
-                        } else {
-                            catch_up = start_catch_up(peers, address, since_ms);
-                        }
+                    Some(Ok(PeerMessage::CatchUpRequest { known })) => {
+                        request_catch_up(known, &mut catch_up);
                     }
                     // Nothing else is expected this direction; skip it.
                     Some(Ok(_)) => {}
@@ -276,29 +290,48 @@ async fn connect_and_forward(
                         return Err(std::io::Error::other(format!("catch-up failed: {e}")));
                     }
                     None => {
-                        let through_ms = catch_up.take().map_or(0, |c| c.through_ms);
-                        if let Some(since_ms) = queued_since.take() {
-                            catch_up = start_catch_up(peers, address, since_ms);
+                        let start = catch_up.take().map(|c| c.start).unwrap_or_default();
+                        if let Some(known) = queued.take() {
+                            catch_up = start_catch_up(peers, address, known);
                         } else {
-                            crate::wire::write_message(&mut writer, &PeerMessage::Synced { through_ms })
-                                .await?;
-                            last_through = Some(through_ms);
+                            let synced = PeerMessage::Synced {
+                                confirmed: start.clone(),
+                                vector: peers.local_vector(),
+                            };
+                            crate::wire::write_message(&mut writer, &synced).await?;
+                            confirmed = Some(start);
                         }
                     }
                 }
             }
             _ = synced_tick.tick() => {
                 // Only once caught up, and only while nothing is pending:
-                // `Synced{t}` promises every change up to `t` has been sent.
-                // `t` is read *before* checking the hub is drained, so
-                // anything published before `t` has already gone out.
-                if catch_up.is_none() && queued_since.is_none() && last_through.is_some() {
-                    let now = crate::hub::now_ms();
+                // `Synced` promises everything it confirms has been sent.
+                // This node's confirmed seq is read *before* checking the
+                // hub is drained, so every write up to it -- published
+                // before that read -- has already gone out on this link.
+                if let (None, None, Some(confirmed)) = (&catch_up, &queued, &mut confirmed) {
+                    let through = peers.hub().sequencer().confirmed_through();
                     if rx.is_empty() {
-                        crate::wire::write_message(&mut writer, &PeerMessage::Synced { through_ms: now })
-                            .await?;
-                        last_through = Some(now);
+                        confirmed.observe(Stamp::new(node_id, through));
+                        let synced = PeerMessage::Synced {
+                            confirmed: [(node_id, through)].into_iter().collect(),
+                            vector: peers.local_vector(),
+                        };
+                        crate::wire::write_message(&mut writer, &synced).await?;
                     }
+                }
+            }
+            changed = resync.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                // A write landed in storage but was never published (see
+                // `Sequencer::release`): catch up from what this peer was
+                // last confirmed, which can't include it.
+                if let Some(base) = catch_up.as_ref().map(|c| c.start.clone()).or(confirmed.clone()) {
+                    eprintln!("peer client '{address}': a write was never published -- catching up again");
+                    request_catch_up(base, &mut catch_up);
                 }
             }
             received = rx.recv() => {
@@ -311,23 +344,16 @@ async fn connect_and_forward(
                     Err(broadcast::error::RecvError::Lagged(skipped)) => {
                         // Fell behind the hub's buffer -- `skipped` entries
                         // are gone from it. They're still in storage, so
-                        // catch this peer up again from the last point it
-                        // was confirmed synced (or the running catch-up's
-                        // start). Before any catch-up was asked for (an
-                        // older peer), there's nothing to resume from.
-                        let base = catch_up.as_ref().map(|c| c.through_ms).or(last_through);
-                        if let Some(base) = base {
+                        // catch this peer up again from what it was last
+                        // confirmed (or the running catch-up's start).
+                        // Before any catch-up was asked for, there's
+                        // nothing to resume from.
+                        if let Some(base) = catch_up.as_ref().map(|c| c.start.clone()).or(confirmed.clone()) {
                             eprintln!(
                                 "peer client '{address}': fell {skipped} entries behind -- \
                                  catching up again"
                             );
-                            let since_ms = base.saturating_sub(margin_ms);
-                            if catch_up.is_some() {
-                                queued_since =
-                                    Some(queued_since.map_or(since_ms, |q| q.min(since_ms)));
-                            } else {
-                                catch_up = start_catch_up(peers, address, since_ms);
-                            }
+                            request_catch_up(base, &mut catch_up);
                         }
                         continue;
                     }
@@ -352,15 +378,17 @@ async fn connect_and_forward(
     }
 }
 
-/// Starts streaming every change since `since_ms` from `peers`' change
-/// source on a blocking thread. `None` (logged) if there's no source.
-fn start_catch_up(peers: &PeerSet, address: &str, since_ms: u64) -> Option<CatchUp> {
+/// Starts streaming every change `known` lacks from `peers`' change source
+/// on a blocking thread. `None` (logged) if there's no source.
+fn start_catch_up(peers: &PeerSet, address: &str, known: VersionVector) -> Option<CatchUp> {
     let Some(source) = peers.change_source().cloned() else {
         eprintln!("peer client '{address}': asked to catch up, but no change source is set");
         return None;
     };
-    eprintln!("peer client '{address}': catching up from {since_ms}");
-    let through_ms = crate::hub::now_ms();
+    eprintln!("peer client '{address}': catching up from {known:?}");
+    // Taken before the scan starts -- see `CatchUp::start`.
+    let start = peers.local_vector();
+    let legacy_origin = kblockdblib::legacy_origin(peers.node_id());
     let (tx, batches) = mpsc::channel(CATCH_UP_BUFFER);
     tokio::task::spawn_blocking(move || {
         let mut emit = |mut batch: Vec<ChangeEntry>| {
@@ -373,14 +401,11 @@ fn start_catch_up(peers: &PeerSet, address: &str, since_ms: u64) -> Option<Catch
             }
             true
         };
-        if let Err(e) = source.changes_since(since_ms, &mut emit) {
+        if let Err(e) = source.changes_since(&known, legacy_origin, &mut emit) {
             let _ = tx.blocking_send(Err(e));
         }
     });
-    Some(CatchUp {
-        batches,
-        through_ms,
-    })
+    Some(CatchUp { batches, start })
 }
 
 /// The next batch of the running catch-up; `None` once it's finished.
@@ -408,7 +433,7 @@ mod tests {
     use crate::hub::{publish_remove, publish_set};
     use crate::test_support::{spawn_node, wait_until, RecordingSink, TestNode, CLUSTER_SECRET};
     use crate::wire::ChangeOp;
-    use kblockdblib::{CellMeta, Value};
+    use kblockdblib::{CellMeta, Stamp, Value};
 
     const DB: &str = "db";
 
@@ -479,8 +504,8 @@ mod tests {
     }
 
     /// Reads until a `Synced`, returning every entry received before it
-    /// and the `through_ms` it carried.
-    async fn read_until_synced(stream: &mut TcpStream) -> (Vec<ChangeEntry>, u64) {
+    /// and the vector it confirmed.
+    async fn read_until_synced(stream: &mut TcpStream) -> (Vec<ChangeEntry>, VersionVector) {
         let mut entries = Vec::new();
         loop {
             let msg =
@@ -490,42 +515,72 @@ mod tests {
                     .unwrap();
             match msg {
                 Some(PeerMessage::ChangeBatch(batch)) => entries.extend(batch),
-                Some(PeerMessage::Synced { through_ms }) => return (entries, through_ms),
+                Some(PeerMessage::Synced { confirmed, .. }) => return (entries, confirmed),
                 Some(PeerMessage::PeerList(_)) => {}
                 other => panic!("unexpected {other:?}"),
             }
         }
     }
 
+    fn vector(entries: &[(u64, u64)]) -> VersionVector {
+        entries.iter().copied().collect()
+    }
+
+    const OTHER: u64 = 0xB;
+
     #[tokio::test]
-    async fn a_catch_up_request_streams_every_change_since_then_then_synced() {
+    async fn a_catch_up_request_streams_what_the_vector_lacks_then_synced() {
         let source = RecordingSink::new();
-        source.seed(DB, &[1], "k", Value::I64(1), 100);
-        source.seed(DB, &[2], "k", Value::I64(2), 300);
-        source.seed_removed(DB, &[3], "k", 400);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let peers = catch_up_peers(&source, 64);
+        let me = peers.node_id();
+        source.seed(DB, &[1], "k", Value::I64(1), 100, Stamp::new(OTHER, 1));
+        source.seed(DB, &[2], "k", Value::I64(2), 300, Stamp::new(OTHER, 2));
+        source.seed_removed(DB, &[3], "k", 400, Stamp::new(OTHER, 3));
+        source.seed(DB, &[4], "k", Value::I64(4), 50, Stamp::NONE);
         peers.add(listener.local_addr().unwrap().to_string());
         let mut stream = accept_link(&listener).await;
 
-        let before = crate::hub::now_ms();
-        crate::wire::write_message(&mut stream, &PeerMessage::CatchUpRequest { since_ms: 200 })
+        let request = PeerMessage::CatchUpRequest {
+            known: vector(&[(OTHER, 1)]),
+        };
+        crate::wire::write_message(&mut stream, &request)
             .await
             .unwrap();
-        let (mut entries, through_ms) = read_until_synced(&mut stream).await;
+        let (mut entries, confirmed) = read_until_synced(&mut stream).await;
         entries.sort_by(|a, b| a.coord.cmp(&b.coord));
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].coord, vec![2]);
-        assert_eq!(entries[0].op, ChangeOp::Set(Value::I64(2)));
-        assert_eq!(entries[1].coord, vec![3]);
-        assert_eq!(entries[1].op, ChangeOp::Remove);
-        assert_eq!(entries[1].modified_at_ms, 400);
-        assert!(through_ms >= before);
+        let got: Vec<(Vec<i32>, ChangeOp, Stamp)> = entries
+            .iter()
+            .map(|e| (e.coord.clone(), e.op.clone(), e.stamp()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (vec![2], ChangeOp::Set(Value::I64(2)), Stamp::new(OTHER, 2)),
+                (vec![3], ChangeOp::Remove, Stamp::new(OTHER, 3)),
+                // Legacy data: the request had no entry for this node's.
+                (vec![4], ChangeOp::Set(Value::I64(4)), Stamp::NONE),
+            ]
+        );
+        // Confirms the sender's own vector as of the catch-up's start:
+        // its own writes (none yet) and its legacy data.
+        assert_eq!(
+            confirmed,
+            vector(&[(me, 0), (kblockdblib::legacy_origin(me), 0)])
+        );
 
-        // Then, idle and caught up, it keeps confirming.
-        let (entries, later) = read_until_synced(&mut stream).await;
+        // Then, idle and caught up, it keeps confirming its own writes.
+        let seq = peers.hub().sequencer().assign().seq;
+        peers.hub().sequencer().published(seq);
+        let (entries, confirmed) = read_until_synced(&mut stream).await;
         assert!(entries.is_empty());
-        assert!(later >= through_ms);
+        assert!(confirmed.get(me) <= Some(seq));
+        loop {
+            let (_, confirmed) = read_until_synced(&mut stream).await;
+            if confirmed == vector(&[(me, seq)]) {
+                break;
+            }
+        }
     }
 
     #[tokio::test]
@@ -547,22 +602,34 @@ mod tests {
         let replication = Some(peers.hub().clone());
         peers.add(listener.local_addr().unwrap().to_string());
         let mut stream = accept_link(&listener).await;
-        crate::wire::write_message(&mut stream, &PeerMessage::CatchUpRequest { since_ms: 0 })
+        let request = PeerMessage::CatchUpRequest {
+            known: VersionVector::new(),
+        };
+        crate::wire::write_message(&mut stream, &request)
             .await
             .unwrap();
-        let (_, through_ms) = read_until_synced(&mut stream).await;
+        read_until_synced(&mut stream).await;
 
         // 20 writes with no await in between: on this single-threaded
         // runtime the link can't drain the 4-entry hub until they're all
         // published, so it lags and loses most of them from the hub.
         for i in 0..20 {
             let meta = CellMeta {
-                created_at_ms: through_ms + 1,
-                modified_at_ms: through_ms + 1,
+                created_at_ms: 100,
+                modified_at_ms: 100,
                 version: 0,
             };
-            source.seed(DB, &[i], "k", Value::I64(i64::from(i)), through_ms + 1);
-            publish_set(&replication, DB, &[i], "k", Value::I64(i64::from(i)), meta);
+            let stamp = peers.hub().sequencer().assign();
+            source.seed(DB, &[i], "k", Value::I64(i64::from(i)), 100, stamp);
+            publish_set(
+                &replication,
+                DB,
+                &[i],
+                "k",
+                Value::I64(i64::from(i)),
+                meta,
+                stamp,
+            );
         }
 
         let mut seen = std::collections::HashSet::new();
@@ -578,6 +645,40 @@ mod tests {
             "only {} of 20 entries arrived",
             seen.len()
         );
+    }
+
+    #[tokio::test]
+    async fn a_write_that_was_never_published_still_reaches_the_peer() {
+        let source = RecordingSink::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = catch_up_peers(&source, 64);
+        let replication = Some(peers.hub().clone());
+        peers.add(listener.local_addr().unwrap().to_string());
+        let mut stream = accept_link(&listener).await;
+        let request = PeerMessage::CatchUpRequest {
+            known: VersionVector::new(),
+        };
+        crate::wire::write_message(&mut stream, &request)
+            .await
+            .unwrap();
+        read_until_synced(&mut stream).await;
+
+        // Stored, but the write "failed" before publishing: the stamper
+        // releases it, which has the link catch the peer up.
+        {
+            let stamper = crate::hub::Stamper::new(&replication);
+            source.seed(DB, &[9], "k", Value::I64(9), 100, stamper.next());
+        }
+        let arrived = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let (entries, _) = read_until_synced(&mut stream).await;
+                if entries.iter().any(|e| e.coord == vec![9]) {
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(arrived.is_ok(), "the released write never arrived");
     }
 
     /// Regression: the link used to notice a dead peer only on its next
@@ -635,6 +736,7 @@ mod tests {
                         modified_at_ms: 10,
                         version: 0,
                     },
+                    Stamp::NONE,
                 );
             },
             || {
@@ -655,7 +757,7 @@ mod tests {
         let replication = Some(peers.hub().clone());
 
         publish_until_seen(
-            || publish_remove(&replication, DB, &[4, 5, 6], "material", 20),
+            || publish_remove(&replication, DB, &[4, 5, 6], "material", 20, Stamp::NONE),
             || sink.is_removed(DB, &[4, 5, 6], "material"),
         )
         .await;
@@ -682,6 +784,7 @@ mod tests {
                             modified_at_ms: 1,
                             version: 0,
                         },
+                        Stamp::NONE,
                     );
                 },
                 || sink.get(DB, &[i, 0, 0], "k") == Some((Value::I64(i as i64), 1, 1, 0)),

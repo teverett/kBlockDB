@@ -59,9 +59,11 @@ use axum::middleware;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
+use kblockdbcluster::hub::Stamper;
+use kblockdblib::{VersionVector, LEGACY_BIT};
 use kblockdbquery as query;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use utoipa::{OpenApi, ToSchema};
 use utoipa_swagger_ui::SwaggerUi;
 
@@ -134,6 +136,16 @@ pub struct HealthResponse {
     /// instance's link to is *currently up* -- a peer that's down or still
     /// being retried isn't listed. Empty unless clustering is configured.
     peers: Vec<String>,
+    /// This instance's cluster node id, as 16 hex digits; `null` unless
+    /// clustering is configured.
+    node_id: Option<String>,
+    /// This instance's version vector: per origin node (hex id; a
+    /// `-legacy` suffix marks that node's pre-clustering data), the
+    /// highest of its writes this instance is guaranteed to have (see
+    /// docs/clustering.md's "Catch-up"). Two instances with equal vectors
+    /// have seen exactly the same writes. Empty unless clustering is
+    /// configured.
+    vector: BTreeMap<String, u64>,
 }
 
 #[utoipa::path(
@@ -146,7 +158,7 @@ pub struct HealthResponse {
 )]
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let database_count = state.list_databases().await?.len();
-    let peers = peer_snapshot(&state)
+    let peers: Vec<String> = peer_snapshot(&state)
         .into_iter()
         .filter(|(_, connected)| *connected)
         .map(|(address, _)| address)
@@ -157,7 +169,36 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         database_count,
         timestamp: unix_timestamp(),
         peers,
+        node_id: state.peers.as_ref().map(|p| node_id_hex(p.node_id())),
+        vector: state
+            .peers
+            .as_ref()
+            .map(|p| vector_json(&p.local_vector()))
+            .unwrap_or_default(),
     }))
+}
+
+/// A node id as JSON shows it: 16 hex digits (a u64 doesn't fit in a
+/// JavaScript number).
+fn node_id_hex(node_id: u64) -> String {
+    format!("{node_id:016x}")
+}
+
+/// A version vector as JSON shows it: keyed by `node_id_hex`, with a
+/// node's legacy pseudo-origin (see `kblockdblib::legacy_origin`) as its
+/// id plus `-legacy`.
+fn vector_json(vector: &VersionVector) -> BTreeMap<String, u64> {
+    vector
+        .iter()
+        .map(|(origin, seq)| {
+            let key = if origin & LEGACY_BIT != 0 {
+                format!("{}-legacy", node_id_hex(origin & !LEGACY_BIT))
+            } else {
+                node_id_hex(origin)
+            };
+            (key, seq)
+        })
+        .collect()
 }
 
 /// Every known peer and whether this instance's link to it is up, sorted
@@ -180,12 +221,85 @@ pub struct ClusterPeer {
     host: String,
     /// Whether this instance's link to it is up right now.
     connected: bool,
+    /// The peer's node id (see `HealthResponse::node_id`); `null` until
+    /// this instance's link to it has connected once.
+    node_id: Option<String>,
+    /// The peer's version vector as it last reported it (every few
+    /// seconds while its link to this instance is up); `null` until it
+    /// has.
+    vector: Option<BTreeMap<String, u64>>,
+    /// The peer's vector compared with this instance's.
+    sync: SyncState,
+    /// Roughly how many writes this instance has that the peer doesn't:
+    /// the sum of the sequence-number gaps. Approximate -- a restart can
+    /// skip sequence numbers.
+    behind_by: u64,
+    /// Roughly how many writes the peer has that this instance doesn't.
+    ahead_by: u64,
+}
+
+/// How a peer's version vector compares with this instance's.
+#[derive(Serialize, ToSchema, Debug, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "snake_case")]
+pub enum SyncState {
+    /// Both have seen exactly the same writes.
+    InSync,
+    /// The peer is missing writes this instance has (it'll catch up).
+    Behind,
+    /// This instance is missing writes the peer has.
+    Ahead,
+    /// Each is missing some of the other's writes.
+    Diverged,
+    /// The peer hasn't reported its vector yet.
+    Unknown,
+}
+
+/// Compares `theirs` with `mine`: the sync state, then roughly how many
+/// writes they're missing (`behind_by`) and have that `mine` doesn't
+/// (`ahead_by`). An origin one side lacks entirely counts as missing.
+fn compare_vectors(mine: &VersionVector, theirs: &VersionVector) -> (SyncState, u64, u64) {
+    let (mut behind, mut ahead) = (false, false);
+    let (mut behind_by, mut ahead_by) = (0, 0);
+    for (origin, seq) in mine.iter() {
+        match theirs.get(origin) {
+            None => {
+                behind = true;
+                behind_by += seq;
+            }
+            Some(theirs) if theirs < seq => {
+                behind = true;
+                behind_by += seq - theirs;
+            }
+            Some(theirs) if theirs > seq => {
+                ahead = true;
+                ahead_by += theirs - seq;
+            }
+            Some(_) => {}
+        }
+    }
+    for (origin, seq) in theirs.iter() {
+        if mine.get(origin).is_none() {
+            ahead = true;
+            ahead_by += seq;
+        }
+    }
+    let state = match (behind, ahead) {
+        (false, false) => SyncState::InSync,
+        (true, false) => SyncState::Behind,
+        (false, true) => SyncState::Ahead,
+        (true, true) => SyncState::Diverged,
+    };
+    (state, behind_by, ahead_by)
 }
 
 #[derive(Serialize, ToSchema)]
 pub struct ClusterResponse {
     /// This instance's own name, same as `HealthResponse::hostname`.
     hostname: String,
+    /// Same as `HealthResponse::node_id`.
+    node_id: Option<String>,
+    /// Same as `HealthResponse::vector`.
+    vector: BTreeMap<String, u64>,
     peers: Vec<ClusterPeer>,
 }
 
@@ -200,12 +314,40 @@ pub struct ClusterResponse {
     security(("basic_auth" = [])),
 )]
 async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
-    let peers = peer_snapshot(&state)
+    let Some(peer_set) = state.peers.as_ref() else {
+        return Json(ClusterResponse {
+            hostname: state.hostname.to_string(),
+            node_id: None,
+            vector: BTreeMap::new(),
+            peers: Vec::new(),
+        });
+    };
+    let mine = peer_set.local_vector();
+    let peers = peer_set
+        .snapshot()
         .into_iter()
-        .map(|(host, connected)| ClusterPeer { host, connected })
+        .map(|(host, connected)| {
+            let node_id = peer_set.node_for(&host);
+            let theirs = node_id.and_then(|id| peer_set.vectors().peer(id));
+            let (sync, behind_by, ahead_by) = match &theirs {
+                Some(theirs) => compare_vectors(&mine, theirs),
+                None => (SyncState::Unknown, 0, 0),
+            };
+            ClusterPeer {
+                host,
+                connected,
+                node_id: node_id.map(node_id_hex),
+                vector: theirs.as_ref().map(vector_json),
+                sync,
+                behind_by,
+                ahead_by,
+            }
+        })
         .collect();
     Json(ClusterResponse {
         hostname: state.hostname.to_string(),
+        node_id: Some(node_id_hex(peer_set.node_id())),
+        vector: vector_json(&mine),
         peers,
     })
 }
@@ -508,10 +650,14 @@ async fn set_cell(
     let coord = parse_coords(&coords)?;
     let value: kblockdblib::Value = body.into();
     let (coord2, key2, value2) = (coord.clone(), key.clone(), value.clone());
-    let meta = state
-        .with_database(&db, move |w| w.set(&coord, &key, value))
+    let stamper = Stamper::new(&state.replication);
+    let stamps = stamper.clone();
+    let (meta, stamp) = state
+        .with_database(&db, move |w| {
+            w.set_stamped(&coord, &key, value, &mut || stamps.next())
+        })
         .await?;
-    kblockdbcluster::hub::publish_set(&state.replication, &db, &coord2, &key2, value2, meta);
+    stamper.publish_set(&db, &coord2, &key2, value2, meta, stamp);
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -539,13 +685,17 @@ async fn remove_cell(
 ) -> Result<StatusCode, ApiError> {
     let coord = parse_coords(&coords)?;
     let (coord2, key2) = (coord.clone(), key.clone());
-    let removed_at = state
-        .with_database(&db, move |w| w.remove(&coord, &key))
+    let stamper = Stamper::new(&state.replication);
+    let stamps = stamper.clone();
+    let removed = state
+        .with_database(&db, move |w| {
+            w.remove_stamped(&coord, &key, &mut || stamps.next())
+        })
         .await?;
     // Only a value that was actually there is replicated, at the time
     // `remove` recorded for it.
-    if let Some(removed_at) = removed_at {
-        kblockdbcluster::hub::publish_remove(&state.replication, &db, &coord2, &key2, removed_at);
+    if let Some((removed_at, stamp)) = removed {
+        stamper.publish_remove(&db, &coord2, &key2, removed_at, stamp);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -630,11 +780,15 @@ async fn set_region(
     let region = kblockdblib::Region::new(origin, extent);
     let values: Vec<kblockdblib::Value> = body.values.into_iter().map(Into::into).collect();
     let (region2, key2, values2) = (region.clone(), key.clone(), values.clone());
-    let metas = state
-        .with_database(&db, move |w| w.set_region(&region, &key, &values))
+    let stamper = Stamper::new(&state.replication);
+    let stamps = stamper.clone();
+    let written = state
+        .with_database(&db, move |w| {
+            w.set_region_stamped(&region, &key, &values, &mut || stamps.next())
+        })
         .await?;
-    for ((coord, value), meta) in region2.iter().zip(values2).zip(metas) {
-        kblockdbcluster::hub::publish_set(&state.replication, &db, &coord, &key2, value, meta);
+    for ((coord, value), (meta, stamp)) in region2.iter().zip(values2).zip(written) {
+        stamper.publish_set(&db, &coord, &key2, value, meta, stamp);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -666,11 +820,15 @@ async fn remove_region(
     let extent = parse_coords(&extent)?;
     let region = kblockdblib::Region::new(origin, extent);
     let key2 = key.clone();
+    let stamper = Stamper::new(&state.replication);
+    let stamps = stamper.clone();
     let removed = state
-        .with_database(&db, move |w| w.remove_region(&region, &key))
+        .with_database(&db, move |w| {
+            w.remove_region_stamped(&region, &key, &mut || stamps.next())
+        })
         .await?;
-    for coord in &removed.coords {
-        kblockdbcluster::hub::publish_remove(&state.replication, &db, coord, &key2, removed.at_ms);
+    for (coord, stamp) in &removed.cells {
+        stamper.publish_remove(&db, coord, &key2, removed.at_ms, *stamp);
     }
     Ok(StatusCode::NO_CONTENT)
 }
@@ -905,28 +1063,10 @@ pub(crate) async fn execute_query(
                 .map(|c| c.coord.to_vec())
                 .collect();
             let affected = matching.len();
-            let written: Vec<(Vec<i32>, String, kblockdblib::Value, kblockdblib::CellMeta)> = state
-                .with_database(db, move |w| {
-                    let mut written = Vec::new();
-                    for coord in &matching {
-                        for (key, literal) in &assignments {
-                            let value = literal.to_value();
-                            let meta = w.set(coord, key, value.clone())?;
-                            written.push((coord.clone(), key.clone(), value, meta));
-                        }
-                    }
-                    Ok(written)
-                })
-                .await?;
-            for (coord, key, value, meta) in written {
-                kblockdbcluster::hub::publish_set(
-                    &state.replication,
-                    db,
-                    &coord,
-                    &key,
-                    value,
-                    meta,
-                );
+            let stamper = Stamper::new(&state.replication);
+            let written = set_each(state, db, matching, assignments, &stamper).await?;
+            for (coord, key, value, meta, stamp) in written {
+                stamper.publish_set(db, &coord, &key, value, meta, stamp);
             }
             Ok(QueryResponse::affected(affected))
         }
@@ -948,21 +1088,25 @@ pub(crate) async fn execute_query(
                 })
                 .collect();
             let affected = matching.len();
+            let stamper = Stamper::new(&state.replication);
+            let stamps = stamper.clone();
             let removed = state
                 .with_database(db, move |w| {
                     let mut removed = Vec::new();
                     for (coord, keys) in matching {
                         for key in keys {
-                            if let Some(at) = w.remove(&coord, &key)? {
-                                removed.push((coord.clone(), key, at));
+                            if let Some((at, stamp)) =
+                                w.remove_stamped(&coord, &key, &mut || stamps.next())?
+                            {
+                                removed.push((coord.clone(), key, at, stamp));
                             }
                         }
                     }
                     Ok(removed)
                 })
                 .await?;
-            for (coord, key, at) in &removed {
-                kblockdbcluster::hub::publish_remove(&state.replication, db, coord, key, *at);
+            for (coord, key, at, stamp) in &removed {
+                stamper.publish_remove(db, coord, key, *at, *stamp);
             }
             Ok(QueryResponse::affected(affected))
         }
@@ -1008,25 +1152,25 @@ async fn execute_set(
             .collect();
         let region2 = region.clone();
         let values2 = values.clone();
-        let per_key_metas: Vec<Vec<kblockdblib::CellMeta>> = state
+        let stamper = Stamper::new(&state.replication);
+        let stamps = stamper.clone();
+        let per_key_written = state
             .with_database(db, move |w| {
-                let mut per_key_metas = Vec::with_capacity(values.len());
+                let mut per_key_written = Vec::with_capacity(values.len());
                 for (key, value) in &values {
-                    per_key_metas.push(w.set_region(&region, key, &vec![value.clone(); volume])?);
+                    per_key_written.push(w.set_region_stamped(
+                        &region,
+                        key,
+                        &vec![value.clone(); volume],
+                        &mut || stamps.next(),
+                    )?);
                 }
-                Ok(per_key_metas)
+                Ok(per_key_written)
             })
             .await?;
-        for ((key, value), metas) in values2.into_iter().zip(per_key_metas) {
-            for (coord, meta) in region2.iter().zip(metas) {
-                kblockdbcluster::hub::publish_set(
-                    &state.replication,
-                    db,
-                    &coord,
-                    &key,
-                    value.clone(),
-                    meta,
-                );
+        for ((key, value), written) in values2.into_iter().zip(per_key_written) {
+            for (coord, (meta, stamp)) in region2.iter().zip(written) {
+                stamper.publish_set(db, &coord, &key, value.clone(), meta, stamp);
             }
         }
         return Ok(QueryResponse::affected(volume));
@@ -1054,23 +1198,48 @@ async fn execute_set(
         .collect();
 
     let affected = targets.len();
-    let written: Vec<(Vec<i32>, String, kblockdblib::Value, kblockdblib::CellMeta)> = state
+    let stamper = Stamper::new(&state.replication);
+    let written = set_each(state, db, targets, assignments, &stamper).await?;
+    for (coord, key, value, meta, stamp) in written {
+        stamper.publish_set(db, &coord, &key, value, meta, stamp);
+    }
+    Ok(QueryResponse::affected(affected))
+}
+
+/// One write of a query's `UPDATE`/`SET ... WHERE`: what was written where,
+/// and the metadata and stamp it got.
+type Written = (
+    Vec<i32>,
+    String,
+    kblockdblib::Value,
+    kblockdblib::CellMeta,
+    kblockdblib::Stamp,
+);
+
+/// Writes every assignment at every coordinate in `coords`, stamping each
+/// write from `stamper` -- shared by `UPDATE` and `SET ... WHERE`.
+async fn set_each(
+    state: &AppState,
+    db: &str,
+    coords: Vec<Vec<i32>>,
+    assignments: Vec<(String, query::Literal)>,
+    stamper: &Stamper,
+) -> Result<Vec<Written>, ApiError> {
+    let stamps = stamper.clone();
+    state
         .with_database(db, move |w| {
             let mut written = Vec::new();
-            for coord in &targets {
+            for coord in &coords {
                 for (key, literal) in &assignments {
                     let value = literal.to_value();
-                    let meta = w.set(coord, key, value.clone())?;
-                    written.push((coord.clone(), key.clone(), value, meta));
+                    let (meta, stamp) =
+                        w.set_stamped(coord, key, value.clone(), &mut || stamps.next())?;
+                    written.push((coord.clone(), key.clone(), value, meta, stamp));
                 }
             }
             Ok(written)
         })
-        .await?;
-    for (coord, key, value, meta) in written {
-        kblockdbcluster::hub::publish_set(&state.replication, db, &coord, &key, value, meta);
-    }
-    Ok(QueryResponse::affected(affected))
+        .await
 }
 
 fn range_to_region(range: &query::Range) -> kblockdblib::Region {

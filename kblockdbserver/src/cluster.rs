@@ -14,7 +14,7 @@ use crate::state::AppState;
 use kblockdbcluster::server::ReplicationSink;
 use kblockdbcluster::source::ChangeSource;
 use kblockdbcluster::wire::{ChangeEntry, ChangeOp};
-use kblockdblib::{CellMeta, Change, ChangeKind, Value};
+use kblockdblib::{CellMeta, Change, ChangeKind, Stamp, Value, VersionVector};
 
 impl ReplicationSink for AppState {
     async fn apply_set(
@@ -24,11 +24,13 @@ impl ReplicationSink for AppState {
         key: String,
         value: Value,
         meta: CellMeta,
+        stamp: Stamp,
     ) -> Result<(), String> {
         let (coord2, key2, value2) = (coord.clone(), key.clone(), value.clone());
         match self
             .with_database(&database, move |w| {
-                w.apply_replicated(&coord, &key, value, meta).map(|_| ())
+                w.apply_replicated_stamped(&coord, &key, value, meta, stamp)
+                    .map(|_| ())
             })
             .await
         {
@@ -41,7 +43,8 @@ impl ReplicationSink for AppState {
                 match self.create_database(&database, None).await {
                     Ok(()) | Err(ApiError::Conflict(_)) => self
                         .with_database(&database, move |w| {
-                            w.apply_replicated(&coord2, &key2, value2, meta).map(|_| ())
+                            w.apply_replicated_stamped(&coord2, &key2, value2, meta, stamp)
+                                .map(|_| ())
                         })
                         .await
                         .map_err(|e| format!("{e:?}")),
@@ -58,6 +61,7 @@ impl ReplicationSink for AppState {
         coord: Vec<i32>,
         key: String,
         modified_at_ms: u64,
+        stamp: Stamp,
     ) -> Result<(), String> {
         // No auto-create-on-NotFound here: a database this server has
         // never seen can't have anything to remove from anyway, so a
@@ -66,7 +70,7 @@ impl ReplicationSink for AppState {
         // reach, without the extra round trip).
         match self
             .with_database(&database, move |w| {
-                w.apply_replicated_remove(&coord, &key, modified_at_ms)
+                w.apply_replicated_remove_stamped(&coord, &key, modified_at_ms, stamp)
                     .map(|_| ())
             })
             .await
@@ -138,16 +142,18 @@ fn change_from_entry(entry: &ChangeEntry) -> Change {
             ),
             ChangeOp::Remove => ChangeKind::Removed(entry.modified_at_ms),
         },
+        stamp: entry.stamp(),
     }
 }
 
-/// Every database's changes since a time, read straight from each `World`
-/// (this runs on a blocking thread -- see `ChangeSource`). A database
-/// removed mid-scan is skipped.
+/// Every database's changes a vector lacks, read straight from each
+/// `World` (this runs on a blocking thread -- see `ChangeSource`). A
+/// database removed mid-scan is skipped.
 impl ChangeSource for AppState {
     fn changes_since(
         &self,
-        since_ms: u64,
+        known: &VersionVector,
+        legacy_origin: u64,
         emit: &mut dyn FnMut(Vec<ChangeEntry>) -> bool,
     ) -> Result<(), String> {
         let names = self.databases.list().map_err(|e| e.to_string())?;
@@ -159,7 +165,7 @@ impl ChangeSource for AppState {
             };
             let mut more = true;
             world
-                .changes_since(since_ms, |batch| {
+                .changes_since(known, legacy_origin, |batch| {
                     let entries = batch
                         .into_iter()
                         .map(|change| change_entry(&database, change))
@@ -196,6 +202,8 @@ fn change_entry(database: &str, change: Change) -> ChangeEntry {
         created_at_ms: meta.created_at_ms,
         modified_at_ms: meta.modified_at_ms,
         version: meta.version,
+        origin: change.stamp.origin,
+        seq: change.stamp.seq,
     }
 }
 
@@ -214,10 +222,18 @@ mod tests {
         }
     }
 
-    fn all_changes_since(state: &AppState, since_ms: u64) -> Vec<ChangeEntry> {
+    const A: u64 = 0xA;
+    const B: u64 = 0xB;
+    const LEGACY: u64 = 0xC | kblockdblib::LEGACY_BIT;
+
+    fn vector(entries: &[(u64, u64)]) -> VersionVector {
+        entries.iter().copied().collect()
+    }
+
+    fn all_changes_since(state: &AppState, known: &VersionVector) -> Vec<ChangeEntry> {
         let mut out = Vec::new();
         state
-            .changes_since(since_ms, &mut |batch| {
+            .changes_since(known, LEGACY, &mut |batch| {
                 out.extend(batch);
                 true
             })
@@ -241,16 +257,35 @@ mod tests {
         state.databases.create("other", None).unwrap();
         let db = state.databases.get(DB).unwrap();
         let other = state.databases.get("other").unwrap();
-        db.apply_replicated(&[1, 1, 1], "k", Value::I64(1), meta_at(100))
+        db.apply_replicated_stamped(
+            &[1, 1, 1],
+            "k",
+            Value::I64(1),
+            meta_at(100),
+            Stamp::new(A, 1),
+        )
+        .unwrap();
+        db.apply_replicated_stamped(
+            &[2, 2, 2],
+            "k",
+            Value::I64(2),
+            meta_at(300),
+            Stamp::new(A, 2),
+        )
+        .unwrap();
+        db.apply_replicated_remove_stamped(&[1, 1, 1], "k", 400, Stamp::new(B, 1))
             .unwrap();
-        db.apply_replicated(&[2, 2, 2], "k", Value::I64(2), meta_at(300))
-            .unwrap();
-        db.apply_replicated_remove(&[1, 1, 1], "k", 400).unwrap();
         other
-            .apply_replicated(&[3, 3, 3], "k", Value::I64(3), meta_at(500))
+            .apply_replicated_stamped(
+                &[3, 3, 3],
+                "k",
+                Value::I64(3),
+                meta_at(500),
+                Stamp::new(B, 2),
+            )
             .unwrap();
 
-        let changes = all_changes_since(&state, 200);
+        let changes = all_changes_since(&state, &vector(&[(A, 1)]));
         assert_eq!(changes.len(), 3);
         assert_eq!(
             (
@@ -272,9 +307,13 @@ mod tests {
         assert_eq!(changes[1].modified_at_ms, 300);
         assert_eq!(changes[2].database, "other");
 
-        let changes = all_changes_since(&state, 450);
+        assert_eq!(changes[0].stamp(), Stamp::new(B, 1));
+        assert_eq!(changes[2].stamp(), Stamp::new(B, 2));
+
+        let changes = all_changes_since(&state, &vector(&[(A, 2), (B, 1)]));
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].database, "other");
+        assert!(all_changes_since(&state, &vector(&[(A, 2), (B, 2)])).is_empty());
     }
 
     fn entry(database: &str, coord: Vec<i32>, op: ChangeOp, ms: u64) -> ChangeEntry {
@@ -286,6 +325,8 @@ mod tests {
             created_at_ms: ms,
             modified_at_ms: ms,
             version: 0,
+            origin: A,
+            seq: ms,
         }
     }
 
@@ -340,7 +381,7 @@ mod tests {
         }
         let mut batches = 0;
         state
-            .changes_since(0, &mut |_| {
+            .changes_since(&VersionVector::new(), LEGACY, &mut |_| {
                 batches += 1;
                 false
             })
@@ -402,6 +443,7 @@ mod tests {
                     modified_at_ms: 10,
                     version: 0,
                 },
+                Stamp::NONE,
             )
             .await
             .unwrap();
@@ -433,6 +475,7 @@ mod tests {
                     modified_at_ms: 1,
                     version: 0,
                 },
+                Stamp::NONE,
             )
             .await
             .unwrap();
@@ -463,6 +506,7 @@ mod tests {
                     modified_at_ms: 200,
                     version: 1,
                 },
+                Stamp::NONE,
             )
             .await
             .unwrap();
@@ -481,6 +525,7 @@ mod tests {
                     modified_at_ms: 150,
                     version: 9,
                 },
+                Stamp::NONE,
             )
             .await
             .unwrap();
@@ -507,6 +552,7 @@ mod tests {
                 vec![0, 0, 0],
                 "k".to_string(),
                 1,
+                Stamp::NONE,
             )
             .await
             .unwrap();
@@ -529,12 +575,19 @@ mod tests {
                     modified_at_ms: 10,
                     version: 0,
                 },
+                Stamp::NONE,
             )
             .await
             .unwrap();
 
         state
-            .apply_remove(DB.to_string(), vec![1, 1, 1], "material".to_string(), 20)
+            .apply_remove(
+                DB.to_string(),
+                vec![1, 1, 1],
+                "material".to_string(),
+                20,
+                Stamp::NONE,
+            )
             .await
             .unwrap();
 

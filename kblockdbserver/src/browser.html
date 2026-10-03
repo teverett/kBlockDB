@@ -53,7 +53,9 @@
       <thead>
         <tr>
           <th>Host</th>
+          <th>Node</th>
           <th>Status</th>
+          <th title="This peer's version vector -- every write it's guaranteed to have, per origin -- compared with this server's">Sync</th>
         </tr>
       </thead>
       <tbody id="cluster-rows"></tbody>
@@ -368,13 +370,54 @@
     }
   }
 
-  function clusterRow(host, connected) {
+  // One row of the Cluster tab. `peer` is a `/rest/cluster` peer, or
+  // null for this server's own row (`self` = that response).
+  function clusterRow(host, nodeId, connected, peer, self) {
     const tr = document.createElement("tr");
     tr.appendChild(cell("td", host));
+    const nodeTd = cell("td", nodeId || "");
+    nodeTd.className = "node-id";
+    tr.appendChild(nodeTd);
     const statusTd = cell("td", connected ? "connected" : "not connected");
     statusTd.className = connected ? "status-up" : "status-down";
     tr.appendChild(statusTd);
+    tr.appendChild(peer ? syncCell(peer, self) : cell("td", ""));
     return tr;
+  }
+
+  const SYNC_LABELS = {
+    in_sync: "in sync",
+    behind: "behind",
+    ahead: "ahead",
+    diverged: "diverged",
+    unknown: "unknown",
+  };
+
+  // A peer's sync state: "in sync", "behind ~N" (it lacks N of this
+  // server's writes), "ahead ~N" (this server lacks N of its writes),
+  // "diverged", or "unknown" (no vector reported yet). Counts are
+  // approximate -- a restart can skip sequence numbers. The tooltip shows
+  // both vectors.
+  function syncCell(peer, self) {
+    let text = SYNC_LABELS[peer.sync] || peer.sync;
+    if (peer.sync === "behind") text += " ~" + peer.behind_by;
+    if (peer.sync === "ahead") text += " ~" + peer.ahead_by;
+    if (peer.sync === "diverged") {
+      text += " (~" + peer.behind_by + " / ~" + peer.ahead_by + ")";
+    }
+    const td = cell("td", text);
+    td.className = "sync-" + peer.sync;
+    if (peer.vector) {
+      td.title = "this server: " + formatVector(self.vector) + "\npeer: " + formatVector(peer.vector);
+    }
+    return td;
+  }
+
+  function formatVector(vector) {
+    return Object.keys(vector)
+      .sort()
+      .map(function (origin) { return origin + "=" + vector[origin]; })
+      .join(", ") || "(empty)";
   }
 
   // Populates the Cluster tab from `GET /rest/cluster` -- this instance
@@ -400,9 +443,11 @@
     }
     const data = await resp.json();
 
-    clusterRowsBody.appendChild(clusterRow(data.hostname + " (this server)", true));
+    clusterRowsBody.appendChild(
+      clusterRow(data.hostname + " (this server)", data.node_id, true, null, data)
+    );
     (data.peers || []).forEach(function (p) {
-      clusterRowsBody.appendChild(clusterRow(p.host, p.connected));
+      clusterRowsBody.appendChild(clusterRow(p.host, p.node_id, p.connected, p, data));
     });
 
     if (!data.peers || data.peers.length === 0) {
