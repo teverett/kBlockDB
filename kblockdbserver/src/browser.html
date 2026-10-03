@@ -8,35 +8,58 @@
 </head>
 <body>
   <h1>kBlockDB</h1>
-  <p class="sub">Results of the query below, sorted ascending by coordinate. Click a row for its full keys and values.</p>
 
-  <div class="query-bar">
-    <input id="query" type="text" value="SELECT *" placeholder="SELECT * WHERE material = 'stone'  (read-only -- SELECT only)" autocomplete="off" spellcheck="false">
-    <button id="run-query" type="button">Run</button>
+  <nav class="tabs" role="tablist">
+    <button id="tab-btn-browser" class="tab-btn active" type="button" role="tab" aria-selected="true" aria-controls="tab-browser">Browser</button>
+    <button id="tab-btn-cluster" class="tab-btn" type="button" role="tab" aria-selected="false" aria-controls="tab-cluster">Cluster</button>
+  </nav>
+
+  <div id="tab-browser" class="tab-panel" role="tabpanel">
+    <p class="sub">Results of the query below, sorted ascending by coordinate. Click a row for its full keys and values.</p>
+
+    <div class="query-bar">
+      <input id="query" type="text" value="SELECT *" placeholder="SELECT * WHERE material = 'stone'  (read-only -- SELECT only)" autocomplete="off" spellcheck="false">
+      <button id="run-query" type="button">Run</button>
+    </div>
+    <div id="query-status" class="muted"></div>
+
+    <div class="toolbar">
+      <select id="database" aria-label="Database"></select>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Coordinate</th>
+          <th># keys</th>
+          <th>Created</th>
+          <th>Modified</th>
+        </tr>
+      </thead>
+      <tbody id="rows"></tbody>
+    </table>
+    <p id="empty" class="empty" hidden>No cells match.</p>
+
+    <div class="pager">
+      <button id="prev" type="button">&larr; Prev</button>
+      <span id="page-info" class="muted"></span>
+      <button id="next" type="button">Next &rarr;</button>
+    </div>
   </div>
-  <div id="query-status" class="muted"></div>
 
-  <div class="toolbar">
-    <select id="database" aria-label="Database"></select>
-  </div>
-
-  <table>
-    <thead>
-      <tr>
-        <th>Coordinate</th>
-        <th># keys</th>
-        <th>Created</th>
-        <th>Modified</th>
-      </tr>
-    </thead>
-    <tbody id="rows"></tbody>
-  </table>
-  <p id="empty" class="empty" hidden>No cells match.</p>
-
-  <div class="pager">
-    <button id="prev" type="button">&larr; Prev</button>
-    <span id="page-info" class="muted"></span>
-    <button id="next" type="button">Next &rarr;</button>
+  <div id="tab-cluster" class="tab-panel" hidden role="tabpanel">
+    <p class="sub">Every host this server knows about: itself, plus any peer it's configured to replicate to or that has connected into it (see <code>/rest/cluster</code>).</p>
+    <table>
+      <thead>
+        <tr>
+          <th>Host</th>
+          <th>Direction</th>
+          <th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="cluster-rows"></tbody>
+    </table>
+    <p id="cluster-empty" class="empty" hidden></p>
   </div>
 
   <div id="modal-backdrop">
@@ -82,6 +105,13 @@
   const modalTitle = document.getElementById("modal-title");
   const modalRows = document.getElementById("modal-rows");
   const modalClose = document.getElementById("modal-close");
+
+  const tabBtnBrowser = document.getElementById("tab-btn-browser");
+  const tabBtnCluster = document.getElementById("tab-btn-cluster");
+  const tabBrowser = document.getElementById("tab-browser");
+  const tabCluster = document.getElementById("tab-cluster");
+  const clusterRowsBody = document.getElementById("cluster-rows");
+  const clusterEmpty = document.getElementById("cluster-empty");
 
   // Every helper below builds DOM nodes via createElement/textContent,
   // never innerHTML, for anything derived from cell data (coordinates are
@@ -320,6 +350,75 @@
   function closeModal() {
     backdrop.classList.remove("open");
   }
+
+  // Shows the named tab's panel and hides the other -- `name` is
+  // `"browser"` or `"cluster"`. Reloads the cluster tab's own data every
+  // time it's switched to (rather than once, on first open) so switching
+  // back to it after time has passed reflects any peer that's connected
+  // or dropped since.
+  function showTab(name) {
+    const browserActive = name === "browser";
+    tabBrowser.hidden = !browserActive;
+    tabCluster.hidden = browserActive;
+    tabBtnBrowser.classList.toggle("active", browserActive);
+    tabBtnBrowser.setAttribute("aria-selected", String(browserActive));
+    tabBtnCluster.classList.toggle("active", !browserActive);
+    tabBtnCluster.setAttribute("aria-selected", String(!browserActive));
+    if (!browserActive) {
+      loadCluster();
+    }
+  }
+
+  function clusterRow(host, direction, connected) {
+    const tr = document.createElement("tr");
+    tr.appendChild(cell("td", host));
+    tr.appendChild(cell("td", direction));
+    const statusTd = cell("td", connected ? "connected" : "not connected");
+    statusTd.className = connected ? "status-up" : "status-down";
+    tr.appendChild(statusTd);
+    return tr;
+  }
+
+  // Populates the Cluster tab from `GET /rest/cluster` -- this instance
+  // itself, plus every configured outbound peer (connected or not) and
+  // every peer currently connected into it (see `docs/clustering.md`).
+  // Not live-updating on its own; `showTab` re-runs this every time the
+  // tab is opened instead.
+  async function loadCluster() {
+    clusterRowsBody.textContent = "";
+    clusterEmpty.hidden = true;
+    let resp;
+    try {
+      resp = await fetch("rest/cluster");
+    } catch (e) {
+      clusterEmpty.hidden = false;
+      clusterEmpty.textContent = "request failed: " + e;
+      return;
+    }
+    if (!resp.ok) {
+      clusterEmpty.hidden = false;
+      clusterEmpty.textContent = resp.status + ": " + resp.statusText;
+      return;
+    }
+    const data = await resp.json();
+
+    clusterRowsBody.appendChild(clusterRow(data.hostname + " (this server)", "", true));
+    (data.peers || []).forEach(function (p) {
+      clusterRowsBody.appendChild(clusterRow(p.host, p.direction, p.connected));
+    });
+
+    if (!data.peers || data.peers.length === 0) {
+      clusterEmpty.hidden = false;
+      clusterEmpty.textContent = "No peers configured or connected -- see docs/clustering.md.";
+    }
+  }
+
+  tabBtnBrowser.addEventListener("click", function () {
+    showTab("browser");
+  });
+  tabBtnCluster.addEventListener("click", function () {
+    showTab("cluster");
+  });
 
   modalClose.addEventListener("click", closeModal);
   backdrop.addEventListener("click", function (e) {

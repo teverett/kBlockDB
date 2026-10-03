@@ -9,9 +9,10 @@
 
 use crate::error::ErrorBody;
 use crate::routes::{
-    self, AddColumnBody, AggregateResponse, CellResponse, ColumnResponse, ColumnsResponse,
-    CreateDatabaseBody, DatabasesResponse, HealthResponse, QueryKeyValue, QueryRequest,
-    QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody, StatsResponse,
+    self, AddColumnBody, AggregateResponse, CellResponse, ClusterPeer, ClusterResponse,
+    ColumnResponse, ColumnsResponse, CreateDatabaseBody, DatabasesResponse, HealthResponse,
+    QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody,
+    StatsResponse,
 };
 use crate::value_json::{ValueJson, ValueTypeJson};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -30,6 +31,7 @@ use utoipa::{Modify, OpenApi};
     ),
     paths(
         routes::health,
+        routes::cluster,
         routes::list_databases,
         routes::create_database,
         routes::remove_database,
@@ -47,6 +49,8 @@ use utoipa::{Modify, OpenApi};
     ),
     components(schemas(
         HealthResponse,
+        ClusterResponse,
+        ClusterPeer,
         DatabasesResponse,
         CreateDatabaseBody,
         StatsResponse,

@@ -6,6 +6,28 @@ body {
 }
 h1 { font-size: 1.3rem; margin-bottom: 0.25rem; }
 p.sub { color: #666; margin-top: 0; }
+.tabs {
+  display: flex;
+  gap: 0.25rem;
+  border-bottom: 1px solid #ccc;
+  margin: 1rem 0 1.25rem;
+}
+.tab-btn {
+  padding: 0.5rem 1rem;
+  font-size: 0.95rem;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.7;
+}
+.tab-btn:hover { opacity: 1; }
+.tab-btn.active {
+  opacity: 1;
+  border-bottom-color: #4080ff;
+  font-weight: 600;
+}
 .query-bar {
   display: flex;
   gap: 0.75rem;
@@ -64,6 +86,8 @@ th { background: rgba(127, 127, 127, 0.08); }
 tbody tr.row { cursor: pointer; }
 tbody tr.row:hover { background: rgba(64, 128, 255, 0.08); }
 td.coord { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+td.status-up { color: #2e8b57; font-weight: 600; }
+td.status-down { color: #c0392b; font-weight: 600; }
 .pager {
   display: flex;
   align-items: center;

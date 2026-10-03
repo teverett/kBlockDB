@@ -260,6 +260,14 @@ impl Databases {
 /// exactly one `kblockdbserver` per data directory; scale by giving it more
 /// threads (it already uses as many as the async runtime has, see
 /// `with_database`), not by running more of it.
+/// One configured `[[peers]]` entry plus its own live connection status --
+/// see `AppState::outbound_peers`.
+#[derive(Clone)]
+pub struct OutboundPeer {
+    pub address: String,
+    pub status: kblockdbcluster::client::ConnectionStatus,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub databases: Databases,
@@ -274,13 +282,13 @@ pub struct AppState {
     /// `cluster.rs` (this server's `ReplicationSink` impl, which
     /// `kblockdbcluster::server::serve` applies incoming changes through).
     pub replication: Option<Arc<kblockdbcluster::hub::ReplicationHub>>,
-    /// The `address` of every configured `[[peers]]` entry -- empty
-    /// unless clustering is configured. Reported by `/rest/health` so a
-    /// caller can see this instance's outbound cluster membership without
-    /// reading its config file. Just the configured list, not whether
-    /// `kblockdbcluster::client::run` has actually managed to connect to
-    /// each one.
-    pub peers: Arc<Vec<String>>,
+    /// Every configured `[[peers]]` entry, paired with its own live
+    /// connection status -- empty unless clustering is configured. Each
+    /// `OutboundPeer::status` is shared with (and only ever written by)
+    /// the `kblockdbcluster::client::run` task dialing that one peer, so
+    /// reading it here always reflects that task's current state, not a
+    /// snapshot taken at startup.
+    pub outbound_peers: Arc<Vec<OutboundPeer>>,
     /// Who currently has a live *inbound* connection to this instance's
     /// peer listener, by their own self-reported `server_id` -- `None`
     /// unless clustering is configured, in which case it's always
@@ -298,7 +306,7 @@ impl AppState {
             databases,
             hostname: Arc::from(os_hostname()),
             replication: None,
-            peers: Arc::new(Vec::new()),
+            outbound_peers: Arc::new(Vec::new()),
             connected_peers: None,
             credentials,
         }
@@ -323,11 +331,11 @@ impl AppState {
         self
     }
 
-    /// Records this instance's configured peer addresses, for
-    /// `/rest/health` to report. See this struct's `peers` field doc
+    /// Records this instance's configured peers and their (shared, live)
+    /// connection status. See this struct's `outbound_peers` field doc
     /// comment.
-    pub fn with_peers(mut self, peers: Vec<String>) -> Self {
-        self.peers = Arc::new(peers);
+    pub fn with_outbound_peers(mut self, peers: Vec<OutboundPeer>) -> Self {
+        self.outbound_peers = Arc::new(peers);
         self
     }
 

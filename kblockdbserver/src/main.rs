@@ -383,9 +383,21 @@ async fn main() {
 
         let hub = kblockdbcluster::hub::ReplicationHub::new();
         let peer_registry = kblockdbcluster::registry::PeerRegistry::new();
+        // One `ConnectionStatus` per configured peer, created here (before
+        // the matching `client::run` task is spawned below) so `AppState`
+        // and that task share the exact same flag -- `AppState` only ever
+        // reads it, `run` is the only writer.
+        let outbound_peers: Vec<state::OutboundPeer> = config
+            .peers
+            .iter()
+            .map(|p| state::OutboundPeer {
+                address: p.address.clone(),
+                status: kblockdbcluster::client::ConnectionStatus::new(),
+            })
+            .collect();
         state = state
             .with_replication(hub.clone())
-            .with_peers(config.peers.iter().map(|p| p.address.clone()).collect())
+            .with_outbound_peers(outbound_peers.clone())
             .with_peer_registry(peer_registry.clone());
 
         let peer_state = state.clone();
@@ -396,13 +408,14 @@ async fn main() {
         });
 
         let server_id = state.hostname.to_string();
-        for peer in &config.peers {
+        for peer in &outbound_peers {
             let address = peer.address.clone();
             let secret = cluster_secret.clone();
             let server_id = server_id.clone();
             let hub = hub.clone();
+            let status = peer.status.clone();
             tokio::spawn(async move {
-                kblockdbcluster::client::run(address, secret, server_id, hub).await;
+                kblockdbcluster::client::run(address, secret, server_id, hub, status).await;
             });
         }
     }

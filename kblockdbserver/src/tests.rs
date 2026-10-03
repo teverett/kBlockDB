@@ -4,11 +4,12 @@
 //! `coords.rs`/`value_json.rs`.
 
 use crate::routes::router;
-use crate::state::{Account, AppState, Databases, WorldShape};
+use crate::state::{Account, AppState, Databases, OutboundPeer, WorldShape};
 use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use axum_extra::headers::{Authorization, HeaderMapExt};
 use http_body_util::BodyExt;
+use kblockdbcluster::client::ConnectionStatus;
 use serde_json::{json, Value as Json};
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -235,17 +236,35 @@ async fn health_reports_an_empty_peer_list_when_unclustered() {
     assert_eq!(body["peers"], json!([]));
 }
 
+fn outbound(address: &str, status: ConnectionStatus) -> OutboundPeer {
+    OutboundPeer {
+        address: address.to_string(),
+        status,
+    }
+}
+
 #[tokio::test]
-async fn health_reports_the_configured_peer_list() {
+async fn health_omits_a_configured_peer_that_is_not_connected() {
     let (databases, _dir) = test_databases();
-    let state = AppState::new(databases, Arc::new(HashMap::new())).with_peers(vec![
-        "10.0.0.2:8082".to_string(),
-        "10.0.0.3:8082".to_string(),
+    let state = AppState::new(databases, Arc::new(HashMap::new()))
+        .with_outbound_peers(vec![outbound("10.0.0.2:8082", ConnectionStatus::new())]);
+
+    let (status, body) = send(router(state), get("/rest/health")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"], json!([]));
+}
+
+#[tokio::test]
+async fn health_includes_only_connected_outbound_peers() {
+    let (databases, _dir) = test_databases();
+    let state = AppState::new(databases, Arc::new(HashMap::new())).with_outbound_peers(vec![
+        outbound("10.0.0.2:8082", ConnectionStatus::connected()),
+        outbound("10.0.0.3:8082", ConnectionStatus::new()),
     ]);
 
     let (status, body) = send(router(state), get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["peers"], json!(["10.0.0.2:8082", "10.0.0.3:8082"]));
+    assert_eq!(body["peers"], json!(["10.0.0.2:8082"]));
 }
 
 #[tokio::test]
@@ -254,12 +273,12 @@ async fn health_includes_a_peer_connected_into_this_instance() {
     let registry = kblockdbcluster::registry::PeerRegistry::new();
     let _connected = registry.track("node-b".to_string());
     let state = AppState::new(databases, Arc::new(HashMap::new()))
-        .with_peers(vec!["10.0.0.2:8082".to_string()])
+        .with_outbound_peers(vec![outbound("10.0.0.2:8082", ConnectionStatus::new())])
         .with_peer_registry(registry);
 
     let (status, body) = send(router(state), get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body["peers"], json!(["10.0.0.2:8082", "node-b"]));
+    assert_eq!(body["peers"], json!(["node-b"]));
 }
 
 #[tokio::test]
@@ -268,12 +287,62 @@ async fn health_does_not_duplicate_a_connected_peer_already_in_the_configured_li
     let registry = kblockdbcluster::registry::PeerRegistry::new();
     let _connected = registry.track("10.0.0.2:8082".to_string());
     let state = AppState::new(databases, Arc::new(HashMap::new()))
-        .with_peers(vec!["10.0.0.2:8082".to_string()])
+        .with_outbound_peers(vec![outbound(
+            "10.0.0.2:8082",
+            ConnectionStatus::connected(),
+        )])
         .with_peer_registry(registry);
 
     let (status, body) = send(router(state), get("/rest/health")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["peers"], json!(["10.0.0.2:8082"]));
+}
+
+#[tokio::test]
+async fn cluster_requires_auth() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/cluster")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(test_app().0, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn cluster_is_empty_when_unclustered() {
+    let (status, body) = send(test_app().0, get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body["hostname"].is_string());
+    assert_eq!(body["peers"], json!([]));
+}
+
+#[tokio::test]
+async fn cluster_reports_every_host_with_its_connection_status() {
+    let (databases, _dir) = test_databases();
+    let registry = kblockdbcluster::registry::PeerRegistry::new();
+    let _connected = registry.track("node-c".to_string());
+    let state = AppState::new(databases, Arc::new(test_credentials()))
+        .with_hostname("node-a".to_string())
+        .with_outbound_peers(vec![
+            outbound("10.0.0.2:8082", ConnectionStatus::connected()),
+            outbound("10.0.0.3:8082", ConnectionStatus::new()),
+        ])
+        .with_peer_registry(registry);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body,
+        json!({
+            "hostname": "node-a",
+            "peers": [
+                {"host": "10.0.0.2:8082", "direction": "outbound", "connected": true},
+                {"host": "10.0.0.3:8082", "direction": "outbound", "connected": false},
+                {"host": "node-c", "direction": "inbound", "connected": true},
+            ]
+        })
+    );
 }
 
 /// `/rest/health` is what a load balancer polls, so it must stay

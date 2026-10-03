@@ -68,6 +68,7 @@ use utoipa_swagger_ui::SwaggerUi;
 pub fn router(state: AppState) -> Router {
     let protected = Router::new()
         .route("/databases", get(list_databases))
+        .route("/cluster", get(cluster))
         .route(
             "/databases/{name}",
             put(create_database).delete(remove_database),
@@ -129,12 +130,14 @@ pub struct HealthResponse {
     /// caller sanity-check clock skew or confirm the response isn't a
     /// stale cached one.
     timestamp: u64,
-    /// This instance's cluster membership: every configured `[[peers]]`
-    /// address (see `docs/clustering.md`) this instance dials out to,
-    /// plus the `server_id` of every peer currently dialed *into* it
-    /// (deduplicated against the configured list, in case a configured
-    /// peer's `server_id` happens to equal its own address) -- empty
-    /// unless clustering is configured.
+    /// Every peer *currently connected* -- either a configured `[[peers]]`
+    /// address this instance has successfully dialed out to, or the
+    /// `server_id` of a peer currently dialed into it (deduplicated
+    /// against the former, in case a configured peer's `server_id`
+    /// happens to equal its own address) -- empty unless clustering is
+    /// configured. A peer that's configured but not currently reachable
+    /// (still retrying, or down) is *not* listed here -- see `GET
+    /// /rest/cluster` for full membership including unconnected peers.
     peers: Vec<String>,
 }
 
@@ -148,7 +151,12 @@ pub struct HealthResponse {
 )]
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
     let database_count = state.list_databases().await?.len();
-    let mut peers = (*state.peers).clone();
+    let mut peers: Vec<String> = state
+        .outbound_peers
+        .iter()
+        .filter(|p| p.status.is_connected())
+        .map(|p| p.address.clone())
+        .collect();
     if let Some(registry) = &state.connected_peers {
         for server_id in registry.connected() {
             if !peers.contains(&server_id) {
@@ -163,6 +171,66 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
         timestamp: unix_timestamp(),
         peers,
     }))
+}
+
+/// One host this instance knows about, for `GET /rest/cluster` -- unlike
+/// `/rest/health`'s `peers`, this includes a configured peer even while
+/// it's unreachable, with `connected` saying which.
+#[derive(Serialize, ToSchema)]
+pub struct ClusterPeer {
+    host: String,
+    /// `"outbound"` for a configured `[[peers]]` entry this instance
+    /// dials out to, `"inbound"` for a peer that dialed into it instead
+    /// (identified by its own self-reported `server_id`, not an address
+    /// this instance could dial back).
+    direction: &'static str,
+    connected: bool,
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ClusterResponse {
+    /// This instance's own name, same as `HealthResponse::hostname`.
+    hostname: String,
+    peers: Vec<ClusterPeer>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/rest/cluster",
+    tag = "cluster",
+    responses(
+        (status = 200, description = "Every host this instance knows about, with live connection status", body = ClusterResponse),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
+    let mut peers: Vec<ClusterPeer> = state
+        .outbound_peers
+        .iter()
+        .map(|p| ClusterPeer {
+            host: p.address.clone(),
+            direction: "outbound",
+            connected: p.status.is_connected(),
+        })
+        .collect();
+    if let Some(registry) = &state.connected_peers {
+        for server_id in registry.connected() {
+            peers.push(ClusterPeer {
+                host: server_id,
+                direction: "inbound",
+                // Always true: `PeerRegistry::connected()` only ever
+                // reports a peer for as long as its connection lasts (see
+                // `kblockdbcluster::registry::PeerRegistry`), so there's
+                // no "inbound but not connected" case to represent.
+                connected: true,
+            });
+        }
+    }
+    Json(ClusterResponse {
+        hostname: state.hostname.to_string(),
+        peers,
+    })
 }
 
 pub(crate) fn unix_timestamp() -> u64 {

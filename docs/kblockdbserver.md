@@ -263,6 +263,7 @@ A cell value on the wire is a small tagged JSON object:
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[]}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","peers":[{"host":"10.0.0.2:8082","direction":"outbound","connected":true}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -288,12 +289,20 @@ currently manages (same number `GET /rest/databases` would list) -- health
 is server-wide, not scoped to any one database, so it has no per-database
 shape to report the way the old single-world `/rest/health` once did; ask
 `GET /rest/db/{db}/stats` or a binary-protocol `Hello` for a specific
-database's shape. `peers` is this instance's cluster membership (see
-[clustering.md](clustering.md)) -- empty unless clustering is
-configured, otherwise its configured `[[peers]]` addresses plus the
-`server_id` of every peer currently connected *into* it, so a peer that
-dialed in without being listed in this instance's own `[[peers]]` still
-shows up.
+database's shape. `peers` lists only the peers *currently connected*
+(see [clustering.md](clustering.md)) -- configured `[[peers]]` addresses
+this instance has successfully dialed out to, plus the `server_id` of
+every peer currently connected *into* it. A configured peer that's down
+or still being retried isn't listed; `GET /rest/cluster` (below) is the
+full membership view, connected or not. Empty unless clustering is
+configured.
+
+`GET /rest/cluster` (auth required, unlike `/rest/health`) reports
+`{"hostname": ..., "peers": [{"host": ..., "direction": "outbound" |
+"inbound", "connected": true | false}, ...]}` -- every configured
+outbound peer with its live connection status, plus every peer currently
+connected inbound (always `connected: true`, since an inbound peer drops
+off the list the moment it disconnects).
 
 `/rest/db/{db}/stats` walks the on-disk chunk files under that database's
 directory and reports: `total_chunks` (chunk files currently on disk --
@@ -448,13 +457,17 @@ curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
 
 `GET /` (note: *not* under `/rest`) serves one small self-contained
 HTML/JS page (styled by `GET /browser.css`, its own file rather than
-inlined) with a database dropdown (populated from `GET /rest/databases`,
-called directly by the page's own JS), a query box, and a table showing
-that query's result, one row per matching cell, sorted ascending by
-coordinate. There's no separate plain-listing endpoint -- the query box
-*is* how the table gets populated, defaulting to `SELECT *` and running
-automatically on load and on every database switch, so there's always
-something to see without having to type a query first. Clicking a row
+inlined), with two tabs at the top -- "Browser" (the default) and
+"Cluster" -- switched purely client-side, no reload or extra round trip
+for the one already fetched.
+
+The **Browser** tab has a database dropdown (populated from `GET
+/rest/databases`, called directly by the page's own JS), a query box, and
+a table showing that query's result, one row per matching cell, sorted
+ascending by coordinate. There's no separate plain-listing endpoint -- the
+query box *is* how the table gets populated, defaulting to `SELECT *` and
+running automatically on load and on every database switch, so there's
+always something to see without having to type a query first. Clicking a row
 opens a modal with that cell's full keys, values, and metadata
 (`created_at_ms`/`modified_at_ms`/`version` per key -- see "REST API"
 above). It's read-only (there's no way to edit anything from here) and
@@ -479,6 +492,12 @@ unpaginated (the server returns every matching row in one response);
 the page's own Prev/Next buttons page through that result purely
 client-side, no second request -- fine for a database browsed
 occasionally, not meant for a query matching millions of cells.
+
+The **Cluster** tab lists every host this server knows about -- itself,
+each configured `[[peers]]` entry, and each peer currently connected into
+it -- with its direction and a connected / not connected status, from
+`GET /rest/cluster`. It re-fetches every time the tab is opened, so
+switching back to it picks up any peer that's connected or dropped since.
 
 Deliberately kept outside `/rest`: this is a convenience UI over the same
 data, not part of the versioned REST API surface -- it has no OpenAPI
