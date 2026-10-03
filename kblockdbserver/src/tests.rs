@@ -1080,6 +1080,27 @@ async fn the_root_data_browser_page_is_served_to_an_authenticated_user() {
     assert_eq!(status, StatusCode::OK);
 }
 
+/// The open tab is kept in the URL fragment, so reloading `/#cluster`
+/// reopens the Cluster tab instead of the default Browser tab.
+#[tokio::test]
+async fn the_data_browser_restores_its_tab_from_the_url() {
+    let req = Request::builder()
+        .method("GET")
+        .uri("/")
+        .body(Body::empty())
+        .unwrap();
+    let resp = test_app()
+        .0
+        .oneshot(with_auth(req, TEST_ADMIN, TEST_ADMIN_PASSWORD))
+        .await
+        .unwrap();
+    let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let html = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(html.contains(r##"location.hash === "#cluster""##));
+    assert!(html.contains("showTab(tabFromUrl());"));
+    assert!(html.contains(r#"addEventListener("popstate""#));
+}
+
 #[tokio::test]
 async fn the_browser_stylesheet_requires_auth() {
     let req = Request::builder()

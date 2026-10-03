@@ -456,11 +456,29 @@
     }
   }
 
+  // The open tab lives in the URL -- `#cluster` for the Cluster tab,
+  // no fragment for the Browser tab -- so a refresh reopens the same tab,
+  // `/#cluster` can be bookmarked, and back/forward step between tabs.
+  function tabFromUrl() {
+    return location.hash === "#cluster" ? "cluster" : "browser";
+  }
+
+  function selectTab(name) {
+    const fragment = name === "cluster" ? "#cluster" : "";
+    if (location.hash !== fragment) {
+      history.pushState(null, "", location.pathname + location.search + fragment);
+    }
+    showTab(name);
+  }
+
   tabBtnBrowser.addEventListener("click", function () {
-    showTab("browser");
+    selectTab("browser");
   });
   tabBtnCluster.addEventListener("click", function () {
-    showTab("cluster");
+    selectTab("cluster");
+  });
+  window.addEventListener("popstate", function () {
+    showTab(tabFromUrl());
   });
 
   modalClose.addEventListener("click", closeModal);
@@ -500,6 +518,7 @@
     renderPage();
   });
 
+  showTab(tabFromUrl());
   loadDatabases();
 })();
 </script>
