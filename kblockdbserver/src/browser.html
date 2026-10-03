@@ -8,17 +8,16 @@
 </head>
 <body>
   <h1>kBlockDB</h1>
-  <p class="sub">Every populated cell in the selected database, sorted ascending by coordinate. Click a row for its full keys and values.</p>
+  <p class="sub">Results of the query below, sorted ascending by coordinate. Click a row for its full keys and values.</p>
 
   <div class="query-bar">
-    <input id="query" type="text" placeholder="SELECT * WHERE material = 'stone'  (read-only -- SELECT only)" autocomplete="off" spellcheck="false">
+    <input id="query" type="text" value="SELECT *" placeholder="SELECT * WHERE material = 'stone'  (read-only -- SELECT only)" autocomplete="off" spellcheck="false">
     <button id="run-query" type="button">Run</button>
   </div>
   <div id="query-status" class="muted"></div>
 
   <div class="toolbar">
     <select id="database" aria-label="Database"></select>
-    <input id="search" type="search" placeholder="Search by coordinate, key, or value...">
   </div>
 
   <table>
@@ -65,13 +64,15 @@
 (function () {
   "use strict";
 
-  const state = { database: "", page: 1, pageSize: 50, search: "", queryMode: false };
+  // `rows` holds the last query's full result (the server runs it
+  // unpaginated), re-sliced client-side per `page`/`pageSize` by
+  // `renderPage` -- so paging never re-sends the query.
+  const state = { database: "", page: 1, pageSize: 50, rows: [] };
 
   const rowsBody = document.getElementById("rows");
   const emptyMsg = document.getElementById("empty");
   const pageInfo = document.getElementById("page-info");
   const databaseSelect = document.getElementById("database");
-  const searchInput = document.getElementById("search");
   const queryInput = document.getElementById("query");
   const runQueryBtn = document.getElementById("run-query");
   const queryStatus = document.getElementById("query-status");
@@ -136,7 +137,6 @@
     if (names.length === 0) {
       state.database = "";
       databaseSelect.disabled = true;
-      searchInput.disabled = true;
       queryInput.disabled = true;
       runQueryBtn.disabled = true;
       renderError("No databases yet.");
@@ -144,7 +144,6 @@
     }
 
     databaseSelect.disabled = false;
-    searchInput.disabled = false;
     queryInput.disabled = false;
     runQueryBtn.disabled = false;
     // Keep the previously selected database if it's still around (e.g.
@@ -152,42 +151,7 @@
     // otherwise default to the first one.
     state.database = names.includes(state.database) ? state.database : names[0];
     databaseSelect.value = state.database;
-    load();
-  }
-
-  async function load() {
-    state.queryMode = false;
-    if (!state.database) {
-      return;
-    }
-    const params = new URLSearchParams({
-      db: state.database,
-      page: String(state.page),
-      page_size: String(state.pageSize),
-      search: state.search,
-    });
-    let resp;
-    try {
-      resp = await fetch("rows?" + params.toString());
-    } catch (e) {
-      renderError("request failed: " + e);
-      return;
-    }
-    if (!resp.ok) {
-      let detail = resp.statusText;
-      try {
-        const body = await resp.json();
-        if (body && body.error) {
-          detail = body.error;
-        }
-      } catch (e) {
-        // response wasn't JSON -- fall back to the plain status text above
-      }
-      renderError(resp.status + ": " + detail);
-      return;
-    }
-    const data = await resp.json();
-    renderRows(data);
+    runQuery();
   }
 
   function setQueryStatus(message, isError) {
@@ -195,23 +159,17 @@
     queryStatus.classList.toggle("error", !!isError);
   }
 
-  // Runs whatever's in `#query` as a `SELECT` against `state.database` via
-  // `POST /query` (see `browser.rs`'s `run_select` -- SET/UPDATE/DELETE are
-  // refused server-side regardless of account, so this can never mutate
-  // anything). An empty box just exits query mode back to the normal
-  // paged/searchable listing.
+  // Runs whatever's in `#query` (defaulting to `SELECT *` if left empty)
+  // against `state.database` via `POST /query` (see `browser.rs`'s
+  // `run_select` -- `SET`/`UPDATE`/`DELETE` are refused server-side
+  // regardless of account, so this can never mutate anything) -- the
+  // page's one and only way to populate the table below.
   async function runQuery() {
-    const text = queryInput.value.trim();
-    if (!text) {
-      state.queryMode = false;
-      setQueryStatus("");
-      load();
-      return;
-    }
     if (!state.database) {
       setQueryStatus("select a database first", true);
       return;
     }
+    const text = queryInput.value.trim() || "SELECT *";
     setQueryStatus("running...");
     let resp;
     try {
@@ -235,7 +193,7 @@
       setQueryStatus(resp.status + ": " + detail, true);
       return;
     }
-    state.queryMode = true;
+    state.page = 1;
     renderQueryResult(body);
   }
 
@@ -248,7 +206,7 @@
       renderAggregates(data.aggregates);
       return;
     }
-    const rows = (data.rows || []).map(function (row) {
+    state.rows = (data.rows || []).map(function (row) {
       const created = row.values.map(function (v) { return v.created_at_ms; });
       const modified = row.values.map(function (v) { return v.modified_at_ms; });
       return {
@@ -259,13 +217,28 @@
         keys: row.values,
       };
     });
-    renderRows({ rows: rows, total_rows: rows.length, page: 1, total_pages: 1 });
-    prevBtn.disabled = true;
-    nextBtn.disabled = true;
-    setQueryStatus(rows.length + " row" + (rows.length === 1 ? "" : "s"));
+    renderPage();
+    setQueryStatus(state.rows.length + " row" + (state.rows.length === 1 ? "" : "s"));
+  }
+
+  // Slices `state.rows` (the query's full, already-fetched result) down
+  // to `state.page`/`state.pageSize` -- paging is purely client-side
+  // here, since the query itself was never paginated server-side.
+  function renderPage() {
+    const totalRows = state.rows.length;
+    const totalPages = Math.max(1, Math.ceil(totalRows / state.pageSize));
+    state.page = Math.min(Math.max(state.page, 1), totalPages);
+    const start = (state.page - 1) * state.pageSize;
+    renderRows({
+      rows: state.rows.slice(start, start + state.pageSize),
+      total_rows: totalRows,
+      page: state.page,
+      total_pages: totalPages,
+    });
   }
 
   function renderAggregates(aggregates) {
+    state.rows = [];
     rowsBody.textContent = "";
     emptyMsg.hidden = true;
     pageInfo.textContent = "";
@@ -280,6 +253,7 @@
   }
 
   function renderError(message) {
+    state.rows = [];
     rowsBody.textContent = "";
     emptyMsg.hidden = false;
     emptyMsg.textContent = message;
@@ -362,23 +336,7 @@
   databaseSelect.addEventListener("change", function () {
     state.database = databaseSelect.value;
     state.page = 1;
-    state.search = "";
-    searchInput.value = "";
-    queryInput.value = "";
-    setQueryStatus("");
-    load();
-  });
-
-  let searchTimer = null;
-  searchInput.addEventListener("input", function () {
-    queryInput.value = "";
-    setQueryStatus("");
-    clearTimeout(searchTimer);
-    searchTimer = setTimeout(function () {
-      state.search = searchInput.value;
-      state.page = 1;
-      load();
-    }, 250);
+    runQuery();
   });
 
   runQueryBtn.addEventListener("click", runQuery);
@@ -392,12 +350,12 @@
   prevBtn.addEventListener("click", function () {
     if (state.page > 1) {
       state.page -= 1;
-      load();
+      renderPage();
     }
   });
   nextBtn.addEventListener("click", function () {
     state.page += 1;
-    load();
+    renderPage();
   });
 
   loadDatabases();

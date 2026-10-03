@@ -448,13 +448,14 @@ curl -u admin:change-me -X POST localhost:8080/rest/db/demo/query \
 
 `GET /` (note: *not* under `/rest`) serves one small self-contained
 HTML/JS page (styled by `GET /browser.css`, its own file rather than
-inlined) with a query box, a database dropdown (populated from `GET
-/rest/databases`, called directly by the page's own JS), and a table
-listing every populated cell in whichever database is selected, one row
-per cell, sorted ascending by coordinate, with a search bar and paging
-controls. Switching the dropdown reloads the table against the newly
-selected database -- there's no separate page per database. Clicking a
-row opens a modal with that cell's full keys, values, and metadata
+inlined) with a database dropdown (populated from `GET /rest/databases`,
+called directly by the page's own JS), a query box, and a table showing
+that query's result, one row per matching cell, sorted ascending by
+coordinate. There's no separate plain-listing endpoint -- the query box
+*is* how the table gets populated, defaulting to `SELECT *` and running
+automatically on load and on every database switch, so there's always
+something to see without having to type a query first. Clicking a row
+opens a modal with that cell's full keys, values, and metadata
 (`created_at_ms`/`modified_at_ms`/`version` per key -- see "REST API"
 above). It's read-only (there's no way to edit anything from here) and
 requires the same HTTP Basic Auth as the REST API -- a `read_only` account
@@ -464,35 +465,20 @@ different means). The browser's own credential prompt (triggered by a
 `401`) is what a plain HTML page gets for free from the browser itself;
 the page's own JS never handles a password. If no databases exist yet,
 the dropdown (and the query box) is disabled and the page says so instead
-of trying to list rows for nothing.
+of trying to query for nothing.
 
-The query box above the dropdown runs a real [`SELECT`](query-language.md)
-against the selected database via `POST /query` (body
-`{"db": "<name>", "query": "<text>"}`), replacing the table with its
-result -- a plain `SELECT`'s rows (reusing the same row/modal rendering
-as the normal listing) or an aggregate `SELECT`'s `count`/`sum`/`mean`/
-`max`/`min` results (shown as `label = value` lines instead). `SET`/
-`UPDATE`/`DELETE` are refused with a `403` here *unconditionally* --
-unlike `POST /rest/db/{db}/query`, a full-access account gets no
-exception, since this page's whole premise is that there's no way to
-edit anything from here. Clearing the box (or editing the search box,
-which implicitly cancels query mode) goes back to the normal paged
-listing.
-
-`GET /rows?db={name}&page=&page_size=&search=` is the JSON endpoint the
-page's JS calls (`db` is required -- no default, matching the rest of the
-server's "every request names its database explicitly" rule, and a
-request missing it gets a plain `400` from the `Query` extractor itself;
-1-based `page`, default 50/max 500 `page_size`, an optional
-case-insensitive `search` matched against a cell's coordinate, any key
-name, or any value's rendered text) -- each row already carries its full
-per-key breakdown, so opening a modal needs no second request. `404`s if
-`db` names a database that doesn't exist. Built on
-`kblockdblib::World::list_cells`, which -- like `/rest/db/{db}/stats`
-above, but heavier, since it decodes whole chunk files rather than just
-reading their sizes -- is a live, uncached filesystem walk redone on every
-call. Fine for a database browsed occasionally; not meant for one with
-millions of populated cells polled repeatedly.
+The query box runs a real [`SELECT`](query-language.md) against the
+selected database via `POST /query` (body `{"db": "<name>", "query":
+"<text>"}`) -- a plain `SELECT`'s rows, or an aggregate `SELECT`'s
+`count`/`sum`/`mean`/`max`/`min` results (shown as `label = value` lines
+instead of the table). `SET`/`UPDATE`/`DELETE` are refused with a `403`
+here *unconditionally* -- unlike `POST /rest/db/{db}/query`, a
+full-access account gets no exception, since this page's whole premise
+is that there's no way to edit anything from here. The query itself runs
+unpaginated (the server returns every matching row in one response);
+the page's own Prev/Next buttons page through that result purely
+client-side, no second request -- fine for a database browsed
+occasionally, not meant for a query matching millions of cells.
 
 Deliberately kept outside `/rest`: this is a convenience UI over the same
 data, not part of the versioned REST API surface -- it has no OpenAPI
@@ -538,10 +524,9 @@ the frame/request/response byte layout.
   plus the `basic_auth` security scheme those annotations reference.
 - `kblockdbserver/src/browser.rs`    -- the data browser (see "Data
   browser" above): `GET /` (the page), `GET /browser.css` (its
-  stylesheet), `GET /rows?db={name}` (the listing's JSON backend, built
-  on `kblockdblib::World::list_cells`), and `POST /query` (the query
-  box's JSON backend, reusing `routes::execute_query` but refusing
-  `SET`/`UPDATE`/`DELETE` unconditionally).
+  stylesheet), and `POST /query` (the query box's JSON backend -- the
+  page's only way to populate the table -- reusing `routes::execute_query`
+  but refusing `SET`/`UPDATE`/`DELETE` unconditionally).
 - `kblockdbserver/src/browser.html`  -- the browser page's self-contained
   HTML/JS, embedded into the binary via `include_str!` (no build step) --
   its database dropdown calls `GET /rest/databases` directly rather than
