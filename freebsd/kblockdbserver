@@ -1,0 +1,73 @@
+#!/bin/sh
+#
+# Install into /usr/local/etc/rc.d/ (as "kblockdbserver", no extension) to
+# manage kblockdbserver as a FreeBSD service:
+#
+#   install -m 555 freebsd/kblockdbserver /usr/local/etc/rc.d/kblockdbserver
+#
+# Then enable and configure it in /etc/rc.conf, e.g.:
+#
+#   kblockdbserver_enable="YES"
+#   kblockdbserver_dir="/usr/local/kblockdb"
+#
+# kblockdbserver itself does not daemonize or write a pidfile, so this
+# script backgrounds it with daemon(8) and tracks the pidfile daemon(8)
+# writes.  kblockdbserver_dir is used as the server's working directory
+# before it starts, since kblockdbserver.toml's data_dir and the default
+# --config path are both resolved relative to the current directory.
+#
+# PROVIDE: kblockdbserver
+# REQUIRE: NETWORKING SERVERLOG
+# KEYWORD: shutdown
+
+. /etc/rc.subr
+
+name="kblockdbserver"
+rcvar="${name}_enable"
+desc="kBlockDB server"
+
+load_rc_config "${name}"
+
+: ${kblockdbserver_enable:="NO"}
+: ${kblockdbserver_user:="kblockdb"}
+: ${kblockdbserver_group:="kblockdb"}
+: ${kblockdbserver_dir:="/usr/local/kblockdb"}
+: ${kblockdbserver_bin:="/usr/local/bin/kblockdbserver"}
+: ${kblockdbserver_config:="${kblockdbserver_dir}/kblockdbserver.toml"}
+: ${kblockdbserver_logfile:="/var/log/kblockdbserver.log"}
+: ${kblockdbserver_pidfile:="/var/run/${name}/${name}.pid"}
+: ${kblockdbserver_flags:=""}
+
+pidfile="${kblockdbserver_pidfile}"
+command="/usr/sbin/daemon"
+command_args="-f -P ${pidfile} -r -t ${name} -u ${kblockdbserver_user} \
+	-o ${kblockdbserver_logfile} \
+	${kblockdbserver_bin} --config ${kblockdbserver_config} ${kblockdbserver_flags}"
+
+start_precmd="kblockdbserver_prestart"
+
+kblockdbserver_prestart()
+{
+	local piddir logdir
+
+	if [ ! -x "${kblockdbserver_bin}" ]; then
+		err 1 "${kblockdbserver_bin} does not exist or is not executable"
+	fi
+	if [ ! -d "${kblockdbserver_dir}" ]; then
+		err 1 "kblockdbserver_dir (${kblockdbserver_dir}) does not exist"
+	fi
+
+	piddir=$(dirname "${pidfile}")
+	if [ ! -d "${piddir}" ]; then
+		install -d -o "${kblockdbserver_user}" -g "${kblockdbserver_group}" "${piddir}"
+	fi
+
+	logdir=$(dirname "${kblockdbserver_logfile}")
+	if [ ! -e "${kblockdbserver_logfile}" ] && [ -d "${logdir}" ]; then
+		install -o "${kblockdbserver_user}" -g "${kblockdbserver_group}" -m 640 /dev/null "${kblockdbserver_logfile}"
+	fi
+
+	cd "${kblockdbserver_dir}" || err 1 "cannot cd to ${kblockdbserver_dir}"
+}
+
+run_rc_command "$1"
