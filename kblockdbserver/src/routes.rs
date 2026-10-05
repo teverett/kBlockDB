@@ -1292,7 +1292,13 @@ pub(crate) async fn execute_query(
             Ok(QueryResponse::affected(affected))
         }
         query::Statement::CreateIndex { key } => {
-            state.with_database(db, move |w| w.create_index(&key)).await?;
+            let key2 = key.clone();
+            state.with_database(db, move |w| w.create_index(&key2)).await?;
+            Stamper::new(&state.replication).publish_index_op(
+                db,
+                &key,
+                kblockdbcluster::wire::IndexOp::Create,
+            );
             Ok(QueryResponse::ok())
         }
         query::Statement::DropIndex { key } => {
@@ -1301,15 +1307,26 @@ pub(crate) async fn execute_query(
                 .with_database(db, move |w| Ok(w.drop_index(&lookup_key)))
                 .await?;
             if dropped {
+                Stamper::new(&state.replication).publish_index_op(
+                    db,
+                    &key,
+                    kblockdbcluster::wire::IndexOp::Drop,
+                );
                 Ok(QueryResponse::ok())
             } else {
                 Err(ApiError::NotFound(format!("no index on key '{key}'")))
             }
         }
         query::Statement::RebuildIndex { key } => {
+            let key2 = key.clone();
             state
-                .with_database(db, move |w| w.rebuild_index(&key))
+                .with_database(db, move |w| w.rebuild_index(&key2))
                 .await?;
+            Stamper::new(&state.replication).publish_index_op(
+                db,
+                &key,
+                kblockdbcluster::wire::IndexOp::Rebuild,
+            );
             Ok(QueryResponse::ok())
         }
     }

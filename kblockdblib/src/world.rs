@@ -95,6 +95,11 @@ const _: () = assert!(
 
 type ChunkKey = Coord;
 
+/// Name of the file at a world's root listing which keys currently have a
+/// secondary index built -- see `World`'s "Layout on disk" doc comment and
+/// `persist_indexed_keys`/`open_inner`'s backfill.
+const INDEXES_FILE: &str = "indexes.txt";
+
 /// Milliseconds since the Unix epoch, for stamping `CellMeta` on every
 /// `set` -- the clock is read here, once per `set`/`set_region` call, and
 /// passed down to `Chunk::set` as a plain argument rather than read there,
@@ -240,6 +245,9 @@ impl Iterator for RegionIter {
 /// Layout on disk under `root`:
 ///   root/world.txt                  -- this world's axes/world_dim (see params.rs)
 ///   root/schema.txt                 -- key string <-> id registry (see schema.rs)
+///   root/indexes.txt                -- which keys have a secondary index
+///                                       built (see `create_index`), so it
+///                                       survives a restart
 ///   root/<c0>/<c1>/.../<c_n-1>.chunk -- one file per non-empty chunk,
 ///                                       nested axes-1 directories deep
 ///
@@ -488,7 +496,7 @@ impl World {
             params.chunk_dim,
             schema.len()
         ));
-        Ok(World {
+        let world = World {
             root,
             axes: params.axes,
             world_dim: params.world_dim,
@@ -502,7 +510,38 @@ impl World {
             compression: false,
             tombstone_retention: None,
             value_index: ValueIndex::new(),
-        })
+        };
+        world.restore_indexes()?;
+        Ok(world)
+    }
+
+    /// Rebuilds every secondary index `indexes.txt` lists -- called once,
+    /// right after `open`/`create` constructs this `World`, so an index
+    /// built in an earlier process run is there again from the start,
+    /// rather than only after someone notices it's gone and runs
+    /// `create_index` again. Same backfill cost as `create_index` itself,
+    /// paid once per listed key, here, at startup, instead of silently
+    /// losing every index on every restart.
+    ///
+    /// A key `indexes.txt` lists that's no longer a live column (its
+    /// column was removed since this was last written) is silently
+    /// skipped -- same "doesn't apply, not an error" spirit as everywhere
+    /// else in this crate; it drops out of the file for good the next
+    /// time anything else changes which keys are indexed (see
+    /// `persist_indexed_keys`).
+    fn restore_indexes(&self) -> io::Result<()> {
+        let path = self.root.join(INDEXES_FILE);
+        if !path.exists() {
+            return Ok(());
+        }
+        let text = fs::read_to_string(&path)?;
+        for key in text.lines().filter(|line| !line.is_empty()) {
+            let key_id = self.schema().id_for_key(key);
+            if let Some(key_id) = key_id {
+                self.build_index(key, key_id)?;
+            }
+        }
+        Ok(())
     }
 
     /// Overrides the cap on concurrent `with_chunk` calls (real concurrent
@@ -745,7 +784,9 @@ impl World {
                 purged += 1;
             }
         }
-        self.value_index.drop_index(key_id);
+        if self.value_index.drop_index(key_id) {
+            let _ = self.persist_indexed_keys();
+        }
         crate::logger::info(format!(
             "removed column '{key}' from {} ({purged} chunk(s) rewritten)",
             self.root.display()
@@ -821,6 +862,7 @@ impl World {
                 self.value_index.record(key_id, &cell.coord, None, Some(value));
             }
         }
+        self.persist_indexed_keys()?;
         crate::logger::info(format!("(re)built index on key '{key}' at {}", self.root.display()));
         Ok(())
     }
@@ -833,7 +875,36 @@ impl World {
         let Some(key_id) = self.schema().id_for_key(key) else {
             return false;
         };
-        self.value_index.drop_index(key_id)
+        let dropped = self.value_index.drop_index(key_id);
+        if dropped {
+            // Best-effort: a failed write here leaves `indexes.txt` one
+            // write behind the in-memory state (this index still reports
+            // dropped via `lookup_eq`/`indexed_keys` for the rest of this
+            // process's life), not a correctness problem -- only a stale
+            // disk file a future `open` would wrongly rebuild from. Not
+            // worth turning a successful, already-applied drop into an
+            // error over.
+            let _ = self.persist_indexed_keys();
+        }
+        dropped
+    }
+
+    /// Rewrites `indexes.txt` at the world root to exactly this `World`'s
+    /// current `indexed_keys()` -- called after every change to which keys
+    /// are indexed (`build_index`/`drop_index`/`remove_column`), so a later
+    /// `open` of this same root can rebuild the same set (see
+    /// `open_inner`'s backfill) instead of starting with none, every time,
+    /// after every restart. A full rewrite, not an append: the list is
+    /// tiny (one line per indexed key, not per cell), so there's no
+    /// efficiency reason to do anything cleverer, and a plain rewrite can
+    /// never accumulate a removed key's stale tombstone the way
+    /// `schema.txt`'s append-only format has to guard against.
+    fn persist_indexed_keys(&self) -> io::Result<()> {
+        let mut text = self.indexed_keys().join("\n");
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        fs::write(self.root.join(INDEXES_FILE), text)
     }
 
     /// Every key currently indexed (see `create_index`), sorted.
@@ -5301,6 +5372,100 @@ mod tests {
             .unwrap();
         w.create_index("material").unwrap();
         assert!(w.remove_column("material").unwrap());
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn an_index_survives_closing_and_reopening_the_world() {
+        let dir = TempDir::new("index-survives-reopen");
+        {
+            let w = create(&dir);
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.set(&coord3(1, 0, 0), "material", Value::Str("dirt".into()))
+                .unwrap();
+            w.create_index("material").unwrap();
+        }
+
+        // A brand new `World` over the same directory -- this can only
+        // know "material" is indexed, and what it currently holds, by
+        // having read `indexes.txt` back and rebuilt from the chunk
+        // files, not from any in-memory state carried over.
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.indexed_keys(), vec!["material".to_string()]);
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![coord3(1, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn a_reopened_index_keeps_itself_up_to_date() {
+        let dir = TempDir::new("index-reopen-live");
+        {
+            let w = create(&dir);
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.create_index("material").unwrap();
+        }
+
+        let w = World::open(&dir).unwrap();
+        w.set(&coord3(0, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn a_dropped_index_stays_dropped_across_a_reopen() {
+        let dir = TempDir::new("index-drop-survives-reopen");
+        {
+            let w = create(&dir);
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.create_index("material").unwrap();
+            w.drop_index("material");
+        }
+
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+        assert_eq!(w.lookup_eq("material", &Value::Str("stone".into())), None);
+    }
+
+    #[test]
+    fn an_unindexed_world_has_no_indexes_txt_to_read() {
+        let dir = TempDir::new("index-none-no-file");
+        {
+            let w = create(&dir);
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+        }
+        let w = World::open(&dir).unwrap();
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_removed_columns_index_does_not_come_back_on_reopen() {
+        let dir = TempDir::new("index-removed-column-no-reopen");
+        {
+            let w = create(&dir);
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.create_index("material").unwrap();
+            w.remove_column("material").unwrap();
+        }
+
+        let w = World::open(&dir).unwrap();
         assert_eq!(w.indexed_keys(), Vec::<String>::new());
     }
 

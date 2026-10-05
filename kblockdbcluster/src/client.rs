@@ -210,6 +210,7 @@ async fn connect_and_forward(
     // backlog instead, same as while this task is connected and merely
     // slow to drain.
     let mut rx = peers.hub().subscribe();
+    let mut index_ops = peers.hub().subscribe_index_ops();
     let mut changes = peers.subscribe_changes();
     let mut resync = peers.hub().sequencer().subscribe_resync();
 
@@ -283,6 +284,15 @@ async fn connect_and_forward(
     // The last vector confirmed to this peer -- `None` until its first
     // catch-up finishes.
     let mut confirmed: Option<VersionVector> = None;
+    // Sent once, right after this link's *first* `Synced` -- not
+    // eagerly on connect, which would race the catch-up this same link
+    // is about to stream: a database an `IndexState` entry names might
+    // not exist on the peer yet (it's created by the very `ChangeBatch`
+    // this catch-up is sending), so sending index state only once that's
+    // confirmed delivered means `apply_index_op` never sees a database
+    // that's about to exist but doesn't yet -- see
+    // `source::ChangeSource::indexed_keys`'s doc comment.
+    let mut index_state_sent = false;
     let mut synced_tick = tokio::time::interval(SYNCED_INTERVAL);
     synced_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     resync.borrow_and_update();
@@ -332,6 +342,10 @@ async fn connect_and_forward(
                             };
                             crate::wire::write_message(&mut writer, &synced).await?;
                             confirmed = Some(start);
+                            if !index_state_sent {
+                                send_index_state(&mut writer, peers).await?;
+                                index_state_sent = true;
+                            }
                         }
                     }
                 }
@@ -410,6 +424,20 @@ async fn connect_and_forward(
                 }
                 send_peer_list(&mut writer, peers, address).await?;
             }
+            received = index_ops.recv() => {
+                match received {
+                    Ok(entry) => {
+                        crate::wire::write_message(&mut writer, &PeerMessage::IndexOp(entry))
+                            .await?;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => return Ok(()),
+                    // Fire-and-forget, same as `IndexOpEntry`'s doc comment
+                    // says: there's no catch-up to fall back on for a
+                    // missed index op, unlike a lagged `ChangeEntry` --
+                    // the operator just re-runs the statement.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                }
+            }
         }
     }
 }
@@ -461,6 +489,28 @@ async fn send_peer_list<W: AsyncWrite + Unpin>(
     address: &str,
 ) -> std::io::Result<()> {
     crate::wire::write_message(stream, &PeerMessage::PeerList(peers.gossip_list(address))).await
+}
+
+/// Sends this process's full current index state (see
+/// `source::ChangeSource::indexed_keys`) as one `IndexState` frame, or
+/// nothing at all if there's no change source or it reports no indexes --
+/// an empty frame would be a harmless no-op on the receiving end anyway,
+/// but there's no reason to send one.
+async fn send_index_state<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    peers: &PeerSet,
+) -> std::io::Result<()> {
+    let Some(source) = peers.change_source().cloned() else {
+        return Ok(());
+    };
+    let entries = tokio::task::spawn_blocking(move || source.indexed_keys())
+        .await
+        .map_err(|e| std::io::Error::other(format!("indexed_keys panicked: {e}")))?
+        .map_err(std::io::Error::other)?;
+    if entries.is_empty() {
+        return Ok(());
+    }
+    crate::wire::write_message(stream, &PeerMessage::IndexState(entries)).await
 }
 
 #[cfg(test)]
@@ -797,6 +847,66 @@ mod tests {
             || sink.is_removed(DB, &[4, 5, 6], "material"),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_published_index_op_reaches_the_peer_over_a_real_connection() {
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let peers = standalone_peers();
+        peers.add(addr.to_string());
+        let replication = Some(peers.hub().clone());
+
+        publish_until_seen(
+            || {
+                crate::hub::publish_index_op(
+                    &replication,
+                    DB,
+                    "material",
+                    crate::wire::IndexOp::Create,
+                );
+            },
+            || {
+                sink.index_ops()
+                    == vec![(
+                        DB.to_string(),
+                        "material".to_string(),
+                        crate::wire::IndexOp::Create,
+                    )]
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn connecting_sends_current_index_state_which_the_peer_applies() {
+        // The connecting side already has an index built (as if it built
+        // it before this peer ever linked, or while this peer was down)
+        // -- it must still reach the peer, via `IndexState` on connect,
+        // not just a live `IndexOp` it would have missed.
+        let source = RecordingSink::new();
+        source.seed_indexed(DB, "material");
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let peers = catch_up_peers(&source, 64);
+        peers.add(addr.to_string());
+
+        wait_until(|| {
+            sink.index_ops()
+                == vec![(DB.to_string(), "material".to_string(), crate::wire::IndexOp::Create)]
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn no_index_state_is_sent_when_there_is_nothing_indexed() {
+        // No seeded index -- `send_index_state` must not send an empty
+        // frame (harmless either way, but there's no reason to).
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let peers = catch_up_peers(&RecordingSink::new(), 64);
+        peers.add(addr.to_string());
+
+        wait_until(|| peers.snapshot() == vec![(addr.to_string(), true)]).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(sink.index_ops().is_empty());
     }
 
     #[tokio::test]

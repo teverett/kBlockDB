@@ -13,7 +13,7 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use kblockdbcluster::server::ReplicationSink;
 use kblockdbcluster::source::ChangeSource;
-use kblockdbcluster::wire::{ChangeEntry, ChangeOp};
+use kblockdbcluster::wire::{ChangeEntry, ChangeOp, IndexOp};
 use kblockdblib::{CellMeta, Change, ChangeKind, Stamp, Value, VersionVector};
 
 impl ReplicationSink for AppState {
@@ -125,6 +125,27 @@ impl ReplicationSink for AppState {
             }
         }
     }
+
+    /// No auto-create here, same reasoning as `apply_remove`: a database
+    /// this server has never seen has no data an index could ever match,
+    /// so building/dropping/rebuilding an index on it is a harmless no-op
+    /// rather than a reason to create an empty database for.
+    async fn apply_index_op(&self, database: String, key: String, op: IndexOp) -> Result<(), String> {
+        match self
+            .with_database(&database, move |w| match op {
+                IndexOp::Create => w.create_index(&key),
+                IndexOp::Drop => {
+                    w.drop_index(&key);
+                    Ok(())
+                }
+                IndexOp::Rebuild => w.rebuild_index(&key),
+            })
+            .await
+        {
+            Ok(()) | Err(ApiError::NotFound(_)) => Ok(()),
+            Err(e) => Err(format!("{e:?}")),
+        }
+    }
 }
 
 fn change_from_entry(entry: &ChangeEntry) -> Change {
@@ -179,6 +200,20 @@ impl ChangeSource for AppState {
             }
         }
         Ok(())
+    }
+
+    fn indexed_keys(&self) -> Result<Vec<(String, String)>, String> {
+        let names = self.databases.list().map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for database in names {
+            let world = match self.databases.get(&database) {
+                Ok(world) => world,
+                Err(ApiError::NotFound(_)) => continue,
+                Err(e) => return Err(format!("{e:?}")),
+            };
+            out.extend(world.indexed_keys().into_iter().map(|key| (database.clone(), key)));
+        }
+        Ok(out)
     }
 }
 
@@ -387,6 +422,42 @@ mod tests {
             })
             .unwrap();
         assert_eq!(batches, 1);
+    }
+
+    #[test]
+    fn indexed_keys_reports_every_databases_indexes() {
+        let dir = temp_dir("indexed-keys");
+        let state = test_state(&dir.0);
+        state.databases.create("other", None).unwrap();
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.set(&[0, 0, 0], "hardness", Value::I64(1)).unwrap();
+        db.create_index("material").unwrap();
+        db.create_index("hardness").unwrap();
+        let other = state.databases.get("other").unwrap();
+        other
+            .set(&[0, 0, 0], "density", Value::F64(1.0))
+            .unwrap();
+        other.create_index("density").unwrap();
+
+        let mut got = state.indexed_keys().unwrap();
+        got.sort();
+        assert_eq!(
+            got,
+            vec![
+                (DB.to_string(), "hardness".to_string()),
+                (DB.to_string(), "material".to_string()),
+                ("other".to_string(), "density".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn indexed_keys_is_empty_when_nothing_is_indexed() {
+        let dir = temp_dir("indexed-keys-empty");
+        let state = test_state(&dir.0);
+        assert_eq!(state.indexed_keys().unwrap(), Vec::new());
     }
 
     const DB: &str = "db";
@@ -600,5 +671,83 @@ mod tests {
                 .unwrap(),
             None
         );
+    }
+
+    #[tokio::test]
+    async fn apply_index_op_create_builds_an_index_on_an_existing_database() {
+        let dir = temp_dir("index-op-create");
+        let state = test_state(&dir.0);
+        state
+            .databases
+            .get(DB)
+            .unwrap()
+            .set(&[1, 1, 1], "material", Value::Str("stone".to_string()))
+            .unwrap();
+
+        state
+            .apply_index_op(DB.to_string(), "material".to_string(), IndexOp::Create)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            state.databases.get(DB).unwrap().indexed_keys(),
+            vec!["material".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_index_op_drop_removes_an_existing_index() {
+        let dir = temp_dir("index-op-drop");
+        let state = test_state(&dir.0);
+        let world = state.databases.get(DB).unwrap();
+        world
+            .set(&[1, 1, 1], "material", Value::Str("stone".to_string()))
+            .unwrap();
+        world.create_index("material").unwrap();
+
+        state
+            .apply_index_op(DB.to_string(), "material".to_string(), IndexOp::Drop)
+            .await
+            .unwrap();
+
+        assert_eq!(world.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn apply_index_op_rebuild_rebuilds_an_existing_index() {
+        let dir = temp_dir("index-op-rebuild");
+        let state = test_state(&dir.0);
+        let world = state.databases.get(DB).unwrap();
+        world
+            .set(&[1, 1, 1], "material", Value::Str("stone".to_string()))
+            .unwrap();
+        world.create_index("material").unwrap();
+
+        state
+            .apply_index_op(DB.to_string(), "material".to_string(), IndexOp::Rebuild)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            world.lookup_eq("material", &Value::Str("stone".to_string())),
+            Some(vec![kblockdblib::Coord::from([1, 1, 1])])
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_index_op_for_an_unseen_database_is_a_harmless_no_op() {
+        let dir = temp_dir("index-op-unseen");
+        let state = test_state(&dir.0);
+
+        state
+            .apply_index_op(
+                "never-created".to_string(),
+                "material".to_string(),
+                IndexOp::Create,
+            )
+            .await
+            .unwrap();
+
+        assert!(state.databases.get("never-created").is_err());
     }
 }

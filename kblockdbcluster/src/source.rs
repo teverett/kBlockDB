@@ -23,4 +23,25 @@ pub trait ChangeSource: Send + Sync + 'static {
         legacy_origin: u64,
         emit: &mut dyn FnMut(Vec<ChangeEntry>) -> bool,
     ) -> Result<(), String>;
+
+    /// Every `(database, key)` pair this process currently has a
+    /// secondary index built on (see `kblockdblib::World::indexed_keys`).
+    /// Sent once per connection as a `wire::PeerMessage::IndexState`,
+    /// right after the initial `PeerList` gossip -- see `client.rs`'s
+    /// `connect_and_forward` -- so a peer that missed earlier live
+    /// `IndexOp`s (it was down, or this is the first time it's ever
+    /// linked to the sender) still ends up with the same `CREATE INDEX`/
+    /// `REBUILD INDEX`s already applied elsewhere, instead of only ever
+    /// learning about one it happened to be connected for. See
+    /// `wire::IndexOpEntry`'s doc comment on why this is still one-way
+    /// (creates, never drops) and not tracked by any version vector.
+    ///
+    /// Blocking, same as `changes_since`, though in practice this is
+    /// cheap (reading an in-memory index registry, not scanning data).
+    /// The default returns nothing: an embedder with no concept of a
+    /// secondary index (or that doesn't want to replicate this) simply
+    /// never sends a reconciliation.
+    fn indexed_keys(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
 }

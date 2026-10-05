@@ -10,7 +10,7 @@
 
 use crate::server::ReplicationSink;
 use crate::source::ChangeSource;
-use crate::wire::{ChangeEntry, ChangeOp};
+use crate::wire::{ChangeEntry, ChangeOp, IndexOp};
 use kblockdblib::{CellMeta, Stamp, Value, VersionVector};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -40,6 +40,15 @@ impl Applied {
 #[derive(Clone, Default)]
 pub struct RecordingSink {
     applied: Arc<Mutex<HashMap<Key, Applied>>>,
+    /// Every `apply_index_op` call this sink has received, in order, as
+    /// `(database, key, op)` -- for a test to assert an `IndexOp` actually
+    /// reached it.
+    index_ops: Arc<Mutex<Vec<(String, String, IndexOp)>>>,
+    /// `(database, key)` pairs currently "indexed" per `apply_index_op`'s
+    /// `Create`/`Drop`/`Rebuild` calls -- lets this sink double as a
+    /// `ChangeSource::indexed_keys()`, for tests exercising `IndexState`
+    /// reconciliation on connect.
+    indexed: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
     /// When `true`, the next `apply_set`/`apply_remove` call returns an
     /// error instead of recording anything, then resets to `false` --
     /// see `fail_next`.
@@ -168,6 +177,22 @@ impl RecordingSink {
         let mut guard = self.fail_next.lock().unwrap();
         std::mem::take(&mut *guard)
     }
+
+    /// Every index op this sink has received so far, in order.
+    pub fn index_ops(&self) -> Vec<(String, String, IndexOp)> {
+        self.index_ops.lock().unwrap().clone()
+    }
+
+    /// Marks `(database, key)` as already indexed, bypassing
+    /// `apply_index_op` -- for a test's starting state (the side that
+    /// should send it via `IndexState` on connect), as opposed to a live
+    /// `IndexOp` this sink is meant to receive and record.
+    pub fn seed_indexed(&self, database: &str, key: &str) {
+        self.indexed
+            .lock()
+            .unwrap()
+            .insert((database.to_string(), key.to_string()));
+    }
 }
 
 impl ReplicationSink for RecordingSink {
@@ -202,6 +227,21 @@ impl ReplicationSink for RecordingSink {
             (database, coord, key),
             Applied::Removed(modified_at_ms, stamp),
         );
+        Ok(())
+    }
+
+    async fn apply_index_op(&self, database: String, key: String, op: IndexOp) -> Result<(), String> {
+        let mut indexed = self.indexed.lock().unwrap();
+        match op {
+            IndexOp::Create | IndexOp::Rebuild => {
+                indexed.insert((database.clone(), key.clone()));
+            }
+            IndexOp::Drop => {
+                indexed.remove(&(database.clone(), key.clone()));
+            }
+        }
+        drop(indexed);
+        self.index_ops.lock().unwrap().push((database, key, op));
         Ok(())
     }
 }
@@ -258,6 +298,12 @@ impl ChangeSource for RecordingSink {
             emit(batch);
         }
         Ok(())
+    }
+
+    fn indexed_keys(&self) -> Result<Vec<(String, String)>, String> {
+        let mut entries: Vec<(String, String)> = self.indexed.lock().unwrap().iter().cloned().collect();
+        entries.sort();
+        Ok(entries)
     }
 }
 

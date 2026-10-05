@@ -46,9 +46,12 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// Bumped whenever this module's wire format changes in a way an older
 /// peer couldn't decode. Mirrors `kblockdbserver::wire::PROTOCOL_VERSION`'s
 /// reasoning, applied here to peer links instead of end-user ones.
-/// Version 4 added stamps and version vectors; a server only links with a
-/// peer speaking exactly this version (see `server.rs`).
-pub const PEER_PROTOCOL_VERSION: u8 = 4;
+/// Version 4 added stamps and version vectors; version 5 added `IndexOp`
+/// (cluster-wide `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX`); version 6
+/// added `IndexState` (catch-up for a peer that missed a live `IndexOp`).
+/// A server only links with a peer speaking exactly this version (see
+/// `server.rs`).
+pub const PEER_PROTOCOL_VERSION: u8 = 6;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -78,6 +81,34 @@ impl ChangeEntry {
 pub enum ChangeOp {
     Set(Value),
     Remove,
+}
+
+/// A cluster-wide index operation on one key -- `kblockdbserver`'s
+/// `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX` query statements publish one
+/// of these (see `hub::publish_index_op`) so every peer builds, drops, or
+/// rebuilds the same secondary index on its own copy of the data, not just
+/// the node the statement was sent to.
+///
+/// Unlike [`ChangeEntry`], this carries no stamp and isn't tracked by any
+/// version vector or catch-up: it's fire-and-forget, same spirit as
+/// `PeerList` gossip. A peer that's disconnected (or simply never receives
+/// it, e.g. a lagged broadcast -- see `hub`'s `INDEX_OP_LOG_CAPACITY`)
+/// stays without the index until the operator re-sends the statement --
+/// it's a local performance structure rebuildable from the key's own data
+/// at any time (see `kblockdblib::World::create_index`'s doc comment), not
+/// durable state that must converge like a cell's value.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexOpEntry {
+    pub database: String,
+    pub key: String,
+    pub op: IndexOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexOp {
+    Create,
+    Drop,
+    Rebuild,
 }
 
 #[derive(Debug, PartialEq)]
@@ -123,6 +154,20 @@ pub enum PeerMessage {
         confirmed: VersionVector,
         vector: VersionVector,
     },
+    /// A cluster-wide index operation -- see [`IndexOpEntry`]. Travels in
+    /// the same connecting-to-accepting direction as `ChangeBatch`, but
+    /// one at a time rather than batched (these are rare, unlike cell
+    /// writes).
+    IndexOp(IndexOpEntry),
+    /// The sender's current full set of secondary indexes, as `(database,
+    /// key)` pairs -- sent once per connection, right after the initial
+    /// `PeerList` (see `client.rs`'s `connect_and_forward` and
+    /// `source::ChangeSource::indexed_keys`), so a peer that missed
+    /// earlier live `IndexOp`s still converges on reconnect. The receiver
+    /// creates whatever it's missing from this list (see `server.rs`) --
+    /// never drops anything merely for being absent from it, same
+    /// one-way-only spirit as `IndexOp` itself.
+    IndexState(Vec<(String, String)>),
 }
 
 #[derive(Debug, PartialEq)]
@@ -201,6 +246,24 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
                 buf.extend_from_slice(&entry.seq.to_le_bytes());
             }
         }
+        PeerMessage::IndexOp(entry) => {
+            buf.push(7);
+            put_string(&mut buf, &entry.database);
+            put_string(&mut buf, &entry.key);
+            buf.push(match entry.op {
+                IndexOp::Create => 0,
+                IndexOp::Drop => 1,
+                IndexOp::Rebuild => 2,
+            });
+        }
+        PeerMessage::IndexState(entries) => {
+            buf.push(8);
+            buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+            for (database, key) in entries {
+                put_string(&mut buf, database);
+                put_string(&mut buf, key);
+            }
+        }
     }
     buf
 }
@@ -259,6 +322,24 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
             confirmed: r.vector()?,
             vector: r.vector()?,
         }),
+        7 => {
+            let database = r.string()?;
+            let key = r.string()?;
+            let op = match r.u8()? {
+                0 => IndexOp::Create,
+                1 => IndexOp::Drop,
+                2 => IndexOp::Rebuild,
+                other => return Err(DecodeError::UnknownTag(other)),
+            };
+            Ok(PeerMessage::IndexOp(IndexOpEntry { database, key, op }))
+        }
+        8 => {
+            let count = r.u32()? as usize;
+            let entries = (0..count)
+                .map(|_| Ok((r.string()?, r.string()?)))
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(PeerMessage::IndexState(entries))
+        }
         other => Err(DecodeError::UnknownTag(other)),
     }
 }
@@ -565,6 +646,27 @@ mod tests {
     }
 
     #[test]
+    fn index_op_round_trips_every_kind() {
+        for op in [IndexOp::Create, IndexOp::Drop, IndexOp::Rebuild] {
+            roundtrip(PeerMessage::IndexOp(IndexOpEntry {
+                database: "demo".to_string(),
+                key: "material".to_string(),
+                op,
+            }));
+        }
+    }
+
+    #[test]
+    fn index_state_round_trips() {
+        roundtrip(PeerMessage::IndexState(vec![
+            ("demo".to_string(), "material".to_string()),
+            ("demo".to_string(), "hardness".to_string()),
+            ("other".to_string(), "density".to_string()),
+        ]));
+        roundtrip(PeerMessage::IndexState(vec![]));
+    }
+
+    #[test]
     fn decode_rejects_an_unknown_tag() {
         assert_eq!(decode(&[99]), Err(DecodeError::UnknownTag(99)));
     }
@@ -581,6 +683,15 @@ mod tests {
         buf.extend_from_slice(&2u32.to_le_bytes());
         buf.extend_from_slice(&[0xff, 0xfe]);
         assert_eq!(decode(&buf), Err(DecodeError::InvalidUtf8));
+    }
+
+    #[test]
+    fn decode_rejects_an_unknown_index_op_tag() {
+        let mut buf = vec![7u8]; // IndexOp
+        put_string(&mut buf, "demo");
+        put_string(&mut buf, "material");
+        buf.push(99); // bogus op tag
+        assert_eq!(decode(&buf), Err(DecodeError::UnknownTag(99)));
     }
 
     #[test]

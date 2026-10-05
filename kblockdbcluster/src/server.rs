@@ -6,7 +6,7 @@
 //! connecting side.
 
 use crate::peers::PeerSet;
-use crate::wire::{ChangeEntry, ChangeOp, PeerMessage};
+use crate::wire::{ChangeEntry, ChangeOp, IndexOp, PeerMessage};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
@@ -51,6 +51,23 @@ pub trait ReplicationSink: Clone + Send + Sync + 'static {
                 apply_entry(self, entry).await;
             }
         }
+    }
+
+    /// Applies a cluster-wide `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX`
+    /// (see `wire::IndexOpEntry`) against `database`'s own copy of `key`.
+    /// The default is a no-op, `Ok(())` -- an embedder that doesn't have a
+    /// concept of a secondary index (or doesn't want to replicate this)
+    /// simply ignores it; `kblockdbserver`'s `AppState` overrides this to
+    /// call `kblockdblib::World::create_index`/`drop_index`/
+    /// `rebuild_index`.
+    fn apply_index_op(
+        &self,
+        database: String,
+        key: String,
+        op: IndexOp,
+    ) -> impl Future<Output = Result<(), String>> + Send {
+        let _ = (database, key, op);
+        async move { Ok(()) }
     }
 }
 
@@ -211,10 +228,33 @@ async fn handle_connection<S: ReplicationSink>(
                 peers.vectors().merge(&confirmed);
                 peers.vectors().record_peer(node_id, vector);
             }
-            // Only Hello/ChangeBatch/PeerList/Synced travel this direction --
-            // anything else is a protocol error, but per this module's "one
-            // bad frame doesn't end the connection" policy, just skip it
-            // rather than disconnecting.
+            PeerMessage::IndexOp(entry) => {
+                let (database, key) = (entry.database.clone(), entry.key.clone());
+                if let Err(e) = sink.apply_index_op(entry.database, entry.key, entry.op).await {
+                    eprintln!(
+                        "peer protocol: dropping index op for '{database}' key '{key}': {e}"
+                    );
+                }
+            }
+            // Catch-up for whatever `IndexOp`s this link's other side
+            // already held before this connection started -- always
+            // `Create` (never `Drop`): see `wire::IndexState`'s doc
+            // comment on why reconciliation only ever adds.
+            PeerMessage::IndexState(entries) => {
+                for (database, key) in entries {
+                    let (database2, key2) = (database.clone(), key.clone());
+                    if let Err(e) = sink.apply_index_op(database, key, IndexOp::Create).await {
+                        eprintln!(
+                            "peer protocol: dropping index-state entry for '{database2}' key \
+                             '{key2}': {e}"
+                        );
+                    }
+                }
+            }
+            // Only Hello/ChangeBatch/PeerList/Synced/IndexOp/IndexState
+            // travel this direction -- anything else is a protocol error,
+            // but per this module's "one bad frame doesn't end the
+            // connection" policy, just skip it rather than disconnecting.
             _ => continue,
         }
     }
@@ -768,6 +808,30 @@ mod tests {
         .unwrap();
 
         wait_until(|| sink.is_removed(DB, &[1, 1, 1], "material")).await;
+    }
+
+    #[tokio::test]
+    async fn an_index_op_is_applied_via_the_sink() {
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        hello(&mut stream, CLUSTER_SECRET).await;
+
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::IndexOp(crate::wire::IndexOpEntry {
+                database: DB.to_string(),
+                key: "material".to_string(),
+                op: IndexOp::Create,
+            }),
+        )
+        .await
+        .unwrap();
+
+        wait_until(|| {
+            sink.index_ops()
+                == vec![(DB.to_string(), "material".to_string(), IndexOp::Create)]
+        })
+        .await;
     }
 
     #[tokio::test]

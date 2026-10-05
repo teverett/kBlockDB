@@ -212,6 +212,14 @@ no type to fix an index to yet) rather than an error -- they simply do
 nothing until something sets that key. `DROP INDEX` on a key with no index
 is an error (404 over REST).
 
+In a clustered deployment (see [clustering.md](clustering.md)), all three
+are cluster-wide: running one against any node builds/drops/rebuilds the
+same index on every connected peer too, not just the node the statement
+was sent to. `CREATE INDEX`/`REBUILD INDEX` also catch a peer up on
+reconnect, so one that was disconnected when you ran it still ends up
+with the index once its link comes back -- `DROP INDEX` doesn't (see
+clustering.md's "Index operations" for why).
+
 ```text
 CREATE INDEX ON material
 DROP INDEX ON material

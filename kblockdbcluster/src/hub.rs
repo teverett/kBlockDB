@@ -17,7 +17,7 @@
 //! catch-up (see `peers.rs`).
 
 use crate::sequence::Sequencer;
-use crate::wire::{ChangeEntry, ChangeOp};
+use crate::wire::{ChangeEntry, ChangeOp, IndexOp, IndexOpEntry};
 use kblockdblib::{CellMeta, Stamp, Value};
 use std::sync::{Arc, Mutex};
 use tokio::sync::broadcast;
@@ -30,8 +30,16 @@ use tokio::sync::broadcast;
 /// module's doc comment).
 const CHANGE_LOG_CAPACITY: usize = 4096;
 
+/// Same idea as `CHANGE_LOG_CAPACITY`, but for `IndexOpEntry`s -- much
+/// smaller, since these are rare (an operator running `CREATE INDEX`, not
+/// every cell write) and, per `wire::IndexOpEntry`'s doc comment,
+/// fire-and-forget: there's no catch-up to fall back on if a link lags
+/// past this, only re-running the statement.
+const INDEX_OP_LOG_CAPACITY: usize = 64;
+
 pub struct ReplicationHub {
     sender: broadcast::Sender<ChangeEntry>,
+    index_ops: broadcast::Sender<IndexOpEntry>,
     sequencer: Sequencer,
 }
 
@@ -55,11 +63,20 @@ impl ReplicationHub {
 
     fn build(capacity: usize, sequencer: Sequencer) -> Arc<Self> {
         let (sender, _) = broadcast::channel(capacity);
-        Arc::new(ReplicationHub { sender, sequencer })
+        let (index_ops, _) = broadcast::channel(INDEX_OP_LOG_CAPACITY);
+        Arc::new(ReplicationHub {
+            sender,
+            index_ops,
+            sequencer,
+        })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<ChangeEntry> {
         self.sender.subscribe()
+    }
+
+    pub fn subscribe_index_ops(&self) -> broadcast::Receiver<IndexOpEntry> {
+        self.index_ops.subscribe()
     }
 
     pub fn sequencer(&self) -> &Sequencer {
@@ -77,6 +94,13 @@ impl ReplicationHub {
         if origin == self.sequencer.node_id() {
             self.sequencer.published(seq);
         }
+    }
+
+    /// Fire-and-forget, same as `publish` -- see `IndexOpEntry`'s doc
+    /// comment on why this carries no stamp and touches the sequencer not
+    /// at all.
+    fn publish_index_op(&self, entry: IndexOpEntry) {
+        let _ = self.index_ops.send(entry);
     }
 }
 
@@ -132,6 +156,27 @@ pub fn publish_remove(
             version: 0, // unused by a removal
             origin: stamp.origin,
             seq: stamp.seq,
+        });
+    }
+}
+
+/// Publishes a cluster-wide index operation -- a no-op if `replication` is
+/// `None`. Every connected peer's `apply_index_op` (`server::
+/// ReplicationSink`) runs `op` against its own copy of `database`, so
+/// `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX` take effect everywhere, not
+/// just on the node the statement was sent to -- see `IndexOpEntry`'s doc
+/// comment for the (lack of a) delivery guarantee this makes.
+pub fn publish_index_op(
+    replication: &Option<Arc<ReplicationHub>>,
+    database: &str,
+    key: &str,
+    op: IndexOp,
+) {
+    if let Some(hub) = replication {
+        hub.publish_index_op(IndexOpEntry {
+            database: database.to_string(),
+            key: key.to_string(),
+            op,
         });
     }
 }
@@ -200,6 +245,13 @@ impl Stamper {
     ) {
         publish_remove(&self.0.hub, database, coord, key, removed_at_ms, stamp);
         self.forget(stamp);
+    }
+
+    /// `publish_index_op` -- see its free-function doc comment. Unlike
+    /// `publish_set`/`publish_remove`, this doesn't consume a stamp: there
+    /// is none to hand out or forget (see `IndexOpEntry`'s doc comment).
+    pub fn publish_index_op(&self, database: &str, key: &str, op: IndexOp) {
+        publish_index_op(&self.0.hub, database, key, op);
     }
 
     fn forget(&self, stamp: Stamp) {
@@ -306,6 +358,38 @@ mod tests {
         assert_eq!(entry.op, ChangeOp::Remove);
         assert_eq!(entry.modified_at_ms, 42);
         assert_eq!((entry.origin, entry.seq), (7, 3));
+    }
+
+    #[test]
+    fn publish_index_op_is_a_no_op_without_a_hub() {
+        publish_index_op(&None, "demo", "material", IndexOp::Create);
+    }
+
+    #[test]
+    fn publish_index_op_reaches_a_subscriber() {
+        let hub = ReplicationHub::new();
+        let mut rx = hub.subscribe_index_ops();
+        let replication = Some(hub);
+
+        publish_index_op(&replication, "demo", "material", IndexOp::Rebuild);
+
+        let entry = rx.try_recv().unwrap();
+        assert_eq!(entry.database, "demo");
+        assert_eq!(entry.key, "material");
+        assert_eq!(entry.op, IndexOp::Rebuild);
+    }
+
+    #[test]
+    fn stamper_publish_index_op_reaches_a_subscriber_too() {
+        let hub = ReplicationHub::new();
+        let mut rx = hub.subscribe_index_ops();
+        let replication = Some(hub);
+        let stamper = Stamper::new(&replication);
+
+        stamper.publish_index_op("demo", "material", IndexOp::Drop);
+
+        let entry = rx.try_recv().unwrap();
+        assert_eq!(entry.op, IndexOp::Drop);
     }
 
     #[test]

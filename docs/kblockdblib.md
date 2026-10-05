@@ -284,6 +284,45 @@ a rewrite, and ids are never reissued. Two consequences follow from that:
 Dropping a column rewrites only the chunk files that actually held a
 value for it; a rare column doesn't cost a full-world rewrite.
 
+## Indexes
+
+A secondary equality index on one key, letting `lookup_eq` answer "which
+cells have `key == value`" in time proportional to the number of matches
+instead of a full `list_cells` scan:
+
+```rust
+world.create_index("material")?;
+world.lookup_eq("material", &kblockdblib::Value::Str("stone".into()))?;
+world.drop_index("material");
+world.rebuild_index("material")?; // discards and rebuilds from scratch
+world.indexed_keys(); // every key currently indexed, sorted
+```
+
+- `create_index(key)` backfills from every cell that currently holds
+  `key` (one `list_cells`-equivalent scan), then every later `set`/
+  `remove`/region/replicated write to `key` keeps it up to date for free.
+  Idempotent -- a no-op on an already-indexed key. A no-op, not an error,
+  on a key that's never been written (there's no type to fix an index to
+  yet).
+- `drop_index(key)` stops maintaining it and discards it; `rebuild_index`
+  is `drop_index` followed by `create_index`'s backfill in one call, for
+  a caller that suspects an index has gone stale (it shouldn't -- every
+  write path keeps it in sync; this is the recovery lever in case that
+  invariant were ever violated).
+- Equality only: a `<`/`>` comparison on an indexed key still needs a
+  full scan.
+
+Which keys are indexed is persisted to `indexes.txt` at the world root
+(see "Layout" below), rewritten in full on every change -- small enough
+(one line per indexed key, not per cell) that a plain rewrite, not an
+append-only log like `schema.txt`'s, is simplest. `World::open`/`create`
+read it back and rebuild each listed index (the same backfill scan
+`create_index` would do) before returning, so an index built in an
+earlier process run is there again after a restart, not just for the
+rest of that run. A listed key whose column was since removed is
+silently skipped and drops out of the file the next time anything else
+changes which keys are indexed.
+
 ## Compression
 
 `World::with_compression(bool)` -- off by default -- zstd-compresses
@@ -386,6 +425,11 @@ packed value array. That costs two different things:
   (`chunk_cells(axes, chunk_dim)`) is computed at runtime from the owning
   world's axis count and chunk size (both per-world runtime parameters,
   not compile-time constants -- see the axis-count/chunking bullets above).
+- `kblockdblib/src/index.rs`  -- `ValueIndex`, the in-memory equality-only
+  secondary index a key can be built on (see "Indexes" above) -- a plain
+  `key_id -> value -> coords` map, with no notion of persistence or chunk
+  storage of its own; `World` is what backfills, persists (`indexes.txt`),
+  and keeps it in sync with every write.
 - `kblockdblib/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
   mapping, chunk file paths, `with_chunk_read`/`with_chunk_write` (the
   cache-then-apply[-then-write] cycle every operation goes through),

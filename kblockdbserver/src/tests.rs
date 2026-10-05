@@ -674,6 +674,102 @@ async fn removing_a_cell_publishes_its_removal_time_and_nothing_when_absent() {
 }
 
 #[tokio::test]
+async fn create_index_via_the_query_language_publishes_an_index_op() {
+    let (databases, _dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let mut published = hub.subscribe_index_ops();
+    let app = router(test_state(databases).with_replication(hub));
+
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    let (status, _) = send(
+        app,
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entry = published.try_recv().expect("the index op is published");
+    assert_eq!(entry.database, DB);
+    assert_eq!(entry.key, "material");
+    assert_eq!(entry.op, kblockdbcluster::wire::IndexOp::Create);
+}
+
+#[tokio::test]
+async fn drop_index_via_the_query_language_publishes_an_index_op() {
+    let (databases, _dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    databases
+        .get(DB)
+        .unwrap()
+        .set(&[1, 2, 3], "material", kblockdblib::Value::Str("stone".into()))
+        .unwrap();
+    databases.get(DB).unwrap().create_index("material").unwrap();
+    let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let mut published = hub.subscribe_index_ops();
+    let app = router(test_state(databases).with_replication(hub));
+
+    let (status, _) = send(
+        app,
+        post("/rest/db/db/query", query("DROP INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entry = published.try_recv().expect("the index op is published");
+    assert_eq!(entry.op, kblockdbcluster::wire::IndexOp::Drop);
+}
+
+#[tokio::test]
+async fn rebuild_index_via_the_query_language_publishes_an_index_op() {
+    let (databases, _dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    databases
+        .get(DB)
+        .unwrap()
+        .set(&[1, 2, 3], "material", kblockdblib::Value::Str("stone".into()))
+        .unwrap();
+    databases.get(DB).unwrap().create_index("material").unwrap();
+    let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let mut published = hub.subscribe_index_ops();
+    let app = router(test_state(databases).with_replication(hub));
+
+    let (status, _) = send(
+        app,
+        post("/rest/db/db/query", query("REBUILD INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let entry = published.try_recv().expect("the index op is published");
+    assert_eq!(entry.op, kblockdbcluster::wire::IndexOp::Rebuild);
+}
+
+#[tokio::test]
+async fn drop_index_that_does_not_exist_publishes_nothing() {
+    let (databases, _dir) = test_databases();
+    databases.create(DB, None).unwrap();
+    let hub = kblockdbcluster::hub::ReplicationHub::new();
+    let mut published = hub.subscribe_index_ops();
+    let app = router(test_state(databases).with_replication(hub));
+
+    let (status, _) = send(
+        app,
+        post("/rest/db/db/query", query("DROP INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(published.try_recv().is_err());
+}
+
+#[tokio::test]
 async fn set_then_get_a_cell_roundtrips() {
     let (app, _dir) = test_app();
 

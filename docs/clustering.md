@@ -284,6 +284,45 @@ mechanism `SELECT`'s `created`/`updated`/`version` keywords expose (see
 [query-language.md](query-language.md)), applied automatically rather
 than queried.
 
+## Index operations
+
+`CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX` (see
+[query-language.md](query-language.md)) are cluster-wide: running one
+against any node publishes an `IndexOp` (`kblockdbcluster::wire::IndexOp`)
+to every connected peer, which runs the same operation against its own
+copy of the database (`kblockdbserver/src/cluster.rs`'s
+`apply_index_op`). This is the one exception to "no database-level
+replication" below -- a secondary index is local performance state, not
+data, but keeping it in sync across the cluster without a separate manual
+step was worth the small addition.
+
+Unlike a cell write, an `IndexOp` carries no stamp and isn't tracked by
+any version vector -- it's fire-and-forget while both sides are
+connected, the same spirit as `PeerList` gossip. But *reconnecting*
+catches up: right after the initial `PeerList`, every connection also
+sends one `IndexState` frame (`kblockdbcluster::wire::PeerMessage::
+IndexState`) -- the sender's complete current `(database, key)` index
+list (`source::ChangeSource::indexed_keys`) -- and the receiver builds
+whatever it's missing from it. So a peer that was down, lagged past the
+hub's (small, 64-entry) index-op buffer, or is linking to this sender for
+the very first time, still ends up with every `CREATE INDEX`/`REBUILD
+INDEX` already applied elsewhere, as soon as its link comes back up --
+no manual re-run needed. `CREATE INDEX`/`REBUILD INDEX` on a key an
+unseen database doesn't have is a harmless no-op on the receiving peer
+(same as `DROP INDEX`), and never auto-creates a database the way a
+`Set`/`Remove` can.
+
+**`DROP INDEX` is the one gap left.** `IndexState` only ever *creates* --
+it never tells a peer to drop an index merely because the index isn't in
+the list it just received (a peer that's still catching up, or has a
+different working set of databases, would otherwise have real indexes
+removed out from under it for no good reason). So a `DROP INDEX` a peer
+missed while disconnected doesn't undo itself on reconnect; the extra
+index just keeps being correctly maintained by ordinary replicated
+writes from then on (it's accurate, just no longer wanted) until the
+operator runs `DROP INDEX` again, which the live `IndexOp` path still
+replicates immediately to whoever's currently connected.
+
 ## Limitations
 
 This is a v1, intentionally minimal design:
@@ -298,7 +337,7 @@ This is a v1, intentionally minimal design:
   would then be accepted. This needs a key's very first write anywhere to
   arrive after its delete, so it's rare.
 - **Upgrade every node together.** Servers only link with a peer speaking
-  exactly the same peer protocol version (4), so a mixed-version cluster
+  exactly the same peer protocol version (5), so a mixed-version cluster
   doesn't replicate at all between old and new servers.
 - **Never copy `.cluster/` to another server.** It holds the node id;
   two servers sharing one would each take the other for itself and
@@ -310,7 +349,9 @@ This is a v1, intentionally minimal design:
 - **No database-level replication.** Creating or removing a database, and
   adding or removing a column, aren't replicated; a database a peer
   hasn't seen is auto-created on its first incoming write. Equal vectors
-  say nothing about these.
+  say nothing about these. Secondary indexes are the one exception --
+  see "Index operations" above -- and even those are best-effort, not
+  tracked by a vector either.
 - **No quorum or strong consistency.** This is eventually-consistent,
   best-effort replication, not a consensus protocol -- there's no
   guarantee all nodes agree at any given instant, only that they tend to
