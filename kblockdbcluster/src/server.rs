@@ -660,10 +660,14 @@ mod tests {
         wait_until(|| a.peers.snapshot() == vec![(by_ip.clone(), true)]).await;
 
         a.peers.add(by_name);
-        // Give the alias link time to connect and be dropped, then check
-        // only the original remains.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        assert_eq!(a.peers.snapshot(), vec![(by_ip, true)]);
+        // Wait for the alias link to connect and be dropped, rather than
+        // sleeping a fixed guess and checking once -- a fixed sleep here
+        // was occasionally too short under load (the alias connects,
+        // gets `HelloOk`, and is pruned as a duplicate, but that whole
+        // round trip can take longer than 300ms when the test binary is
+        // busy running other tests concurrently), which flaked this test
+        // without anything actually being wrong.
+        wait_until(|| a.peers.snapshot() == vec![(by_ip.clone(), true)]).await;
     }
 
     #[tokio::test]
