@@ -293,7 +293,7 @@ instead of a full `list_cells` scan:
 ```rust
 world.create_index("material")?;
 world.lookup_eq("material", &kblockdblib::Value::Str("stone".into()))?;
-world.drop_index("material");
+world.drop_index("material")?;
 world.rebuild_index("material")?; // discards and rebuilds from scratch
 world.indexed_keys(); // every key currently indexed, sorted
 ```
@@ -304,24 +304,34 @@ world.indexed_keys(); // every key currently indexed, sorted
   Idempotent -- a no-op on an already-indexed key. A no-op, not an error,
   on a key that's never been written (there's no type to fix an index to
   yet).
-- `drop_index(key)` stops maintaining it and discards it; `rebuild_index`
-  is `drop_index` followed by `create_index`'s backfill in one call, for
-  a caller that suspects an index has gone stale (it shouldn't -- every
-  write path keeps it in sync; this is the recovery lever in case that
-  invariant were ever violated).
+- `drop_index(key)` stops maintaining it and deletes its on-disk state;
+  `rebuild_index` is `drop_index` followed by `create_index`'s backfill
+  in one call, for a caller that suspects an index has gone stale (it
+  shouldn't -- every write path keeps it in sync; this is the recovery
+  lever in case that invariant were ever violated).
 - Equality only: a `<`/`>` comparison on an indexed key still needs a
   full scan.
 
-Which keys are indexed is persisted to `indexes.txt` at the world root
-(see "Layout" below), rewritten in full on every change -- small enough
-(one line per indexed key, not per cell) that a plain rewrite, not an
-append-only log like `schema.txt`'s, is simplest. `World::open`/`create`
-read it back and rebuild each listed index (the same backfill scan
-`create_index` would do) before returning, so an index built in an
-earlier process run is there again after a restart, not just for the
-rest of that run. A listed key whose column was since removed is
-silently skipped and drops out of the file the next time anything else
-changes which keys are indexed.
+**Backed by an on-disk LSM structure, not an in-memory map** (`crate::lsm`,
+wrapped per-key by `crate::index::ValueIndex`), so an index on a key most
+of a huge world holds doesn't need to fit in RAM: writes buffer in a small
+bounded memtable (durably logged to a WAL first), flushed to an immutable
+sorted segment file once the memtable passes a size threshold, with
+segments merged (compacted) once they accumulate past their own
+threshold. A lookup checks the memtable then every segment, using each
+segment's small in-memory sparse index to avoid reading it in full. See
+`kblockdblib/src/lsm.rs`'s own doc comment for the exact shape and its
+deliberate simplifications (one compaction tier, no bloom filters).
+
+Each indexed key gets its own directory, `root/indexes/<key_id>/` (see
+"Layout" below) -- which keys are indexed is exactly which subdirectories
+exist there, not a separate manifest. Because each index's segments and
+WAL *are* its persisted state, `World::open`/`create` restore every
+existing index by just opening its directory (reading each segment's
+small header/footer, replaying the WAL) -- unlike the very first
+`create_index` for a key, this needs no `list_cells`-style rescan, so a
+world with a huge existing index reopens cheaply, not in time proportional
+to how much it indexes.
 
 ## Compression
 
@@ -425,11 +435,18 @@ packed value array. That costs two different things:
   (`chunk_cells(axes, chunk_dim)`) is computed at runtime from the owning
   world's axis count and chunk size (both per-world runtime parameters,
   not compile-time constants -- see the axis-count/chunking bullets above).
-- `kblockdblib/src/index.rs`  -- `ValueIndex`, the in-memory equality-only
-  secondary index a key can be built on (see "Indexes" above) -- a plain
-  `key_id -> value -> coords` map, with no notion of persistence or chunk
-  storage of its own; `World` is what backfills, persists (`indexes.txt`),
-  and keeps it in sync with every write.
+- `kblockdblib/src/index.rs`  -- `ValueIndex`, the equality-only secondary
+  index registry a key can be built on (see "Indexes" above): one
+  `crate::lsm::LsmIndex` per indexed key id, plus the `Value` ->
+  order-preserving-bytes encoding (`sortable_bytes`) `lsm.rs` itself
+  stays opaque to. `World` is what backfills a brand new index and keeps
+  every existing one in sync with every write; this module has no notion
+  of chunk storage of its own.
+- `kblockdblib/src/lsm.rs`  -- `LsmIndex`, the on-disk log-structured-merge
+  engine one secondary index's directory is -- memtable, WAL, immutable
+  sorted segments with a sparse in-memory footer index, and single-tier
+  compaction. Generic over `Vec<u8>` keys and `Coord`s; knows nothing
+  about `Value`/`World`.
 - `kblockdblib/src/world.rs`  -- `World::create`/`open`, coordinate -> chunk
   mapping, chunk file paths, `with_chunk_read`/`with_chunk_write` (the
   cache-then-apply[-then-write] cycle every operation goes through),

@@ -95,11 +95,6 @@ const _: () = assert!(
 
 type ChunkKey = Coord;
 
-/// Name of the file at a world's root listing which keys currently have a
-/// secondary index built -- see `World`'s "Layout on disk" doc comment and
-/// `persist_indexed_keys`/`open_inner`'s backfill.
-const INDEXES_FILE: &str = "indexes.txt";
-
 /// Milliseconds since the Unix epoch, for stamping `CellMeta` on every
 /// `set` -- the clock is read here, once per `set`/`set_region` call, and
 /// passed down to `Chunk::set` as a plain argument rather than read there,
@@ -245,9 +240,13 @@ impl Iterator for RegionIter {
 /// Layout on disk under `root`:
 ///   root/world.txt                  -- this world's axes/world_dim (see params.rs)
 ///   root/schema.txt                 -- key string <-> id registry (see schema.rs)
-///   root/indexes.txt                -- which keys have a secondary index
-///                                       built (see `create_index`), so it
-///                                       survives a restart
+///   root/indexes/<key_id>/          -- one secondary index's on-disk LSM
+///                                       state per indexed key (see
+///                                       `create_index`, `crate::index`,
+///                                       `crate::lsm`); which keys are
+///                                       indexed is exactly which
+///                                       subdirectories exist here, not a
+///                                       separate manifest
 ///   root/<c0>/<c1>/.../<c_n-1>.chunk -- one file per non-empty chunk,
 ///                                       nested axes-1 directories deep
 ///
@@ -496,7 +495,13 @@ impl World {
             params.chunk_dim,
             schema.len()
         ));
-        let world = World {
+        // Opens whatever secondary indexes already exist under
+        // `root/indexes/` -- each one's own on-disk LSM state (segments +
+        // WAL, see `crate::index`/`crate::lsm`) already *is* its
+        // persisted content, so unlike the very first `create_index` for
+        // a key, this needs no `list_cells`-style rescan to restore it.
+        let value_index = ValueIndex::open(&root)?;
+        Ok(World {
             root,
             axes: params.axes,
             world_dim: params.world_dim,
@@ -509,39 +514,8 @@ impl World {
             chunk_cache: ChunkCache::new(DEFAULT_MAX_CACHED_CHUNKS),
             compression: false,
             tombstone_retention: None,
-            value_index: ValueIndex::new(),
-        };
-        world.restore_indexes()?;
-        Ok(world)
-    }
-
-    /// Rebuilds every secondary index `indexes.txt` lists -- called once,
-    /// right after `open`/`create` constructs this `World`, so an index
-    /// built in an earlier process run is there again from the start,
-    /// rather than only after someone notices it's gone and runs
-    /// `create_index` again. Same backfill cost as `create_index` itself,
-    /// paid once per listed key, here, at startup, instead of silently
-    /// losing every index on every restart.
-    ///
-    /// A key `indexes.txt` lists that's no longer a live column (its
-    /// column was removed since this was last written) is silently
-    /// skipped -- same "doesn't apply, not an error" spirit as everywhere
-    /// else in this crate; it drops out of the file for good the next
-    /// time anything else changes which keys are indexed (see
-    /// `persist_indexed_keys`).
-    fn restore_indexes(&self) -> io::Result<()> {
-        let path = self.root.join(INDEXES_FILE);
-        if !path.exists() {
-            return Ok(());
-        }
-        let text = fs::read_to_string(&path)?;
-        for key in text.lines().filter(|line| !line.is_empty()) {
-            let key_id = self.schema().id_for_key(key);
-            if let Some(key_id) = key_id {
-                self.build_index(key, key_id)?;
-            }
-        }
-        Ok(())
+            value_index,
+        })
     }
 
     /// Overrides the cap on concurrent `with_chunk` calls (real concurrent
@@ -784,9 +758,7 @@ impl World {
                 purged += 1;
             }
         }
-        if self.value_index.drop_index(key_id) {
-            let _ = self.persist_indexed_keys();
-        }
+        self.value_index.drop_index(key_id)?;
         crate::logger::info(format!(
             "removed column '{key}' from {} ({purged} chunk(s) rewritten)",
             self.root.display()
@@ -848,63 +820,53 @@ impl World {
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(());
         };
-        self.value_index.drop_index(key_id);
+        self.value_index.drop_index(key_id)?;
         self.build_index(key, key_id)
     }
 
     /// Shared by `create_index`/`rebuild_index`: registers `key_id` as
-    /// indexed (starting empty) and backfills it from every cell
-    /// `list_cells` currently reports holding `key`.
+    /// indexed (starting empty, its on-disk LSM directory freshly created
+    /// -- see `crate::index`/`crate::lsm`) and backfills it from every
+    /// cell `list_cells` currently reports holding `key`.
     fn build_index(&self, key: &str, key_id: u32) -> io::Result<()> {
-        self.value_index.create(key_id);
+        self.value_index.create(key_id)?;
         for cell in self.list_cells()? {
             if let Some((_, value, _)) = cell.values.iter().find(|(k, ..)| k == key) {
-                self.value_index.record(key_id, &cell.coord, None, Some(value));
+                self.value_index.record(key_id, &cell.coord, None, Some(value))?;
             }
         }
-        self.persist_indexed_keys()?;
         crate::logger::info(format!("(re)built index on key '{key}' at {}", self.root.display()));
         Ok(())
     }
 
-    /// Stops maintaining `key`'s secondary index and discards it. Returns
-    /// whether it was indexed. After this, `lookup_eq(key, ...)` falls back
-    /// to reporting "not indexed" (`None`) the same as a key that was never
-    /// indexed at all.
-    pub fn drop_index(&self, key: &str) -> bool {
-        let Some(key_id) = self.schema().id_for_key(key) else {
-            return false;
-        };
-        let dropped = self.value_index.drop_index(key_id);
-        if dropped {
-            // Best-effort: a failed write here leaves `indexes.txt` one
-            // write behind the in-memory state (this index still reports
-            // dropped via `lookup_eq`/`indexed_keys` for the rest of this
-            // process's life), not a correctness problem -- only a stale
-            // disk file a future `open` would wrongly rebuild from. Not
-            // worth turning a successful, already-applied drop into an
-            // error over.
-            let _ = self.persist_indexed_keys();
+    /// `ValueIndex::record`, logging (rather than propagating) a failure
+    /// -- every write-path call site below calls this, not
+    /// `self.value_index.record` directly. A secondary index's own disk
+    /// I/O failing doesn't fail the cell write that triggered it: that
+    /// write already succeeded, and an index is a derived, rebuildable
+    /// structure (`rebuild_index`), not the source of truth -- the same
+    /// "fall back, don't fail" stance `lookup_eq` takes on the read side.
+    fn record_index_change(
+        &self,
+        key_id: u32,
+        coord: &Coord,
+        old: Option<&Value>,
+        new: Option<&Value>,
+    ) {
+        if let Err(e) = self.value_index.record(key_id, coord, old, new) {
+            crate::logger::warn(format!("secondary index update failed at {coord:?}: {e}"));
         }
-        dropped
     }
 
-    /// Rewrites `indexes.txt` at the world root to exactly this `World`'s
-    /// current `indexed_keys()` -- called after every change to which keys
-    /// are indexed (`build_index`/`drop_index`/`remove_column`), so a later
-    /// `open` of this same root can rebuild the same set (see
-    /// `open_inner`'s backfill) instead of starting with none, every time,
-    /// after every restart. A full rewrite, not an append: the list is
-    /// tiny (one line per indexed key, not per cell), so there's no
-    /// efficiency reason to do anything cleverer, and a plain rewrite can
-    /// never accumulate a removed key's stale tombstone the way
-    /// `schema.txt`'s append-only format has to guard against.
-    fn persist_indexed_keys(&self) -> io::Result<()> {
-        let mut text = self.indexed_keys().join("\n");
-        if !text.is_empty() {
-            text.push('\n');
-        }
-        fs::write(self.root.join(INDEXES_FILE), text)
+    /// Stops maintaining `key`'s secondary index and deletes its on-disk
+    /// state. Returns whether it was indexed. After this, `lookup_eq(key,
+    /// ...)` falls back to reporting "not indexed" (`None`) the same as a
+    /// key that was never indexed at all.
+    pub fn drop_index(&self, key: &str) -> io::Result<bool> {
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return Ok(false);
+        };
+        self.value_index.drop_index(key_id)
     }
 
     /// Every key currently indexed (see `create_index`), sorted.
@@ -945,9 +907,25 @@ impl World {
         // point (see `create_index`), so it always has a type here.
         let column_type = schema.type_for_key(key)?;
         drop(schema);
-        match normalize_value_for_type(value, column_type) {
-            Some(value) => self.value_index.lookup_eq(key_id, &value),
-            None => Some(Vec::new()),
+        let normalized = match normalize_value_for_type(value, column_type) {
+            Some(value) => value,
+            None => return Some(Vec::new()),
+        };
+        // A read error here (disk I/O, same as any other file access in
+        // this crate) falls back to "not indexed" rather than a hard
+        // error: the caller's response is the same either way -- a full
+        // `list_cells` scan -- and that's a better outcome than failing a
+        // read outright over a structure that exists purely to make reads
+        // faster, not to be their only path to a correct answer.
+        match self.value_index.lookup_eq(key_id, &normalized) {
+            Ok(result) => result,
+            Err(e) => {
+                crate::logger::warn(format!(
+                    "secondary index lookup failed for key '{key}': {e} -- falling back to a \
+                     full scan"
+                ));
+                None
+            }
         }
     }
 
@@ -1446,7 +1424,7 @@ impl World {
             ((meta, stamp), old_value)
         })?;
         if indexed {
-            self.value_index.record(
+            self.record_index_change(
                 key_id,
                 &Coord::from(coord),
                 old_value.as_ref(),
@@ -1504,7 +1482,7 @@ impl World {
             ((wins, old_value), wins)
         })?;
         if indexed && wins {
-            self.value_index.record(
+            self.record_index_change(
                 key_id,
                 &Coord::from(coord),
                 old_value.as_ref(),
@@ -1560,8 +1538,7 @@ impl World {
             ((wins, old_value), wins)
         })?;
         if indexed && wins {
-            self.value_index
-                .record(key_id, &Coord::from(coord), old_value.as_ref(), None);
+            self.record_index_change(key_id, &Coord::from(coord), old_value.as_ref(), None);
         }
         Ok(wins)
     }
@@ -1671,7 +1648,7 @@ impl World {
             match outcome {
                 Ok((applied, index_updates)) => {
                     for (local_idx, key_id, old, new) in index_updates {
-                        self.value_index.record(
+                        self.record_index_change(
                             key_id,
                             &self.unsplit(&ckey, local_idx),
                             old.as_ref(),
@@ -1739,8 +1716,7 @@ impl World {
             ((removed, old_value), changed)
         })?;
         if indexed && removed.is_some() {
-            self.value_index
-                .record(key_id, &Coord::from(coord), old_value.as_ref(), None);
+            self.record_index_change(key_id, &Coord::from(coord), old_value.as_ref(), None);
         }
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
         Ok(removed.map(|stamp| (at_ms, stamp)))
@@ -1922,7 +1898,7 @@ impl World {
             index_updates.extend(updates);
         }
         for (coord, old, new) in index_updates {
-            self.value_index.record(key_id, &coord, old.as_ref(), new.as_ref());
+            self.record_index_change(key_id, &coord, old.as_ref(), new.as_ref());
         }
         crate::logger::info(format!(
             "set region {region:?} key '{key}' from {volume} per-cell values"
@@ -1980,7 +1956,7 @@ impl World {
             })?;
             if indexed {
                 for (local_idx, _, old_value) in &removed_here {
-                    self.value_index.record(
+                    self.record_index_change(
                         key_id,
                         &self.unsplit(&ckey, *local_idx),
                         old_value.as_ref(),
@@ -5298,8 +5274,8 @@ mod tests {
         w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
             .unwrap();
         w.create_index("material").unwrap();
-        assert!(w.drop_index("material"));
-        assert!(!w.drop_index("material"));
+        assert!(w.drop_index("material").unwrap());
+        assert!(!w.drop_index("material").unwrap());
 
         assert_eq!(w.lookup_eq("material", &Value::Str("stone".into())), None);
         // A set after dropping must not resurrect/maintain the index.
@@ -5344,12 +5320,14 @@ mod tests {
         // recovery lever for exactly this (see its doc comment), so this
         // confirms it actually discards what a cheap `create_index`
         // no-op would have left behind.
-        w.value_index.record(
-            w.schema().id_for_key("material").unwrap(),
-            &coord3(9, 9, 9),
-            None,
-            Some(&Value::Str("stone".into())),
-        );
+        w.value_index
+            .record(
+                w.schema().id_for_key("material").unwrap(),
+                &coord3(9, 9, 9),
+                None,
+                Some(&Value::Str("stone".into())),
+            )
+            .unwrap();
         assert_eq!(
             w.lookup_eq("material", &Value::Str("stone".into()))
                 .unwrap()
@@ -5389,8 +5367,8 @@ mod tests {
 
         // A brand new `World` over the same directory -- this can only
         // know "material" is indexed, and what it currently holds, by
-        // having read `indexes.txt` back and rebuilt from the chunk
-        // files, not from any in-memory state carried over.
+        // having opened its on-disk LSM segments back under
+        // `root/indexes/`, not from any in-memory state carried over.
         let w = World::open(&dir).unwrap();
         assert_eq!(w.indexed_keys(), vec!["material".to_string()]);
         assert_eq!(
@@ -5434,7 +5412,7 @@ mod tests {
             w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
                 .unwrap();
             w.create_index("material").unwrap();
-            w.drop_index("material");
+            w.drop_index("material").unwrap();
         }
 
         let w = World::open(&dir).unwrap();
@@ -5443,7 +5421,7 @@ mod tests {
     }
 
     #[test]
-    fn an_unindexed_world_has_no_indexes_txt_to_read() {
+    fn an_unindexed_world_has_nothing_to_restore_on_reopen() {
         let dir = TempDir::new("index-none-no-file");
         {
             let w = create(&dir);

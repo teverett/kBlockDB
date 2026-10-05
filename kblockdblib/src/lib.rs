@@ -13,6 +13,7 @@ mod chunk_cache;
 pub mod coord;
 pub mod index;
 pub mod logger;
+mod lsm;
 pub mod params;
 pub mod schema;
 mod semaphore;

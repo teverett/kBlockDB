@@ -678,7 +678,7 @@ async fn remove_index(
 ) -> Result<StatusCode, ApiError> {
     let lookup_key = key.clone();
     let dropped = state
-        .with_database(&db, move |w| Ok(w.drop_index(&lookup_key)))
+        .with_database(&db, move |w| w.drop_index(&lookup_key))
         .await?;
     if dropped {
         Ok(StatusCode::NO_CONTENT)
@@ -1304,7 +1304,7 @@ pub(crate) async fn execute_query(
         query::Statement::DropIndex { key } => {
             let lookup_key = key.clone();
             let dropped = state
-                .with_database(db, move |w| Ok(w.drop_index(&lookup_key)))
+                .with_database(db, move |w| w.drop_index(&lookup_key))
                 .await?;
             if dropped {
                 Stamper::new(&state.replication).publish_index_op(

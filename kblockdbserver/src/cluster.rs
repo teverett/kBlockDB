@@ -134,10 +134,7 @@ impl ReplicationSink for AppState {
         match self
             .with_database(&database, move |w| match op {
                 IndexOp::Create => w.create_index(&key),
-                IndexOp::Drop => {
-                    w.drop_index(&key);
-                    Ok(())
-                }
+                IndexOp::Drop => w.drop_index(&key).map(|_| ()),
                 IndexOp::Rebuild => w.rebuild_index(&key),
             })
             .await

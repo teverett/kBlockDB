@@ -197,9 +197,11 @@ frequency -- unless the key a `WHERE` filters on has a secondary index
 
 **Indexes.** `CREATE INDEX ON <key>` builds a secondary equality index on
 `key` (see [kblockdblib's design notes](kblockdblib.md) and
-`kblockdblib::World::create_index`): an in-memory map from `key`'s value to
-every coordinate currently holding it, kept up to date by every later
-write to `key`. `DROP INDEX ON <key>` discards it. `REBUILD INDEX ON <key>`
+`kblockdblib::World::create_index`): an on-disk map from `key`'s value to
+every coordinate currently holding it (not an in-memory structure -- it
+doesn't need to fit in RAM, see kblockdblib's own "Indexes" section),
+kept up to date by every later write to `key`. `DROP INDEX ON <key>`
+discards it. `REBUILD INDEX ON <key>`
 discards whatever's there (if anything) and builds a fresh one from
 scratch -- the recovery lever if an index is ever suspected to have gone
 stale, though it shouldn't: every write path keeps it in sync. All three
