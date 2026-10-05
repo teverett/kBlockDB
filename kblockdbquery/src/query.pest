@@ -29,6 +29,14 @@ kw_and    = @{ ^"AND"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_or     = @{ ^"OR"     ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_not    = @{ ^"NOT"    ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_exists = @{ ^"EXISTS" ~ !(ASCII_ALPHANUMERIC | "_") }
+// `CREATE INDEX ON <key>` / `DROP INDEX ON <key>` / `REBUILD INDEX ON
+// <key>` -- see `create_index_stmt`/`drop_index_stmt`/`rebuild_index_stmt`
+// below.
+kw_create  = @{ ^"CREATE"  ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_drop    = @{ ^"DROP"    ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_rebuild = @{ ^"REBUILD" ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_index   = @{ ^"INDEX"   ~ !(ASCII_ALPHANUMERIC | "_") }
+kw_on      = @{ ^"ON"      ~ !(ASCII_ALPHANUMERIC | "_") }
 // Metadata keywords -- see `meta` below: these address a cell's
 // per-key `CellMeta` fields (`created_at_ms`/`modified_at_ms`/`version`)
 // from a WHERE clause, the same word-bounded, case-insensitive way every
@@ -37,7 +45,12 @@ kw_created = @{ ^"CREATED" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_updated = @{ ^"UPDATED" ~ !(ASCII_ALPHANUMERIC | "_") }
 kw_version = @{ ^"VERSION" ~ !(ASCII_ALPHANUMERIC | "_") }
 
-statement = { SOI ~ (select_stmt | set_stmt | update_stmt | delete_stmt) ~ EOI }
+statement = {
+    SOI ~ (
+        select_stmt | set_stmt | update_stmt | delete_stmt
+        | create_index_stmt | drop_index_stmt | rebuild_index_stmt
+    ) ~ EOI
+}
 
 select_stmt = { kw_select ~ columns ~ (kw_from ~ range)? ~ (kw_where ~ expr)? }
 // SET is an upsert over `IN <range>` -- unlike UPDATE, it can create cells
@@ -49,6 +62,13 @@ set_stmt    = { kw_set ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ kw_i
 // as DELETE's.
 update_stmt = { kw_update ~ "(" ~ assignment_list ~ ")" ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
 delete_stmt = { kw_delete ~ (kw_where ~ expr)? ~ (kw_in ~ range)? }
+
+// A secondary equality index (see `kblockdblib::World::create_index`) on a
+// single key -- not scoped to a range or filtered by WHERE, since it's a
+// schema-level operation on the whole column, not a per-cell one.
+create_index_stmt  = { kw_create ~ kw_index ~ kw_on ~ ident }
+drop_index_stmt    = { kw_drop ~ kw_index ~ kw_on ~ ident }
+rebuild_index_stmt = { kw_rebuild ~ kw_index ~ kw_on ~ ident }
 
 // Aggregates are tried first: `count(*)`/`sum(key)`/... need their "("
 // checked before `column_list` could mistake the function name alone

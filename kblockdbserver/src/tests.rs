@@ -182,6 +182,20 @@ fn delete(path: &str) -> Request<Body> {
     )
 }
 
+/// A bodyless `PUT` -- for routes like `/rest/db/{db}/indexes/{key}` whose
+/// handler takes no JSON body, unlike `put`'s.
+fn put_empty(path: &str) -> Request<Body> {
+    with_auth(
+        Request::builder()
+            .method("PUT")
+            .uri(path)
+            .body(Body::empty())
+            .unwrap(),
+        TEST_ADMIN,
+        TEST_ADMIN_PASSWORD,
+    )
+}
+
 #[tokio::test]
 async fn health_reports_status_and_the_database_count() {
     let (status, body) = send(test_app().0, get("/rest/health")).await;
@@ -2244,6 +2258,501 @@ async fn a_read_only_user_can_list_but_not_change_columns() {
         TEST_READ_ONLY_PASSWORD,
     );
     let (status, _) = send(app, remove).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+// --- Indexes ---
+
+#[tokio::test]
+async fn list_indexes_is_empty_by_default() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["indexes"], json!([]));
+}
+
+#[tokio::test]
+async fn create_index_then_list_indexes_reports_it() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    let (status, _) = send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(body["indexes"], json!(["material"]));
+}
+
+#[tokio::test]
+async fn creating_an_index_twice_is_still_no_content() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+    let (status, _) = send(app, put_empty("/rest/db/db/indexes/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+#[tokio::test]
+async fn removing_an_index_drops_it_from_the_listing() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+
+    let (status, _) = send(app.clone(), delete("/rest/db/db/indexes/material")).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    let (_, body) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(body["indexes"], json!([]));
+}
+
+#[tokio::test]
+async fn removing_an_index_that_doesnt_exist_is_404() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(app, delete("/rest/db/db/indexes/nope")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("nope"));
+}
+
+#[tokio::test]
+async fn listing_indexes_requires_auth() {
+    let (app, _dir) = test_app();
+    let req = Request::builder()
+        .method("GET")
+        .uri("/rest/db/db/indexes")
+        .body(Body::empty())
+        .unwrap();
+    let (status, _) = send(app, req).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_read_only_user_can_list_but_not_create_or_drop_an_index() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let list = with_auth(
+        Request::builder()
+            .method("GET")
+            .uri("/rest/db/db/indexes")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), list).await;
+    assert_eq!(status, StatusCode::OK);
+
+    let create = with_auth(
+        Request::builder()
+            .method("PUT")
+            .uri("/rest/db/db/indexes/material")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), create).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let remove = with_auth(
+        Request::builder()
+            .method("DELETE")
+            .uri("/rest/db/db/indexes/material")
+            .body(Body::empty())
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, remove).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+/// The whole point of an index is that it changes *how* a query is
+/// answered, not *what* it answers -- this builds an index on `material`
+/// and runs the exact same `SELECT` scenario already covered without one
+/// (see `select_where_filters_by_value`), to confirm the index-assisted
+/// path (`routes::matching_cells`) and the full-scan path agree.
+#[tokio::test]
+async fn select_where_filters_by_value_the_same_way_with_or_without_an_index() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/material",
+            json!({"type": "str", "value": "air"}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn select_where_and_of_two_indexed_keys_intersects_correctly() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/hardness",
+            json!({"type": "i64", "value": 7}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/hardness",
+            json!({"type": "i64", "value": 3}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/hardness")).await;
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE material = 'stone' AND hardness = 7"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
+async fn update_and_delete_with_where_still_work_correctly_once_the_key_is_indexed() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/material",
+            json!({"type": "str", "value": "air"}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/db/db/query",
+            query("UPDATE (hardness = 5) WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 1);
+
+    let (_, cell) = send(app.clone(), get("/rest/db/db/cells/1,2,3/hardness")).await;
+    assert_eq!(cell["value"], json!({"type": "i64", "value": 5}));
+
+    let (status, body) = send(
+        app.clone(),
+        post(
+            "/rest/db/db/query",
+            query("DELETE WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["affected_cells"], 1);
+
+    let (status, _) = send(app, get("/rest/db/db/cells/1,2,3/material")).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn create_index_on_via_the_query_language_is_equivalent_to_the_rest_route() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({}));
+
+    let (_, indexes) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(indexes["indexes"], json!(["material"]));
+}
+
+#[tokio::test]
+async fn create_index_on_via_the_query_language_is_idempotent() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+    let (status, _) = send(
+        app,
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn drop_index_on_via_the_query_language_removes_it() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post("/rest/db/db/query", query("DROP INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({}));
+
+    let (_, indexes) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(indexes["indexes"], json!([]));
+}
+
+#[tokio::test]
+async fn drop_index_on_a_key_with_no_index_is_404() {
+    let (app, _dir) = test_app();
+    let (status, body) = send(
+        app,
+        post("/rest/db/db/query", query("DROP INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body["error"].as_str().unwrap().contains("material"));
+}
+
+#[tokio::test]
+async fn a_read_only_user_cannot_create_or_drop_an_index_via_the_query_language() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let create = with_auth(
+        Request::builder()
+            .method("POST")
+            .uri("/rest/db/db/query")
+            .header("content-type", "application/json")
+            .body(Body::from(query("CREATE INDEX ON material").to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app.clone(), create).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let drop = with_auth(
+        Request::builder()
+            .method("POST")
+            .uri("/rest/db/db/query")
+            .header("content-type", "application/json")
+            .body(Body::from(query("DROP INDEX ON material").to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, drop).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn rebuild_index_on_via_the_query_language_keeps_the_index_working() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+
+    let (status, body) = send(
+        app.clone(),
+        post("/rest/db/db/query", query("REBUILD INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, json!({}));
+
+    let (_, indexes) = send(app.clone(), get("/rest/db/db/indexes")).await;
+    assert_eq!(indexes["indexes"], json!(["material"]));
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE material = 'stone'"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+}
+
+#[tokio::test]
+async fn rebuild_index_on_a_never_indexed_key_builds_it() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+
+    let (status, _) = send(
+        app.clone(),
+        post("/rest/db/db/query", query("REBUILD INDEX ON material")),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let (_, indexes) = send(app, get("/rest/db/db/indexes")).await;
+    assert_eq!(indexes["indexes"], json!(["material"]));
+}
+
+#[tokio::test]
+async fn a_read_only_user_cannot_rebuild_an_index_via_the_query_language() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        post("/rest/db/db/query", query("CREATE INDEX ON material")),
+    )
+    .await;
+
+    let rebuild = with_auth(
+        Request::builder()
+            .method("POST")
+            .uri("/rest/db/db/query")
+            .header("content-type", "application/json")
+            .body(Body::from(query("REBUILD INDEX ON material").to_string()))
+            .unwrap(),
+        TEST_READ_ONLY_USER,
+        TEST_READ_ONLY_PASSWORD,
+    );
+    let (status, _) = send(app, rebuild).await;
     assert_eq!(status, StatusCode::FORBIDDEN);
 }
 

@@ -11,13 +11,16 @@ doc comment. It's the same grammar regardless of how you send it: `POST
 its semantics; each transport's own doc covers how to actually send it and
 what the response looks like on the wire.
 
-Four statement kinds:
+Seven statement kinds:
 
 ```text
 SELECT <columns> [FROM <range>] [WHERE <criteria>]
 SET (<key>=<value>, ...) [WHERE <criteria>] IN <range>
 UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
 DELETE [WHERE <criteria>] [IN <range>]
+CREATE INDEX ON <key>
+DROP INDEX ON <key>
+REBUILD INDEX ON <key>
 ```
 
 - `<columns>` is `*`, a comma-separated key list (`material, density`), or
@@ -135,12 +138,13 @@ exactly like `UPDATE` in practice -- the two only diverge with no `WHERE`
 at all, or one that only compares axis coordinates (`x<N>`), where `SET`
 can genuinely bring new cells into existence.
 
-`SELECT` is a read; `SET`/`UPDATE`/`DELETE` are writes. Every transport
-exposes all four behind one call (`POST /rest/db/{db}/query` over REST,
-`Query` over the binary protocol) rather than one per statement kind, so
-`read_only` is decided by which kind of statement was actually sent,
-checked after parsing and before touching anything -- not by HTTP method
-or opcode the way every other operation's read/write split works.
+`SELECT` is a read; `SET`/`UPDATE`/`DELETE`/`CREATE INDEX`/`DROP INDEX`/
+`REBUILD INDEX` are writes. Every transport exposes all seven behind one
+call (`POST /rest/db/{db}/query` over REST, `Query` over the binary
+protocol) rather than one per statement kind, so `read_only` is decided by
+which kind of statement was actually sent, checked after parsing and
+before touching anything -- not by HTTP method or opcode the way every
+other operation's read/write split works.
 
 ```text
 SELECT material, density WHERE x0 >= 10 AND x0 < 20 AND material = 'stone'
@@ -187,4 +191,41 @@ between the scan and the write -- a real (if narrow) race, same honest
 trade-off `list_cells`'s own doc comment already makes for reads. Fine for
 the occasional bulk edit; not meant for a database with millions of
 populated cells or for these write statements racing each other at high
-frequency.
+frequency -- unless the key a `WHERE` filters on has a secondary index
+(see "Indexes" below), in which case `SELECT`/`UPDATE`/`DELETE` skip
+`list_cells` and look the matching coordinates up directly.
+
+**Indexes.** `CREATE INDEX ON <key>` builds a secondary equality index on
+`key` (see [kblockdblib's design notes](kblockdblib.md) and
+`kblockdblib::World::create_index`): an in-memory map from `key`'s value to
+every coordinate currently holding it, kept up to date by every later
+write to `key`. `DROP INDEX ON <key>` discards it. `REBUILD INDEX ON <key>`
+discards whatever's there (if anything) and builds a fresh one from
+scratch -- the recovery lever if an index is ever suspected to have gone
+stale, though it shouldn't: every write path keeps it in sync. All three
+are schema-level operations on the whole column -- `IN <range>`/`WHERE`
+aren't meaningful here and aren't accepted. `CREATE INDEX` is idempotent
+(building an already-indexed key's index again is a no-op); `REBUILD
+INDEX` is not -- it always rebuilds, indexed or not. `CREATE INDEX`/
+`REBUILD INDEX` on a key that's never been written are both no-ops (there's
+no type to fix an index to yet) rather than an error -- they simply do
+nothing until something sets that key. `DROP INDEX` on a key with no index
+is an error (404 over REST).
+
+```text
+CREATE INDEX ON material
+DROP INDEX ON material
+REBUILD INDEX ON material
+```
+
+Once an index exists, no further query syntax is needed to benefit from
+it: `SELECT`/`UPDATE`/`DELETE ... WHERE material = 'stone'` automatically
+resolves `material`'s matching coordinates from the index instead of
+scanning every chunk, then still re-checks the full `WHERE` clause against
+each candidate (so an `AND`ed, `OR`ed, or otherwise more complex clause
+stays correct, not just fast). Only `=`/`!=`-style equality against an
+indexed key is ever served directly from it; a `<`/`<=`/`>`/`>=`
+comparison, `EXISTS`, `OR`, or `NOT` still falls back to scanning. `SET`'s
+`WHERE` path doesn't use an index at all: it needs every candidate
+*coordinate* in its range, including ones with no cell yet, which a value
+index can't help with.

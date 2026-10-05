@@ -547,6 +547,25 @@ impl Chunk {
         out
     }
 
+    /// Every `(key_id, value, meta)` set at a single cell -- `local_idx`
+    /// restricted out of `entries_by_local_idx`, for a caller that already
+    /// knows exactly which cell it wants (e.g. `World::cell_entry_at`,
+    /// serving a secondary-index lookup) and so has no reason to decode
+    /// every other cell in the chunk. Cost is proportional to this chunk's
+    /// column count, not its cell count.
+    pub fn entries_at(&self, local_idx: usize) -> Vec<(u32, Value, CellMeta)> {
+        self.columns
+            .iter()
+            .filter_map(|(&key_id, col)| {
+                if !col.presence.get(local_idx) {
+                    return None;
+                }
+                let rank = col.presence.rank(local_idx);
+                Some((key_id, col.value_at(rank), col.meta[rank]))
+            })
+            .collect()
+    }
+
     // --- Binary format (CHUNK_FORMAT 2) ---
     //
     //   [4 bytes CHUNK_MAGIC][u8 format = 2]
@@ -1197,6 +1216,47 @@ mod tests {
                 }
             )]
         );
+    }
+
+    #[test]
+    fn entries_at_matches_entries_by_local_idx_for_one_cell() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::Str("stone".into()), 1000);
+        c.set(0, 2, Value::I64(7), 2000);
+        c.set(5, 1, Value::Str("air".into()), 3000);
+
+        let mut at_0 = c.entries_at(0);
+        at_0.sort_by_key(|(key_id, ..)| *key_id);
+        assert_eq!(
+            at_0,
+            vec![
+                (
+                    1,
+                    Value::Str("stone".into()),
+                    CellMeta {
+                        created_at_ms: 1000,
+                        modified_at_ms: 1000,
+                        version: 0,
+                    }
+                ),
+                (
+                    2,
+                    Value::I64(7),
+                    CellMeta {
+                        created_at_ms: 2000,
+                        modified_at_ms: 2000,
+                        version: 0,
+                    }
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn entries_at_is_empty_for_an_unset_cell() {
+        let mut c = Chunk::new(CELLS);
+        c.set(0, 1, Value::I64(1), 1000);
+        assert!(c.entries_at(1).is_empty());
     }
 
     #[test]

@@ -6,7 +6,22 @@
 //! SET (<key>=<value>, ...) [WHERE <criteria>] IN <range>
 //! UPDATE (<key>=<value>, ...) [WHERE <criteria>] [IN <range>]
 //! DELETE [WHERE <criteria>] [IN <range>]
+//! CREATE INDEX ON <key>
+//! DROP INDEX ON <key>
+//! REBUILD INDEX ON <key>
 //! ```
+//!
+//! `CREATE INDEX ON <key>`/`DROP INDEX ON <key>`/`REBUILD INDEX ON <key>`
+//! build, discard, or force-rebuild a secondary equality index on `key`
+//! (see `kblockdblib::World::create_index`/`drop_index`/`rebuild_index`)
+//! -- a schema-level operation on the whole column, not scoped to a range
+//! or `WHERE` the way every other statement here is. `CREATE INDEX` is a
+//! no-op if `key` is already indexed; `REBUILD INDEX` always discards
+//! whatever's there and backfills from scratch, for a caller that
+//! suspects it's gone stale. Once built, `kblockdbserver`'s query handler
+//! uses it automatically to speed up a later `SELECT`/`UPDATE`/`DELETE
+//! ... WHERE <key> = <literal>` -- no further query syntax is needed to
+//! benefit from it.
 //!
 //! `<columns>` is `*` or a comma-separated key list. `<range>` is
 //! `(o0,o1,...) TO (e0,e1,...)`, inclusive of `o`/exclusive of `e` on every
@@ -54,7 +69,7 @@
 //! `remove` calls the parsed statement implies, and every REST/binary-
 //! protocol wire format that carries query text in and results back out.
 
-use kblockdblib::{CellEntry, Value};
+use kblockdblib::{CellEntry, Coord, Value};
 use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser as PestParser;
@@ -255,16 +270,34 @@ pub enum Statement {
         where_clause: Option<Expr>,
         range: Option<Range>,
     },
+    /// `CREATE INDEX ON <key>`: builds a secondary equality index on `key`
+    /// (see `kblockdblib::World::create_index`) -- a schema-level operation
+    /// on the whole column, not scoped to a range or `WHERE`. Idempotent:
+    /// building an already-indexed key's index again is a no-op.
+    CreateIndex { key: String },
+    /// `DROP INDEX ON <key>`: stops maintaining `key`'s secondary index and
+    /// discards it (see `kblockdblib::World::drop_index`).
+    DropIndex { key: String },
+    /// `REBUILD INDEX ON <key>`: drops `key`'s secondary index (if it has
+    /// one) and builds a fresh one from scratch (see
+    /// `kblockdblib::World::rebuild_index`) -- unlike `CreateIndex`, this
+    /// always rebuilds even if `key` is already indexed.
+    RebuildIndex { key: String },
 }
 
 impl Statement {
-    /// `SET`/`UPDATE`/`DELETE` are writes; `SELECT` is a read. See this
-    /// crate's doc comment on why this -- not HTTP method -- is what
-    /// gates a `read_only` account here.
+    /// `SET`/`UPDATE`/`DELETE`/`CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX`
+    /// are writes; `SELECT` is a read. See this crate's doc comment on why
+    /// this -- not HTTP method -- is what gates a `read_only` account here.
     pub fn is_write(&self) -> bool {
         matches!(
             self,
-            Statement::Set { .. } | Statement::Update { .. } | Statement::Delete { .. }
+            Statement::Set { .. }
+                | Statement::Update { .. }
+                | Statement::Delete { .. }
+                | Statement::CreateIndex { .. }
+                | Statement::DropIndex { .. }
+                | Statement::RebuildIndex { .. }
         )
     }
 }
@@ -294,9 +327,13 @@ pub fn parse(input: &str) -> Result<Statement, ParseError> {
         Rule::set_stmt => build_set(inner),
         Rule::update_stmt => build_update(inner),
         Rule::delete_stmt => build_delete(inner),
-        other => {
-            unreachable!("statement can only contain select/set/update/delete_stmt, got {other:?}")
-        }
+        Rule::create_index_stmt => Ok(build_create_index(inner)),
+        Rule::drop_index_stmt => Ok(build_drop_index(inner)),
+        Rule::rebuild_index_stmt => Ok(build_rebuild_index(inner)),
+        other => unreachable!(
+            "statement can only contain select/set/update/delete/create_index/drop_index/\
+             rebuild_index_stmt, got {other:?}"
+        ),
     }
 }
 
@@ -318,6 +355,11 @@ fn is_keyword(pair: &Pair<Rule>) -> bool {
             | Rule::kw_and
             | Rule::kw_or
             | Rule::kw_not
+            | Rule::kw_create
+            | Rule::kw_drop
+            | Rule::kw_rebuild
+            | Rule::kw_index
+            | Rule::kw_on
     )
 }
 
@@ -406,6 +448,38 @@ fn build_delete(pair: Pair<Rule>) -> Result<Statement, ParseError> {
         where_clause,
         range,
     })
+}
+
+fn build_create_index(pair: Pair<Rule>) -> Statement {
+    Statement::CreateIndex {
+        key: create_or_drop_index_key(pair),
+    }
+}
+
+fn build_drop_index(pair: Pair<Rule>) -> Statement {
+    Statement::DropIndex {
+        key: create_or_drop_index_key(pair),
+    }
+}
+
+fn build_rebuild_index(pair: Pair<Rule>) -> Statement {
+    Statement::RebuildIndex {
+        key: create_or_drop_index_key(pair),
+    }
+}
+
+/// `create_index_stmt`/`drop_index_stmt`/`rebuild_index_stmt` are all just
+/// their keywords followed by one `ident` -- this is that `ident`'s text,
+/// shared by all three builders.
+fn create_or_drop_index_key(pair: Pair<Rule>) -> String {
+    pair.into_inner()
+        .find(|p| !is_keyword(p))
+        .expect(
+            "create_index_stmt/drop_index_stmt/rebuild_index_stmt always has an ident besides \
+             their keywords",
+        )
+        .as_str()
+        .to_string()
 }
 
 fn build_columns(pair: Pair<Rule>) -> Columns {
@@ -670,6 +744,58 @@ fn now_ms() -> i64 {
 // Pure functions over an in-memory `CellEntry` -- no I/O, no `World`. See
 // this crate's doc comment for why `kblockdbserver` owns everything that
 // actually touches disk.
+
+/// Tries to narrow `expr` down to a concrete set of candidate coordinates
+/// using `lookup_eq` -- a caller-supplied stand-in for
+/// `kblockdblib::World::lookup_eq`, which answers "every coordinate
+/// currently holding this value under this key" for a key that has a
+/// secondary index built (`World::create_index`), or `None` if it doesn't.
+///
+/// Returns `None` if `expr` can't be narrowed at all -- no equality
+/// comparison against an indexed key anywhere at its top level -- in which
+/// case the caller should fall back to its usual full `list_cells` scan
+/// filtered by `matches`/`eval`, exactly as if this function didn't exist.
+///
+/// A `Some` result is a **superset** of the final answer whenever `expr`
+/// contains anything this function can't itself evaluate -- `Or`, `Not`,
+/// `Exists`, a non-`Eq` comparison, or an equality against a key with no
+/// index. The caller must always re-check every returned coordinate against
+/// the full `expr` (e.g. via `eval` on that coordinate's real `CellEntry`)
+/// before treating it as a genuine match; this function only ever narrows
+/// the search, never decides it.
+///
+/// Only `And` is descended into for narrowing (`Or` can't be narrowed this
+/// way: a coordinate satisfying *either* side might not appear in either
+/// side's own candidate set once one side isn't itself indexed, so there's
+/// no sound way to combine them short of unioning two full scans -- no
+/// better than not narrowing at all). Within an `And`, each side that *can*
+/// be narrowed contributes a candidate set, and the two are intersected;
+/// a side that can't still leaves the other's candidates valid, since
+/// `And` only needs *a* superset of cells satisfying every term, and the
+/// un-narrowed side's own filtering happens later via `eval`.
+pub fn candidate_coords(
+    expr: &Expr,
+    lookup_eq: &dyn Fn(&str, &Value) -> Option<Vec<Coord>>,
+) -> Option<Vec<Coord>> {
+    match expr {
+        Expr::Compare(Operand::Key(name), CompareOp::Eq, literal) => {
+            lookup_eq(name, &literal.to_value())
+        }
+        Expr::And(a, b) => match (candidate_coords(a, lookup_eq), candidate_coords(b, lookup_eq)) {
+            (Some(left), Some(right)) => {
+                let right: std::collections::HashSet<Coord> = right.into_iter().collect();
+                Some(left.into_iter().filter(|c| right.contains(c)).collect())
+            }
+            (Some(one), None) | (None, Some(one)) => Some(one),
+            (None, None) => None,
+        },
+        // `Or`/`Not`/`Exists`/a non-`Eq` comparison/an axis or metadata
+        // comparison: none of these can be served by an equality index --
+        // see this function's doc comment on why `Or` in particular isn't
+        // just "union both sides".
+        _ => None,
+    }
+}
 
 /// Whether `cell` falls inside `range` (or `range` is `None`, matching
 /// everything) *and* satisfies `where_clause` (or it's `None`, same).
@@ -1154,6 +1280,131 @@ mod tests {
     #[test]
     fn select_is_not_a_write() {
         assert!(!parse("SELECT *").unwrap().is_write());
+    }
+
+    // --- Parsing: CREATE INDEX / DROP INDEX / REBUILD INDEX ---
+
+    #[test]
+    fn parses_create_index() {
+        let stmt = parse("CREATE INDEX ON material").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::CreateIndex {
+                key: "material".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_drop_index() {
+        let stmt = parse("DROP INDEX ON material").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::DropIndex {
+                key: "material".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_rebuild_index() {
+        let stmt = parse("REBUILD INDEX ON material").unwrap();
+        assert_eq!(
+            stmt,
+            Statement::RebuildIndex {
+                key: "material".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn create_drop_and_rebuild_index_keywords_are_case_insensitive() {
+        assert!(parse("create index on material").is_ok());
+        assert!(parse("Create Index On material").is_ok());
+        assert!(parse("drop index on material").is_ok());
+        assert!(parse("Drop Index On material").is_ok());
+        assert!(parse("rebuild index on material").is_ok());
+        assert!(parse("Rebuild Index On material").is_ok());
+    }
+
+    #[test]
+    fn rebuild_index_without_a_key_is_rejected() {
+        assert!(parse("REBUILD INDEX ON").is_err());
+        assert!(parse("REBUILD INDEX").is_err());
+        assert!(parse("REBUILD ON material").is_err());
+    }
+
+    #[test]
+    fn rebuild_index_is_a_write() {
+        assert!(parse("REBUILD INDEX ON material").unwrap().is_write());
+    }
+
+    #[test]
+    fn a_key_named_like_the_rebuild_keyword_still_works_as_an_ordinary_identifier() {
+        let stmt = parse("SELECT * WHERE rebuildflag = true").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::Compare(
+                Operand::Key("rebuildflag".to_string()),
+                CompareOp::Eq,
+                Literal::Bool(true)
+            )
+        );
+    }
+
+    #[test]
+    fn create_and_drop_index_are_writes() {
+        assert!(parse("CREATE INDEX ON material").unwrap().is_write());
+        assert!(parse("DROP INDEX ON material").unwrap().is_write());
+    }
+
+    #[test]
+    fn create_index_without_a_key_is_rejected() {
+        assert!(parse("CREATE INDEX ON").is_err());
+        assert!(parse("CREATE INDEX").is_err());
+        assert!(parse("CREATE ON material").is_err());
+    }
+
+    #[test]
+    fn drop_index_without_a_key_is_rejected() {
+        assert!(parse("DROP INDEX ON").is_err());
+        assert!(parse("DROP INDEX").is_err());
+    }
+
+    #[test]
+    fn a_key_named_like_the_create_or_drop_keyword_still_works_as_an_ordinary_identifier() {
+        // Same word-boundary guarantee every other keyword here has (see
+        // query.pest's kw_* doc comment).
+        let stmt = parse("SELECT * WHERE createflag = true AND dropflag = false").unwrap();
+        let Statement::Select {
+            where_clause: Some(expr),
+            ..
+        } = stmt
+        else {
+            panic!("expected a WHERE clause");
+        };
+        assert_eq!(
+            expr,
+            Expr::And(
+                Box::new(Expr::Compare(
+                    Operand::Key("createflag".to_string()),
+                    CompareOp::Eq,
+                    Literal::Bool(true)
+                )),
+                Box::new(Expr::Compare(
+                    Operand::Key("dropflag".to_string()),
+                    CompareOp::Eq,
+                    Literal::Bool(false)
+                )),
+            )
+        );
     }
 
     // --- Parsing: operator precedence, grouping, errors ---
@@ -1915,6 +2166,120 @@ mod tests {
             &parse_expr("EXISTS(density) OR material = 'stone'"),
             &without_density
         ));
+    }
+
+    // --- candidate_coords ---
+
+    /// A `lookup_eq` stand-in: `key` is "indexed" iff it's a key of `index`,
+    /// in which case it reports exactly the coordinates `index` says hold
+    /// `value` for that key (by `Value`'s `Debug` text, since `Value` isn't
+    /// `Hash`/`Eq`) -- good enough for these pure, in-memory tests, which
+    /// never touch a real `kblockdblib::World`.
+    fn fake_index<'a>(
+        index: &'a [(&'a str, Vec<(Value, Vec<Coord>)>)],
+    ) -> impl Fn(&str, &Value) -> Option<Vec<Coord>> + 'a {
+        move |key, value| {
+            let (_, entries) = index.iter().find(|(k, _)| *k == key)?;
+            Some(
+                entries
+                    .iter()
+                    .find(|(v, _)| format!("{v:?}") == format!("{value:?}"))
+                    .map(|(_, coords)| coords.clone())
+                    .unwrap_or_default(),
+            )
+        }
+    }
+
+    #[test]
+    fn candidate_coords_is_none_without_any_indexed_equality() {
+        let lookup = fake_index(&[]);
+        assert_eq!(candidate_coords(&parse_expr("x0 = 1"), &lookup), None);
+        assert_eq!(
+            candidate_coords(&parse_expr("material = 'stone'"), &lookup),
+            None
+        );
+        assert_eq!(
+            candidate_coords(&parse_expr("EXISTS(material)"), &lookup),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_coords_returns_an_indexed_equalitys_coordinates() {
+        let index = [(
+            "material",
+            vec![(
+                Value::Str("stone".into()),
+                vec![Coord::from([0, 0, 0]), Coord::from([1, 0, 0])],
+            )],
+        )];
+        let lookup = fake_index(&index);
+        let mut got = candidate_coords(&parse_expr("material = 'stone'"), &lookup).unwrap();
+        got.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(got, vec![Coord::from([0, 0, 0]), Coord::from([1, 0, 0])]);
+    }
+
+    #[test]
+    fn candidate_coords_of_an_indexed_key_with_no_match_is_an_empty_some() {
+        let index = [("material", vec![])];
+        let lookup = fake_index(&index);
+        assert_eq!(
+            candidate_coords(&parse_expr("material = 'stone'"), &lookup),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn candidate_coords_intersects_both_sides_of_an_and_when_both_are_indexed() {
+        let index = [
+            (
+                "material",
+                vec![(
+                    Value::Str("stone".into()),
+                    vec![
+                        Coord::from([0, 0, 0]),
+                        Coord::from([1, 0, 0]),
+                        Coord::from([2, 0, 0]),
+                    ],
+                )],
+            ),
+            (
+                "hardness",
+                vec![(Value::I64(7), vec![Coord::from([1, 0, 0]), Coord::from([3, 0, 0])])],
+            ),
+        ];
+        let lookup = fake_index(&index);
+        let got =
+            candidate_coords(&parse_expr("material = 'stone' AND hardness = 7"), &lookup).unwrap();
+        assert_eq!(got, vec![Coord::from([1, 0, 0])]);
+    }
+
+    #[test]
+    fn candidate_coords_of_an_and_falls_back_to_the_side_that_is_indexed() {
+        let index = [(
+            "material",
+            vec![(Value::Str("stone".into()), vec![Coord::from([0, 0, 0])])],
+        )];
+        let lookup = fake_index(&index);
+        // `hardness` isn't indexed, but `material` is -- the AND should
+        // still narrow to material's candidates; the caller is on its own
+        // to re-check `hardness > 5` afterward via `eval`.
+        let got =
+            candidate_coords(&parse_expr("material = 'stone' AND hardness > 5"), &lookup).unwrap();
+        assert_eq!(got, vec![Coord::from([0, 0, 0])]);
+    }
+
+    #[test]
+    fn candidate_coords_of_an_or_is_always_none() {
+        let index = [(
+            "material",
+            vec![(Value::Str("stone".into()), vec![Coord::from([0, 0, 0])])],
+        )];
+        let lookup = fake_index(&index);
+        assert_eq!(
+            candidate_coords(&parse_expr("material = 'stone' OR x0 = 99"), &lookup),
+            None
+        );
     }
 
     /// Test-only helper: parses `SELECT * WHERE <src>` and returns just the

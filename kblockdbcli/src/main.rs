@@ -604,8 +604,11 @@ fn run_query(client: &reqwest::blocking::Client, args: &Args, query: &str) -> Re
 
 /// Renders a `/rest/query` response (kblockdbserver's `QueryResponse`),
 /// which is shaped one way for a plain `SELECT` (`rows`), another for a
-/// `SELECT count(*)`/`sum(...)`/... (`aggregates`), and a third for
-/// `SET`/`UPDATE`/`DELETE` (`affected_cells`).
+/// `SELECT count(*)`/`sum(...)`/... (`aggregates`), a third for
+/// `SET`/`UPDATE`/`DELETE` (`affected_cells`), and an empty object `{}` for
+/// `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX` (none of `rows`/
+/// `aggregates`/`affected_cells` apply to a schema-level operation on a
+/// whole column rather than a set of cells).
 fn print_query_response(body: &Json) -> Result<(), String> {
     if let Some(rows) = body.get("rows").and_then(Json::as_array) {
         for row in rows {
@@ -620,6 +623,9 @@ fn print_query_response(body: &Json) -> Result<(), String> {
         Ok(())
     } else if let Some(affected) = body.get("affected_cells").and_then(Json::as_u64) {
         println!("{affected} cell(s) affected");
+        Ok(())
+    } else if body.as_object().is_some_and(|o| o.is_empty()) {
+        println!("ok");
         Ok(())
     } else {
         Err("unrecognized query response shape".to_string())
@@ -904,8 +910,17 @@ mod unit_tests {
     }
 
     #[test]
+    fn print_query_response_accepts_an_index_shape() {
+        // CREATE INDEX/DROP INDEX/REBUILD INDEX return an empty object --
+        // none of rows/aggregates/affected_cells apply to a schema-level
+        // operation on a whole column.
+        let body = json!({});
+        assert!(print_query_response(&body).is_ok());
+    }
+
+    #[test]
     fn print_query_response_rejects_an_unrecognized_shape() {
-        assert!(print_query_response(&json!({})).is_err());
+        assert!(print_query_response(&json!({"something_else": 1})).is_err());
     }
 
     #[test]

@@ -89,6 +89,11 @@ pub fn router(state: AppState) -> Router {
             "/db/{db}/columns/{key}",
             put(add_column).delete(remove_column),
         )
+        .route("/db/{db}/indexes", get(list_indexes))
+        .route(
+            "/db/{db}/indexes/{key}",
+            put(create_index).delete(remove_index),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), require_auth));
 
     // Not under `protected` -- see this module's doc comment on why
@@ -596,6 +601,92 @@ async fn remove_column(
     }
 }
 
+/// Every key with a secondary equality index built on it (see
+/// `kblockdblib::World::create_index`), sorted.
+#[derive(Serialize, ToSchema)]
+pub struct IndexesResponse {
+    indexes: Vec<String>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/rest/db/{db}/indexes",
+    tag = "indexes",
+    params(
+        ("db" = String, Path, description = "The database to read"),
+    ),
+    responses(
+        (status = 200, description = "Every key with a secondary index built on it", body = IndexesResponse),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn list_indexes(
+    State(state): State<AppState>,
+    Path(db): Path<String>,
+) -> Result<Json<IndexesResponse>, ApiError> {
+    let indexes = state.with_database(&db, |w| Ok(w.indexed_keys())).await?;
+    Ok(Json(IndexesResponse { indexes }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/rest/db/{db}/indexes/{key}",
+    tag = "indexes",
+    params(
+        ("db" = String, Path, description = "The database to write"),
+        ("key" = String, Path, description = "The column/key to build a secondary index on"),
+    ),
+    responses(
+        (status = 204, description = "The index now exists (freshly built, or already did)"),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn create_index(
+    State(state): State<AppState>,
+    Path((db, key)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .with_database(&db, move |w| w.create_index(&key))
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[utoipa::path(
+    delete,
+    path = "/rest/db/{db}/indexes/{key}",
+    tag = "indexes",
+    params(
+        ("db" = String, Path, description = "The database to write"),
+        ("key" = String, Path, description = "The indexed column/key to stop indexing"),
+    ),
+    responses(
+        (status = 204, description = "The index was dropped"),
+        (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
+        (status = 403, description = "This account is read-only", body = ErrorBody),
+        (status = 404, description = "No such database, or no index on this key", body = ErrorBody),
+    ),
+    security(("basic_auth" = [])),
+)]
+async fn remove_index(
+    State(state): State<AppState>,
+    Path((db, key)): Path<(String, String)>,
+) -> Result<StatusCode, ApiError> {
+    let lookup_key = key.clone();
+    let dropped = state
+        .with_database(&db, move |w| Ok(w.drop_index(&lookup_key)))
+        .await?;
+    if dropped {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::NotFound(format!("no index on key '{key}'")))
+    }
+}
+
 #[derive(Serialize, ToSchema)]
 pub struct CellResponse {
     value: ValueJson,
@@ -993,6 +1084,18 @@ impl QueryResponse {
             affected_cells: Some(n),
         }
     }
+
+    /// `CREATE INDEX`/`DROP INDEX`: an empty success body (`{}`) -- neither
+    /// statement produces rows, aggregates, or an affected-cell count (an
+    /// index is a schema-level thing, not a per-cell one).
+    fn ok() -> Self {
+        QueryResponse {
+            total_rows: None,
+            rows: None,
+            aggregates: None,
+            affected_cells: None,
+        }
+    }
 }
 
 #[utoipa::path(
@@ -1004,11 +1107,11 @@ impl QueryResponse {
     ),
     request_body = QueryRequest,
     responses(
-        (status = 200, description = "SELECT: the matching rows. SET/UPDATE/DELETE: how many cells were affected", body = QueryResponse),
+        (status = 200, description = "SELECT: the matching rows. SET/UPDATE/DELETE: how many cells were affected. CREATE INDEX/DROP INDEX/REBUILD INDEX: an empty body", body = QueryResponse),
         (status = 400, description = "Malformed query, or a range whose axis count doesn't match the database's", body = ErrorBody),
         (status = 401, description = "Missing or invalid credentials", body = ErrorBody),
-        (status = 403, description = "A read-only account attempted a SET, UPDATE, or DELETE", body = ErrorBody),
-        (status = 404, description = "No such database", body = ErrorBody),
+        (status = 403, description = "A read-only account attempted a SET, UPDATE, DELETE, CREATE INDEX, DROP INDEX, or REBUILD INDEX", body = ErrorBody),
+        (status = 404, description = "No such database, or (for DROP INDEX) no index on the given key", body = ErrorBody),
     ),
     security(("basic_auth" = [])),
 )]
@@ -1025,6 +1128,54 @@ async fn run_query(
         Ok(resp) => Json(resp).into_response(),
         Err(e) => e.into_response(),
     }
+}
+
+/// Every cell matching `range`/`where_clause`, preferring a secondary
+/// index over a full `list_cells` scan whenever `where_clause` makes that
+/// possible -- used by `SELECT`/`UPDATE`/`DELETE` (not `SET`'s `WHERE`
+/// path, which needs every candidate *coordinate* in its range, including
+/// ones with no cell yet, so an index over existing values can't help it
+/// the same way).
+///
+/// Tries `query::candidate_coords` first: if `where_clause` narrows down
+/// to a concrete coordinate set (every key compared with `=` at the
+/// expression's top level has an index -- see `kblockdblib::World::
+/// create_index`), this reads just those cells (`World::cell_entry_at`)
+/// instead of decoding the whole world. `candidate_coords` only ever
+/// returns a *superset* when part of `where_clause` couldn't be narrowed
+/// (an `OR`, a `<`/`>` comparison, `EXISTS`, ...), so every candidate is
+/// still re-checked against the full `range`/`where_clause` via
+/// `query::matches` before it's reported as a real match -- same final
+/// result as the full-scan path, just reached without decoding cells that
+/// could never have matched anyway.
+///
+/// Falls back to the full `World::list_cells` scan, filtered the same way,
+/// whenever `where_clause` is `None` or doesn't narrow at all.
+fn matching_cells(
+    world: &kblockdblib::World,
+    range: Option<&query::Range>,
+    where_clause: Option<&query::Expr>,
+) -> std::io::Result<Vec<kblockdblib::CellEntry>> {
+    if let Some(expr) = where_clause {
+        if let Some(coords) =
+            query::candidate_coords(expr, &|key, value| world.lookup_eq(key, value))
+        {
+            let mut cells = Vec::with_capacity(coords.len());
+            for coord in &coords {
+                if let Some(cell) = world.cell_entry_at(coord)? {
+                    if query::matches(range, Some(expr), &cell) {
+                        cells.push(cell);
+                    }
+                }
+            }
+            return Ok(cells);
+        }
+    }
+    Ok(world
+        .list_cells()?
+        .into_iter()
+        .filter(|c| query::matches(range, where_clause, c))
+        .collect())
 }
 
 pub(crate) async fn execute_query(
@@ -1051,18 +1202,19 @@ pub(crate) async fn execute_query(
             where_clause,
         } => {
             let cells = state
-                .with_database(db, kblockdblib::World::list_cells)
+                .with_database(db, move |w| {
+                    matching_cells(w, range.as_ref(), where_clause.as_ref())
+                })
                 .await?;
-            let matching: Vec<&kblockdblib::CellEntry> = cells
-                .iter()
-                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
-                .collect();
             match &columns {
-                query::Columns::Aggregates(aggregates) => Ok(QueryResponse::aggregates(
-                    query::aggregate(aggregates, &matching),
-                )),
+                query::Columns::Aggregates(aggregates) => {
+                    let refs: Vec<&kblockdblib::CellEntry> = cells.iter().collect();
+                    Ok(QueryResponse::aggregates(query::aggregate(
+                        aggregates, &refs,
+                    )))
+                }
                 _ => {
-                    let rows = matching.iter().map(|c| project_row(&columns, c)).collect();
+                    let rows = cells.iter().map(|c| project_row(&columns, c)).collect();
                     Ok(QueryResponse::rows(rows))
                 }
             }
@@ -1077,20 +1229,19 @@ pub(crate) async fn execute_query(
             where_clause,
             range,
         } => {
-            let cells = state
-                .with_database(db, kblockdblib::World::list_cells)
-                .await?;
-            // Snapshotted here, then mutated in a second `with_database`
-            // call below -- not atomic with respect to a concurrent writer
-            // touching the same cells in between (a classic find-then-
-            // mutate race), same honest caveat as any bulk operation built
-            // on a point-in-time `list_cells` scan rather than a
+            // Snapshotted here (via `matching_cells`, index-assisted when
+            // possible -- see its doc comment), then mutated in a second
+            // `with_database` call below -- not atomic with respect to a
+            // concurrent writer touching the same cells in between (a
+            // classic find-then-mutate race), same honest caveat as any
+            // bulk operation built on a point-in-time scan rather than a
             // world-wide lock.
-            let matching: Vec<Vec<i32>> = cells
-                .iter()
-                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
-                .map(|c| c.coord.to_vec())
-                .collect();
+            let cells = state
+                .with_database(db, move |w| {
+                    matching_cells(w, range.as_ref(), where_clause.as_ref())
+                })
+                .await?;
+            let matching: Vec<Vec<i32>> = cells.iter().map(|c| c.coord.to_vec()).collect();
             let affected = matching.len();
             let stamper = Stamper::new(&state.replication);
             let written = set_each(state, db, matching, assignments, &stamper).await?;
@@ -1104,11 +1255,12 @@ pub(crate) async fn execute_query(
             range,
         } => {
             let cells = state
-                .with_database(db, kblockdblib::World::list_cells)
+                .with_database(db, move |w| {
+                    matching_cells(w, range.as_ref(), where_clause.as_ref())
+                })
                 .await?;
             let matching: Vec<(Vec<i32>, Vec<String>)> = cells
                 .iter()
-                .filter(|c| query::matches(range.as_ref(), where_clause.as_ref(), c))
                 .map(|c| {
                     (
                         c.coord.to_vec(),
@@ -1138,6 +1290,27 @@ pub(crate) async fn execute_query(
                 stamper.publish_remove(db, coord, key, *at, *stamp);
             }
             Ok(QueryResponse::affected(affected))
+        }
+        query::Statement::CreateIndex { key } => {
+            state.with_database(db, move |w| w.create_index(&key)).await?;
+            Ok(QueryResponse::ok())
+        }
+        query::Statement::DropIndex { key } => {
+            let lookup_key = key.clone();
+            let dropped = state
+                .with_database(db, move |w| Ok(w.drop_index(&lookup_key)))
+                .await?;
+            if dropped {
+                Ok(QueryResponse::ok())
+            } else {
+                Err(ApiError::NotFound(format!("no index on key '{key}'")))
+            }
+        }
+        query::Statement::RebuildIndex { key } => {
+            state
+                .with_database(db, move |w| w.rebuild_index(&key))
+                .await?;
+            Ok(QueryResponse::ok())
         }
     }
 }
@@ -1292,6 +1465,9 @@ fn check_range_axes(stmt: &query::Statement, axes: usize) -> Result<(), ApiError
         | query::Statement::Update { range, .. }
         | query::Statement::Delete { range, .. } => range.as_ref(),
         query::Statement::Set { range, .. } => Some(range),
+        query::Statement::CreateIndex { .. }
+        | query::Statement::DropIndex { .. }
+        | query::Statement::RebuildIndex { .. } => None,
     };
     match range {
         Some(r) if r.from.len() != axes => Err(ApiError::BadRequest(format!(

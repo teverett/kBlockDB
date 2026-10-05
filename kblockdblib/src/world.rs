@@ -1,6 +1,7 @@
 use crate::chunk::{self, CellMeta, ChangeKind, Chunk};
 use crate::chunk_cache::ChunkCache;
 pub use crate::coord::Coord;
+use crate::index::ValueIndex;
 use crate::params::WorldParams;
 use crate::schema::{ColumnInfo, Schema};
 use crate::semaphore::Semaphore;
@@ -394,6 +395,11 @@ pub struct World {
     /// Whether removals leave a tombstone, and for how long -- see
     /// `with_tombstone_retention`.
     tombstone_retention: Option<Duration>,
+    /// Secondary equality indexes, one per key opted in via `create_index`
+    /// -- see `World::create_index`/`lookup_eq` and `crate::index`. Empty
+    /// (no keys indexed, zero overhead on every write) until a caller asks
+    /// for one.
+    value_index: ValueIndex,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -495,6 +501,7 @@ impl World {
             chunk_cache: ChunkCache::new(DEFAULT_MAX_CACHED_CHUNKS),
             compression: false,
             tombstone_retention: None,
+            value_index: ValueIndex::new(),
         })
     }
 
@@ -738,11 +745,139 @@ impl World {
                 purged += 1;
             }
         }
+        self.value_index.drop_index(key_id);
         crate::logger::info(format!(
             "removed column '{key}' from {} ({purged} chunk(s) rewritten)",
             self.root.display()
         ));
         Ok(true)
+    }
+
+    /// Builds a secondary equality index on `key`: after this returns,
+    /// `lookup_eq(key, value)` answers "which cells have `key == value`" in
+    /// time proportional to the number of matches, instead of `list_cells`'s
+    /// full chunk-by-chunk decode of the whole world. Every `set`/
+    /// `set_region`/`remove`/`remove_region` (and their replicated/
+    /// stamped/batch counterparts) of `key` keeps the index up to date from
+    /// here on, at the cost of one hashmap update per write to `key` --
+    /// writes to every other key are unaffected.
+    ///
+    /// Equality only: there's no ordering here, so a `<`/`>` comparison on
+    /// `key` still needs a full scan even after this. Interns `key` if it
+    /// isn't already a column (an index on a key nothing has written yet is
+    /// legal, just trivially empty until something is).
+    ///
+    /// Idempotent: calling this again on an already-indexed key is a cheap
+    /// no-op, not a rebuild -- use `rebuild_index` if you suspect it's gone
+    /// stale (it shouldn't; every write path keeps it in sync).
+    ///
+    /// Cost: one `list_cells`-equivalent full-world scan, done once, here --
+    /// the same cost a single unindexed `WHERE key = ...` query would have
+    /// paid anyway, just paid up front instead of on every query.
+    pub fn create_index(&self, key: &str) -> io::Result<()> {
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            // Nothing has ever written this key: there's no type to fix
+            // yet, so there's nothing to scan either -- just register an
+            // empty index under a freshly reserved id isn't possible
+            // without a type, so instead this key simply isn't indexable
+            // until something sets it. Reported as success (an empty
+            // index is a legitimate, if currently moot, state) rather than
+            // an error that would surprise a caller indexing a key ahead of
+            // any data.
+            return Ok(());
+        };
+        if self.value_index.is_indexed(key_id) {
+            return Ok(());
+        }
+        self.build_index(key, key_id)
+    }
+
+    /// Drops `key`'s secondary index (if it has one) and builds a fresh one
+    /// from scratch, same cost as `create_index` -- a full `list_cells`-
+    /// equivalent scan. Unlike `create_index`, this always rebuilds even if
+    /// `key` is already indexed: for a caller that suspects it's gone
+    /// stale (it shouldn't -- every write path keeps it in sync, see
+    /// `create_index`'s doc comment -- but this is the recovery lever if
+    /// that invariant were ever violated, e.g. by a bug or a direct edit
+    /// to the data directory outside this `World`).
+    ///
+    /// A no-op, same as `create_index`, if `key` has never been written --
+    /// there's nothing to rebuild.
+    pub fn rebuild_index(&self, key: &str) -> io::Result<()> {
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return Ok(());
+        };
+        self.value_index.drop_index(key_id);
+        self.build_index(key, key_id)
+    }
+
+    /// Shared by `create_index`/`rebuild_index`: registers `key_id` as
+    /// indexed (starting empty) and backfills it from every cell
+    /// `list_cells` currently reports holding `key`.
+    fn build_index(&self, key: &str, key_id: u32) -> io::Result<()> {
+        self.value_index.create(key_id);
+        for cell in self.list_cells()? {
+            if let Some((_, value, _)) = cell.values.iter().find(|(k, ..)| k == key) {
+                self.value_index.record(key_id, &cell.coord, None, Some(value));
+            }
+        }
+        crate::logger::info(format!("(re)built index on key '{key}' at {}", self.root.display()));
+        Ok(())
+    }
+
+    /// Stops maintaining `key`'s secondary index and discards it. Returns
+    /// whether it was indexed. After this, `lookup_eq(key, ...)` falls back
+    /// to reporting "not indexed" (`None`) the same as a key that was never
+    /// indexed at all.
+    pub fn drop_index(&self, key: &str) -> bool {
+        let Some(key_id) = self.schema().id_for_key(key) else {
+            return false;
+        };
+        self.value_index.drop_index(key_id)
+    }
+
+    /// Every key currently indexed (see `create_index`), sorted.
+    pub fn indexed_keys(&self) -> Vec<String> {
+        let schema = self.schema();
+        let mut keys: Vec<String> = self
+            .value_index
+            .indexed_key_ids()
+            .into_iter()
+            .filter_map(|id| schema.key_for_id(id).map(str::to_string))
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Every coordinate currently holding `value` under `key`, using its
+    /// secondary index -- `None` if `key` isn't indexed (see
+    /// `create_index`), in which case the caller should fall back to a full
+    /// `list_cells` scan filtered in memory. `Some(vec![])` is a real
+    /// answer ("indexed, zero matches"), not "unknown".
+    ///
+    /// `value`'s own type doesn't have to match `key`'s column type exactly
+    /// -- an `I64`/`F64` mismatch is reconciled the same way `eval_compare`
+    /// (`kblockdbquery`) treats `WHERE key = <literal>` for a numeric
+    /// column, via `compare_f64`'s plain `==`: `5` matches a `F64` column
+    /// holding `5.0`, and `5.0` matches an `I64` column holding `5`, but
+    /// `5.5` can never match an `I64` column at all (reported here as
+    /// `Some(vec![])`, since that's a precise answer, not "unknown").
+    /// `Str`/`Bool` compared against the wrong type never match either --
+    /// same "doesn't apply, not an error" rule as `eval_compare`.
+    pub fn lookup_eq(&self, key: &str, value: &Value) -> Option<Vec<Coord>> {
+        let schema = self.schema();
+        let key_id = schema.id_for_key(key)?;
+        if !self.value_index.is_indexed(key_id) {
+            return None;
+        }
+        // `is_indexed` being true means `key` was a real column at some
+        // point (see `create_index`), so it always has a type here.
+        let column_type = schema.type_for_key(key)?;
+        drop(schema);
+        match normalize_value_for_type(value, column_type) {
+            Some(value) => self.value_index.lookup_eq(key_id, &value),
+            None => Some(Vec::new()),
+        }
     }
 
     /// Walks every chunk file on disk under `root` and totals their count,
@@ -817,6 +952,42 @@ impl World {
         }
         cells.sort_by(|a, b| a.coord.iter().cmp(b.coord.iter()));
         Ok(cells)
+    }
+
+    /// This single coordinate's full cell state (every key set there,
+    /// alongside its value and `CellMeta`) -- `list_cells` restricted to
+    /// one cell, for a caller that already knows exactly which coordinates
+    /// it wants (e.g. `lookup_eq`'s candidates) instead of discovering them
+    /// by scanning every chunk. `None` if nothing's set there.
+    ///
+    /// Cost is one chunk read (cached after the first touch, same as
+    /// `get`) plus decoding that one chunk's columns for this cell --
+    /// nowhere near a full `list_cells` walk, but still proportional to how
+    /// many distinct keys this chunk holds, not O(1) the way `get` is.
+    pub fn cell_entry_at(&self, coord: &[i32]) -> io::Result<Option<CellEntry>> {
+        let (ckey, local_idx) = self.split(coord)?;
+        let key_names: Vec<Option<String>> = {
+            let schema = self.schema();
+            (0..schema.id_space() as u32)
+                .map(|id| schema.key_for_id(id).map(str::to_string))
+                .collect()
+        };
+        let entries = self.with_chunk_read(&ckey, |chunk| chunk.entries_at(local_idx))?;
+        let mut values: Vec<(String, Value, CellMeta)> = entries
+            .into_iter()
+            .filter_map(|(key_id, value, meta)| {
+                let name = key_names.get(key_id as usize)?.clone()?;
+                Some((name, value, meta))
+            })
+            .collect();
+        if values.is_empty() {
+            return Ok(None);
+        }
+        values.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(Some(CellEntry {
+            coord: Coord::from(coord),
+            values,
+        }))
     }
 
     /// Every value and tombstone (see `with_tombstone_retention`) whose
@@ -1192,13 +1363,26 @@ impl World {
         // before touching any chunk, as a normal `InvalidInput` error.
         let key_id = self.schema().intern(key, value.value_type())?;
         let now_ms = now_ms();
-        self.with_chunk_write(&ckey, |chunk| {
+        // Only indexed keys pay for reading the old value back out of the
+        // chunk before overwriting it -- see `create_index`'s doc comment
+        // on the "zero overhead for unindexed keys" guarantee.
+        let indexed = self.value_index.is_indexed(key_id);
+        let new_value_for_index = indexed.then(|| value.clone());
+        let (result, old_value) = self.with_chunk_write(&ckey, |chunk| {
+            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
             let stamp = stamp();
-            (
-                chunk.set_stamped(local_idx, key_id, value, now_ms, stamp),
-                stamp,
-            )
-        })
+            let meta = chunk.set_stamped(local_idx, key_id, value, now_ms, stamp);
+            ((meta, stamp), old_value)
+        })?;
+        if indexed {
+            self.value_index.record(
+                key_id,
+                &Coord::from(coord),
+                old_value.as_ref(),
+                new_value_for_index.as_ref(),
+            );
+        }
+        Ok(result)
     }
 
     /// Applies a replicated write -- `value`/`meta` as reported by the
@@ -1241,10 +1425,22 @@ impl World {
     ) -> io::Result<bool> {
         let (ckey, local_idx) = self.split(coord)?;
         let key_id = self.schema().intern(key, value.value_type())?;
-        self.with_chunk_maybe_write(&ckey, |chunk| {
+        let indexed = self.value_index.is_indexed(key_id);
+        let new_value_for_index = indexed.then(|| value.clone());
+        let (wins, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
             let wins = apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp);
-            (wins, wins)
-        })
+            ((wins, old_value), wins)
+        })?;
+        if indexed && wins {
+            self.value_index.record(
+                key_id,
+                &Coord::from(coord),
+                old_value.as_ref(),
+                new_value_for_index.as_ref(),
+            );
+        }
+        Ok(wins)
     }
 
     /// `apply_replicated`'s counterpart for a replicated removal: applies
@@ -1278,8 +1474,10 @@ impl World {
         let Some(key_id) = self.schema().id_for_key(key) else {
             return Ok(false); // never interned anywhere: nothing to remove
         };
+        let indexed = self.value_index.is_indexed(key_id);
         let keep_tombstones = self.tombstone_retention.is_some();
-        self.with_chunk_maybe_write(&ckey, |chunk| {
+        let (wins, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
             let wins = apply_remove_if_newer(
                 chunk,
                 local_idx,
@@ -1288,8 +1486,13 @@ impl World {
                 stamp,
                 keep_tombstones,
             );
-            (wins, wins)
-        })
+            ((wins, old_value), wins)
+        })?;
+        if indexed && wins {
+            self.value_index
+                .record(key_id, &Coord::from(coord), old_value.as_ref(), None);
+        }
+        Ok(wins)
     }
 
     /// `apply_replicated`/`apply_replicated_remove` for a whole batch, in
@@ -1345,28 +1548,65 @@ impl World {
         for ckey in chunk_order {
             let group = by_chunk.remove(&ckey).unwrap_or_default();
             let indices: Vec<usize> = group.iter().map(|(i, ..)| *i).collect();
-            let applied = self.with_chunk_maybe_write(&ckey, |chunk| {
-                let applied: Vec<bool> = group
-                    .into_iter()
-                    .map(|(_, local_idx, key_id, kind, stamp)| match kind {
+            // Index updates for keys with a secondary index (see
+            // `create_index`) are collected here and applied after the
+            // chunk's lock is released below, rather than from inside the
+            // closure -- `ValueIndex` has its own lock, independent of the
+            // chunk's, so there's no ordering requirement, but doing it
+            // outside keeps the write-through chunk lock held for the
+            // shortest time possible.
+            let outcome = self.with_chunk_maybe_write(&ckey, |chunk| {
+                let mut applied: Vec<bool> = Vec::with_capacity(group.len());
+                let mut index_updates: Vec<(usize, u32, Option<Value>, Option<Value>)> =
+                    Vec::new();
+                for (_, local_idx, key_id, kind, stamp) in group {
+                    let indexed = self.value_index.is_indexed(key_id);
+                    let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+                    let wins = match kind {
                         ChangeKind::Set(value, meta) => {
-                            apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp)
+                            let new_for_index = indexed.then(|| value.clone());
+                            let wins =
+                                apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp);
+                            if indexed && wins {
+                                index_updates.push((
+                                    local_idx,
+                                    key_id,
+                                    old_value.clone(),
+                                    new_for_index,
+                                ));
+                            }
+                            wins
                         }
-                        ChangeKind::Removed(at_ms) => apply_remove_if_newer(
-                            chunk,
-                            local_idx,
-                            key_id,
-                            at_ms,
-                            stamp,
-                            keep_tombstones,
-                        ),
-                    })
-                    .collect();
+                        ChangeKind::Removed(at_ms) => {
+                            let wins = apply_remove_if_newer(
+                                chunk,
+                                local_idx,
+                                key_id,
+                                at_ms,
+                                stamp,
+                                keep_tombstones,
+                            );
+                            if indexed && wins {
+                                index_updates.push((local_idx, key_id, old_value.clone(), None));
+                            }
+                            wins
+                        }
+                    };
+                    applied.push(wins);
+                }
                 let changed = applied.iter().any(|&a| a);
-                (applied, changed)
+                ((applied, index_updates), changed)
             });
-            match applied {
-                Ok(applied) => {
+            match outcome {
+                Ok((applied, index_updates)) => {
+                    for (local_idx, key_id, old, new) in index_updates {
+                        self.value_index.record(
+                            key_id,
+                            &self.unsplit(&ckey, local_idx),
+                            old.as_ref(),
+                            new.as_ref(),
+                        );
+                    }
                     for (i, applied) in indices.into_iter().zip(applied) {
                         results[i] = Some(Ok(applied));
                     }
@@ -1420,11 +1660,17 @@ impl World {
         };
         let at_ms = now_ms();
         let keep_tombstones = self.tombstone_retention.is_some();
-        let removed = self.with_chunk_maybe_write(&ckey, |chunk| {
+        let indexed = self.value_index.is_indexed(key_id);
+        let (removed, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
             let removed = remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp);
             let changed = removed.is_some();
-            (removed, changed)
+            ((removed, old_value), changed)
         })?;
+        if indexed && removed.is_some() {
+            self.value_index
+                .record(key_id, &Coord::from(coord), old_value.as_ref(), None);
+        }
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
         Ok(removed.map(|stamp| (at_ms, stamp)))
     }
@@ -1570,6 +1816,7 @@ impl World {
         }
         let key_id = self.schema().intern(key, value_type)?;
         let now_ms = now_ms();
+        let indexed = self.value_index.is_indexed(key_id);
         let mut metas = vec![
             (
                 CellMeta {
@@ -1581,15 +1828,30 @@ impl World {
             );
             volume
         ];
+        let mut index_updates: Vec<(Coord, Option<Value>, Option<Value>)> = Vec::new();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            self.with_chunk_write(&ckey, |chunk| {
+            let updates = self.with_chunk_write(&ckey, |chunk| {
+                let mut updates = Vec::new();
                 for (i, local_idx) in cells {
+                    let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
                     let stamp = stamp();
                     let meta =
                         chunk.set_stamped(local_idx, key_id, values[i].clone(), now_ms, stamp);
                     metas[i] = (meta, stamp);
+                    if indexed {
+                        updates.push((
+                            self.unsplit(&ckey, local_idx),
+                            old_value,
+                            Some(values[i].clone()),
+                        ));
+                    }
                 }
+                updates
             })?;
+            index_updates.extend(updates);
+        }
+        for (coord, old, new) in index_updates {
+            self.value_index.record(key_id, &coord, old.as_ref(), new.as_ref());
         }
         crate::logger::info(format!(
             "set region {region:?} key '{key}' from {volume} per-cell values"
@@ -1631,22 +1893,34 @@ impl World {
             return Ok(removed);
         };
         let keep_tombstones = self.tombstone_retention.is_some();
+        let indexed = self.value_index.is_indexed(key_id);
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             let removed_here = self.with_chunk_maybe_write(&ckey, |chunk| {
-                let removed_here: Vec<(usize, Stamp)> = cells
+                let removed_here: Vec<(usize, Stamp, Option<Value>)> = cells
                     .into_iter()
                     .filter_map(|(_, local_idx)| {
+                        let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
                         remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp)
-                            .map(|stamp| (local_idx, stamp))
+                            .map(|stamp| (local_idx, stamp, old_value))
                     })
                     .collect();
                 let changed = !removed_here.is_empty();
                 (removed_here, changed)
             })?;
+            if indexed {
+                for (local_idx, _, old_value) in &removed_here {
+                    self.value_index.record(
+                        key_id,
+                        &self.unsplit(&ckey, *local_idx),
+                        old_value.as_ref(),
+                        None,
+                    );
+                }
+            }
             removed.cells.extend(
                 removed_here
                     .into_iter()
-                    .map(|(local_idx, stamp)| (self.unsplit(&ckey, local_idx), stamp)),
+                    .map(|(local_idx, stamp, _)| (self.unsplit(&ckey, local_idx), stamp)),
             );
         }
         crate::logger::info(format!(
@@ -1681,6 +1955,30 @@ impl World {
 /// One change in `World::apply_changes`, resolved against its chunk:
 /// (input index, local cell index, key id, the change, its stamp).
 type PendingChange = (usize, usize, u32, ChangeKind, Stamp);
+
+/// Converts `value` to `target`'s type if it can possibly equal a value of
+/// that type, mirroring the numeric cross-type equality `kblockdbquery`'s
+/// `eval_compare`/`compare_f64` already allows for a `WHERE key = <literal>`
+/// comparison -- see `World::lookup_eq`'s doc comment. `None` means `value`
+/// can never equal anything `target`-typed (a fractional `F64` compared
+/// against an `I64` column, or a `Str`/`Bool` mismatch).
+fn normalize_value_for_type(value: &Value, target: ValueType) -> Option<Value> {
+    if value.value_type() == target {
+        return Some(value.clone());
+    }
+    match (value, target) {
+        // Every `i64` is exactly representable as `f64` (well inside its
+        // 2^53 exact-integer range for any realistic coordinate/attribute
+        // value), so this direction never loses precision.
+        (Value::I64(n), ValueType::F64) => Some(Value::F64(*n as f64)),
+        (Value::F64(f), ValueType::I64)
+            if f.fract() == 0.0 && *f >= i64::MIN as f64 && *f <= i64::MAX as f64 =>
+        {
+            Some(Value::I64(*f as i64))
+        }
+        _ => None,
+    }
+}
 
 /// What last-write-wins compares a cell/key's current state by: when it
 /// was last written (a value's `modified_at_ms`, or a tombstone's removal
@@ -4723,5 +5021,375 @@ mod tests {
         assert!(results[1].is_err());
         assert!(!results[2].as_ref().unwrap());
         assert!(*results[3].as_ref().unwrap());
+    }
+
+    #[test]
+    fn lookup_eq_on_an_unindexed_key_is_none() {
+        let dir = TempDir::new("index-unindexed");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        assert_eq!(w.lookup_eq("material", &Value::Str("stone".into())), None);
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn create_index_backfills_existing_data() {
+        let dir = TempDir::new("index-backfill");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(1, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(2, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+
+        w.create_index("material").unwrap();
+        assert_eq!(w.indexed_keys(), vec!["material".to_string()]);
+
+        let mut stone = w.lookup_eq("material", &Value::Str("stone".into())).unwrap();
+        stone.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(stone, vec![coord3(0, 0, 0), coord3(1, 0, 0)]);
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![coord3(2, 0, 0)])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("lava".into())),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn create_index_on_a_never_written_key_is_an_empty_noop() {
+        let dir = TempDir::new("index-never-written");
+        let w = create(&dir);
+        w.create_index("material").unwrap();
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn set_keeps_an_existing_index_up_to_date() {
+        let dir = TempDir::new("index-set-live");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+
+        // A brand new cell under the indexed key.
+        w.set(&coord3(5, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let mut stone = w.lookup_eq("material", &Value::Str("stone".into())).unwrap();
+        stone.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(stone, vec![coord3(0, 0, 0), coord3(5, 0, 0)]);
+
+        // Overwriting an already-indexed cell moves it to its new value.
+        w.set(&coord3(0, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(5, 0, 0)])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn remove_clears_the_cell_from_an_existing_index() {
+        let dir = TempDir::new("index-remove-live");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+
+        w.remove(&coord3(0, 0, 0), "material").unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn set_region_and_remove_region_keep_an_existing_index_up_to_date() {
+        let dir = TempDir::new("index-region-live");
+        let w = create(&dir);
+        // `create_index` only tracks a key once it's a known column (see
+        // its doc comment) -- fix the type up front, same as a real
+        // deployment indexing a key ahead of its first `set`.
+        w.add_column("material", ValueType::Str).unwrap();
+        w.create_index("material").unwrap();
+
+        let region = Region::new([0, 0, 0], [2, 1, 1]);
+        w.set_region(
+            &region,
+            "material",
+            &[Value::Str("stone".into()), Value::Str("dirt".into())],
+        )
+        .unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![coord3(1, 0, 0)])
+        );
+
+        w.remove_region(&region, "material").unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![])
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("dirt".into())),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn apply_replicated_keeps_an_existing_index_up_to_date() {
+        let dir = TempDir::new("index-replicated-live");
+        let w = create(&dir);
+        w.add_column("material", ValueType::Str).unwrap();
+        w.create_index("material").unwrap();
+
+        let meta = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        w.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), meta)
+            .unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+
+        assert!(w
+            .apply_replicated_remove(&coord3(0, 0, 0), "material", 2)
+            .unwrap());
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn apply_changes_keeps_an_existing_index_up_to_date() {
+        let dir = TempDir::new("index-apply-changes-live");
+        let w = create(&dir);
+        w.add_column("material", ValueType::Str).unwrap();
+        w.create_index("material").unwrap();
+
+        let meta_at = |ms: u64| CellMeta {
+            created_at_ms: ms,
+            modified_at_ms: ms,
+            version: 0,
+        };
+        let results = w.apply_changes(vec![
+            Change {
+                coord: coord3(0, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Set(Value::Str("stone".into()), meta_at(1)),
+                stamp: Stamp::NONE,
+            },
+            Change {
+                coord: coord3(1, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Set(Value::Str("stone".into()), meta_at(1)),
+                stamp: Stamp::NONE,
+            },
+        ]);
+        assert!(results.iter().all(|r| *r.as_ref().unwrap()));
+        let mut stone = w.lookup_eq("material", &Value::Str("stone".into())).unwrap();
+        stone.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(stone, vec![coord3(0, 0, 0), coord3(1, 0, 0)]);
+
+        let remove_results = w.apply_changes(vec![Change {
+            coord: coord3(0, 0, 0),
+            key: "material".into(),
+            kind: ChangeKind::Removed(2),
+            stamp: Stamp::NONE,
+        }]);
+        assert!(*remove_results[0].as_ref().unwrap());
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(1, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn drop_index_stops_maintenance_and_lookup_falls_back_to_unindexed() {
+        let dir = TempDir::new("index-drop-live");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+        assert!(w.drop_index("material"));
+        assert!(!w.drop_index("material"));
+
+        assert_eq!(w.lookup_eq("material", &Value::Str("stone".into())), None);
+        // A set after dropping must not resurrect/maintain the index.
+        w.set(&coord3(1, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        assert_eq!(w.lookup_eq("material", &Value::Str("stone".into())), None);
+    }
+
+    #[test]
+    fn rebuild_index_on_a_never_indexed_key_builds_it_from_scratch() {
+        let dir = TempDir::new("index-rebuild-fresh");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.rebuild_index("material").unwrap();
+        assert_eq!(w.indexed_keys(), vec!["material".to_string()]);
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn rebuild_index_on_a_never_written_key_is_an_empty_noop() {
+        let dir = TempDir::new("index-rebuild-never-written");
+        let w = create(&dir);
+        w.rebuild_index("material").unwrap();
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn rebuild_index_discards_stale_entries_an_already_built_index_would_keep() {
+        let dir = TempDir::new("index-rebuild-discards-stale");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+
+        // Simulate the index having drifted stale by writing directly to
+        // the underlying `ValueIndex`, bypassing every write path that
+        // would normally keep it in sync -- `rebuild_index` is the
+        // recovery lever for exactly this (see its doc comment), so this
+        // confirms it actually discards what a cheap `create_index`
+        // no-op would have left behind.
+        w.value_index.record(
+            w.schema().id_for_key("material").unwrap(),
+            &coord3(9, 9, 9),
+            None,
+            Some(&Value::Str("stone".into())),
+        );
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into()))
+                .unwrap()
+                .len(),
+            2
+        );
+
+        w.rebuild_index("material").unwrap();
+        assert_eq!(
+            w.lookup_eq("material", &Value::Str("stone".into())),
+            Some(vec![coord3(0, 0, 0)])
+        );
+    }
+
+    #[test]
+    fn remove_column_drops_its_index_too() {
+        let dir = TempDir::new("index-remove-column");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+        assert!(w.remove_column("material").unwrap());
+        assert_eq!(w.indexed_keys(), Vec::<String>::new());
+    }
+
+    #[test]
+    fn cell_entry_at_reports_every_key_set_at_that_cell() {
+        let dir = TempDir::new("cell-entry-at-basic");
+        let w = create(&dir);
+        w.set(&coord3(1, 2, 3), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(1, 2, 3), "hardness", Value::I64(7)).unwrap();
+        w.set(&coord3(9, 9, 9), "material", Value::Str("air".into()))
+            .unwrap();
+
+        let entry = w.cell_entry_at(&coord3(1, 2, 3)).unwrap().unwrap();
+        assert_eq!(entry.coord, coord3(1, 2, 3));
+        assert_eq!(
+            entry.values.iter().map(|(k, ..)| k.clone()).collect::<Vec<_>>(),
+            vec!["hardness".to_string(), "material".to_string()],
+        );
+    }
+
+    #[test]
+    fn cell_entry_at_is_none_for_an_unset_cell() {
+        let dir = TempDir::new("cell-entry-at-unset");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        assert_eq!(w.cell_entry_at(&coord3(1, 1, 1)).unwrap(), None);
+    }
+
+    #[test]
+    fn cell_entry_at_matches_list_cells_for_the_same_cell() {
+        let dir = TempDir::new("cell-entry-at-matches-list-cells");
+        let w = create(&dir);
+        w.set(&coord3(2, 2, 2), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(2, 2, 2), "density", Value::F64(2.5)).unwrap();
+
+        let from_list = w
+            .list_cells()
+            .unwrap()
+            .into_iter()
+            .find(|c| c.coord == coord3(2, 2, 2))
+            .unwrap();
+        let from_single = w.cell_entry_at(&coord3(2, 2, 2)).unwrap().unwrap();
+        assert_eq!(from_list, from_single);
+    }
+
+    #[test]
+    fn lookup_eq_reconciles_an_int_literal_against_an_f64_column() {
+        let dir = TempDir::new("index-lookup-eq-int-vs-f64");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "density", Value::F64(5.0)).unwrap();
+        w.create_index("density").unwrap();
+
+        assert_eq!(
+            w.lookup_eq("density", &Value::I64(5)),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        // A fractional float can never equal anything in this I64... er,
+        // F64 column that isn't itself 5.0 -- not indexed under Int(6).
+        assert_eq!(w.lookup_eq("density", &Value::I64(6)), Some(vec![]));
+    }
+
+    #[test]
+    fn lookup_eq_reconciles_a_float_literal_against_an_i64_column() {
+        let dir = TempDir::new("index-lookup-eq-f64-vs-int");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(7)).unwrap();
+        w.create_index("hardness").unwrap();
+
+        assert_eq!(
+            w.lookup_eq("hardness", &Value::F64(7.0)),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        // 7.5 can never equal an I64 column's value -- a precise empty
+        // answer, not "unknown" (which would send the caller to a full
+        // scan that would also find nothing).
+        assert_eq!(w.lookup_eq("hardness", &Value::F64(7.5)), Some(vec![]));
+    }
+
+    #[test]
+    fn lookup_eq_of_a_mismatched_non_numeric_type_is_a_precise_empty_result() {
+        let dir = TempDir::new("index-lookup-eq-type-mismatch");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+
+        assert_eq!(w.lookup_eq("material", &Value::Bool(true)), Some(vec![]));
     }
 }

@@ -6,5 +6,5 @@ target/release/kblockdbcli --password changeme --db demo query "SELECT * FROM (0
 target/release/kblockdbcli --password changeme --db demo query "SELECT count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'"
 target/release/kblockdbcli --password changeme --db demo query "SELECT max(bearingkg) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'"
 target/release/kblockdbcli --password changeme --db demo query "SELECT max(bearingkg),count(*) FROM (0,0,0,0) TO (9,9,9,1) WHERE material = 'stone'"
-
-
+target/release/kblockdbcli --password changeme --db demo query "CREATE INDEX ON material"
+target/release/kblockdbcli --password changeme --db demo query "CREATE INDEX ON bearingkg"

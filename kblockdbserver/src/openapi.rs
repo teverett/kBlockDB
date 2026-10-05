@@ -11,8 +11,8 @@ use crate::error::ErrorBody;
 use crate::routes::{
     self, AddColumnBody, AggregateResponse, CellResponse, ClusterPeer, ClusterResponse,
     ColumnResponse, ColumnsResponse, CreateDatabaseBody, DatabasesResponse, HealthResponse,
-    QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse, SetRegionBody,
-    StatsResponse, SyncState,
+    IndexesResponse, QueryKeyValue, QueryRequest, QueryResponse, QueryRow, RegionValuesResponse,
+    SetRegionBody, StatsResponse, SyncState,
 };
 use crate::value_json::{ValueJson, ValueTypeJson};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
@@ -39,6 +39,9 @@ use utoipa::{Modify, OpenApi};
         routes::list_columns,
         routes::add_column,
         routes::remove_column,
+        routes::list_indexes,
+        routes::create_index,
+        routes::remove_index,
         routes::get_cell,
         routes::set_cell,
         routes::remove_cell,
@@ -58,6 +61,7 @@ use utoipa::{Modify, OpenApi};
         ColumnResponse,
         ColumnsResponse,
         AddColumnBody,
+        IndexesResponse,
         CellResponse,
         RegionValuesResponse,
         SetRegionBody,
@@ -75,6 +79,7 @@ use utoipa::{Modify, OpenApi};
         (name = "databases", description = "Which databases this server manages -- listing, creating, and deleting"),
         (name = "stats", description = "On-disk statistics for a database's data"),
         (name = "columns", description = "A database's schema -- listing, adding and dropping columns"),
+        (name = "indexes", description = "Secondary equality indexes on a column, for faster WHERE lookups"),
         (name = "cells", description = "Single-cell reads and writes"),
         (name = "regions", description = "Axis-aligned box-of-cells reads and writes"),
         (name = "query", description = "The SELECT/SET/UPDATE/DELETE query language -- see the README"),

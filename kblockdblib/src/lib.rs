@@ -11,6 +11,7 @@
 pub mod chunk;
 mod chunk_cache;
 pub mod coord;
+pub mod index;
 pub mod logger;
 pub mod params;
 pub mod schema;
