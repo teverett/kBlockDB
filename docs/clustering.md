@@ -19,6 +19,13 @@ cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
 # is set but this isn't). Distinct from http_port/binary_port.
 peer_port = 8082
 
+# This instance's own host (IP or DNS name, no port) for a peer to dial
+# back on. Optional -- auto-detected (this host's own best-guess outbound
+# IP) when unset, which is already correct on an ordinary LAN. Set this
+# explicitly only when auto-detection picks the wrong address for your
+# topology (see "Peer addresses" below).
+advertised_host = "10.0.0.2"
+
 # How long a peer learned at runtime (it connected in, or was gossiped)
 # may stay unreachable before it's dropped from the peer set. Default
 # 300 (five minutes); 0 never drops anyone. Configured [[peers]] are never
@@ -61,6 +68,32 @@ connecting server's `peer_port`, so the accepting side dials back to
 `<source IP>:<peer_port>` the first time it sees a new peer. So for any
 pair of servers, only *one* side has to list the other: if A's config names
 B, B learns A the moment A connects and starts sending to A as well.
+
+### Peer addresses
+
+The "`<source IP>`" above is whatever address the accepting side's TCP
+stack reports the connection arrived from -- correct on an ordinary LAN
+or direct-routed network, where that's genuinely the connecting server's
+own address. It's wrong whenever something sits between the two and
+rewrites the source address, most commonly a NAT gateway or a site-to-
+site VPN: every peer then sees connections arriving from the gateway's
+own address, not the connecting server's, and learns that (unreachable,
+or reaching the wrong host) address instead.
+
+`advertised_host` fixes this at the source: every server sends a host in
+its own `Hello` (`wire::PeerMessage::Hello`'s `advertised_host` field),
+and every peer it connects to dials back on
+`<advertised_host>:<peer_port>` instead of the observed source IP. By
+default that host is auto-detected -- this server's own best-guess
+outbound IP (`main.rs`'s `primary_local_ip`, the same mechanism that
+already picks what address to print for the HTTP/data-browser URL when
+bound to a wildcard address), which is already correct on an ordinary
+LAN and so changes nothing there. Set `[cluster].advertised_host`
+explicitly only when auto-detection itself picks the wrong address for
+your topology -- most commonly a host with more than one active network
+path, where the one the OS picks as "primary" isn't the one that
+actually reaches a given peer. Check a peer's `/rest/cluster`
+`peers[].host` to see what it ended up learning.
 
 ### Gossip
 
@@ -409,7 +442,7 @@ This is a v1, intentionally minimal design:
   would then be accepted. This needs a key's very first write anywhere to
   arrive after its delete, so it's rare.
 - **Upgrade every node together.** Servers only link with a peer speaking
-  exactly the same peer protocol version (8), so a mixed-version cluster
+  exactly the same peer protocol version (9), so a mixed-version cluster
   doesn't replicate at all between old and new servers.
 - **Never copy `.cluster/` to another server.** It holds the node id;
   two servers sharing one would each take the other for itself and

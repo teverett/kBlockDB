@@ -52,9 +52,12 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// version 7 added `SyncReport` (the periodic "do we actually hold the
 /// same data" check); version 8 added `ChunkDigestsRequest`/
 /// `ChunkDigests` (the on-mismatch drill-down that localizes which
-/// chunk(s) a `SyncReport` disagreement is in). A server only links with
-/// a peer speaking exactly this version (see `server.rs`).
-pub const PEER_PROTOCOL_VERSION: u8 = 8;
+/// chunk(s) a `SyncReport` disagreement is in); version 9 added `Hello`'s
+/// `advertised_host` (a connecting node's own stated dial-back address,
+/// for when the accepting side's observed TCP source IP isn't reachable
+/// -- e.g. a NAT/VPN gateway sitting between them). A server only links
+/// with a peer speaking exactly this version (see `server.rs`).
+pub const PEER_PROTOCOL_VERSION: u8 = 9;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -133,14 +136,27 @@ pub enum PeerMessage {
         secret: String,
         server_id: String,
         /// The port the connecting server's own peer listener is on --
-        /// combined with the connection's source IP, the address the
-        /// accepting side dials back to (see `peers::PeerSet`).
+        /// combined with `advertised_host` (if set) or else the
+        /// connection's observed source IP, the address the accepting
+        /// side dials back to (see `peers::PeerSet`).
         peer_port: u16,
         /// The connecting process's random per-run identity -- lets the
         /// accepting side tell it's been dialed by itself (see
         /// `peers::PeerSet::claim`).
         node_id: u64,
         protocol_version: u8,
+        /// The connecting process's own stated host (IP or DNS name, no
+        /// port) to dial back on, overriding the connection's observed
+        /// source IP -- set from `peers::LocalIdentity::advertised_host`
+        /// (an embedder decides how: `kblockdbserver` auto-detects its
+        /// own outbound IP by default, overridable via config). Needed
+        /// when the accepting side's view of where the connection came
+        /// from isn't actually reachable (most commonly a NAT/VPN
+        /// gateway between the two), in which case the observed source
+        /// IP alone is wrong no matter how it's used. `None` leaves
+        /// today's behavior (dial back on the observed source IP)
+        /// unchanged.
+        advertised_host: Option<String>,
     },
     /// Carries the *accepting* process's node id, so the connecting side
     /// can tell when the address it dialed turned out to be itself, or a
@@ -245,6 +261,7 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
             peer_port,
             node_id,
             protocol_version,
+            advertised_host,
         } => {
             buf.push(0);
             buf.push(*protocol_version);
@@ -252,6 +269,7 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
             put_string(&mut buf, server_id);
             buf.extend_from_slice(&peer_port.to_le_bytes());
             buf.extend_from_slice(&node_id.to_le_bytes());
+            put_option_string(&mut buf, advertised_host.as_deref());
         }
         PeerMessage::HelloOk { node_id } => {
             buf.push(1);
@@ -357,6 +375,7 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
             server_id: r.string()?,
             peer_port: r.u16()?,
             node_id: r.u64()?,
+            advertised_host: r.option_string()?,
         }),
         1 => Ok(PeerMessage::HelloOk { node_id: r.u64()? }),
         2 => Ok(PeerMessage::HelloRejected(r.string()?)),
@@ -522,6 +541,19 @@ fn put_string(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(s.as_bytes());
 }
 
+/// A presence byte (0/1) then `put_string`, iff `Some` -- `put_string`'s
+/// `Option` counterpart, for a field like `Hello::advertised_host` that's
+/// usually absent.
+fn put_option_string(buf: &mut Vec<u8>, s: Option<&str>) {
+    match s {
+        Some(s) => {
+            buf.push(1);
+            put_string(buf, s);
+        }
+        None => buf.push(0),
+    }
+}
+
 fn put_vector(buf: &mut Vec<u8>, vector: &VersionVector) {
     buf.extend_from_slice(&(vector.len() as u32).to_le_bytes());
     for (origin, seq) in vector.iter() {
@@ -606,6 +638,14 @@ impl<'a> Reader<'a> {
         String::from_utf8(self.take(len)?.to_vec()).map_err(|_| DecodeError::InvalidUtf8)
     }
 
+    fn option_string(&mut self) -> Result<Option<String>, DecodeError> {
+        match self.u8()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.string()?)),
+            other => Err(DecodeError::UnknownTag(other)),
+        }
+    }
+
     fn vector(&mut self) -> Result<VersionVector, DecodeError> {
         let count = self.u32()? as usize;
         (0..count)
@@ -646,6 +686,19 @@ mod tests {
             peer_port: 8082,
             node_id: 0xDEAD_BEEF_1234_5678,
             protocol_version: PEER_PROTOCOL_VERSION,
+            advertised_host: None,
+        });
+    }
+
+    #[test]
+    fn hello_round_trips_with_an_advertised_host() {
+        roundtrip(PeerMessage::Hello {
+            secret: "shh".to_string(),
+            server_id: "node-a".to_string(),
+            peer_port: 8082,
+            node_id: 0xDEAD_BEEF_1234_5678,
+            protocol_version: PEER_PROTOCOL_VERSION,
+            advertised_host: Some("yoda.internal".to_string()),
         });
     }
 

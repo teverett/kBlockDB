@@ -258,6 +258,7 @@ fn peer_set(peers: &[(&str, bool)]) -> kblockdbcluster::peers::PeerSet {
             cluster_secret: "s".to_string(),
             server_id: "node-a".to_string(),
             peer_port: 1,
+            advertised_host: None,
         },
         kblockdbcluster::hub::ReplicationHub::new(),
     );
@@ -3131,6 +3132,27 @@ fn primary_local_ip_is_never_a_useless_answer() {
     if let Some(ip) = crate::primary_local_ip() {
         assert!(!ip.is_loopback(), "{ip} is loopback");
         assert!(!ip.is_unspecified(), "{ip} is unspecified");
+    }
+}
+
+#[test]
+fn advertised_host_prefers_an_explicit_override() {
+    // Deterministic regardless of this machine's actual network state --
+    // an explicit config value always wins over auto-detection.
+    assert_eq!(
+        crate::advertised_host(Some("configured.example")),
+        Some("configured.example".to_string())
+    );
+}
+
+#[test]
+fn advertised_host_falls_back_to_the_auto_detected_ip() {
+    // Same "if it found something, it must be useful" check as
+    // `primary_local_ip_is_never_a_useless_answer` -- this test
+    // environment may or may not have an outbound route.
+    if let Some(host) = crate::advertised_host(None) {
+        assert_ne!(host, "127.0.0.1");
+        assert_ne!(host, "0.0.0.0");
     }
 }
 

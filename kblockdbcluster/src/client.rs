@@ -237,6 +237,7 @@ async fn connect_and_forward(
             peer_port: identity.peer_port,
             node_id: peers.node_id(),
             protocol_version: PEER_PROTOCOL_VERSION,
+            advertised_host: identity.advertised_host.clone(),
         },
     )
     .await?;
@@ -605,6 +606,7 @@ mod tests {
                 cluster_secret: CLUSTER_SECRET.to_string(),
                 server_id: "node-a".to_string(),
                 peer_port: 1,
+                advertised_host: None,
             },
             crate::hub::ReplicationHub::new(),
         )
@@ -637,6 +639,7 @@ mod tests {
                 cluster_secret: CLUSTER_SECRET.to_string(),
                 server_id: "node-a".to_string(),
                 peer_port: 1,
+                advertised_host: None,
             },
             crate::hub::ReplicationHub::with_capacity(hub_capacity),
         )
@@ -659,6 +662,29 @@ mod tests {
             Some(PeerMessage::PeerList(_))
         ));
         stream
+    }
+
+    #[tokio::test]
+    async fn connecting_sends_its_configured_advertised_host_in_hello() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = PeerSet::new(
+            crate::peers::LocalIdentity {
+                cluster_secret: CLUSTER_SECRET.to_string(),
+                server_id: "node-a".to_string(),
+                peer_port: 1,
+                advertised_host: Some("gateway.invalid".to_string()),
+            },
+            crate::hub::ReplicationHub::new(),
+        );
+        peers.add(listener.local_addr().unwrap().to_string());
+
+        let (mut stream, _) = listener.accept().await.unwrap();
+        match crate::wire::read_message(&mut stream).await.unwrap() {
+            Some(PeerMessage::Hello { advertised_host, .. }) => {
+                assert_eq!(advertised_host.as_deref(), Some("gateway.invalid"));
+            }
+            other => panic!("expected Hello, got {other:?}"),
+        }
     }
 
     /// Reads until a `Synced`, returning every entry received before it

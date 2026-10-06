@@ -163,6 +163,7 @@ async fn handle_connection<S: ReplicationSink>(
         peer_port,
         node_id,
         protocol_version,
+        advertised_host,
     } = hello
     else {
         let _ = crate::wire::write_message(
@@ -220,7 +221,14 @@ async fn handle_connection<S: ReplicationSink>(
         // -- nothing to learn or apply.
         return;
     }
-    let dial_back = SocketAddr::new(remote_ip, peer_port).to_string();
+    // Prefer the connecting side's own stated host over the connection's
+    // observed source IP, when it said one -- see `wire::PeerMessage::
+    // Hello::advertised_host`'s doc comment on why the observed IP alone
+    // can be wrong (a NAT/VPN gateway between the two, most commonly).
+    let dial_back = match advertised_host.filter(|host| !host.is_empty()) {
+        Some(host) => format!("{host}:{peer_port}"),
+        None => SocketAddr::new(remote_ip, peer_port).to_string(),
+    };
     eprintln!("peer protocol: '{server_id}' connected from {dial_back}");
     // Peers are symmetric: a peer that connected in is replicated *to*
     // as well -- a no-op if it's already known (e.g. configured here too).
@@ -390,6 +398,7 @@ mod tests {
                 peer_port: UNREACHABLE_PEER_PORT,
                 node_id: TEST_CLIENT_NODE_ID,
                 protocol_version,
+                advertised_host: None,
             },
         )
         .await
@@ -737,6 +746,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_hello_with_an_advertised_host_is_learned_by_it_not_the_observed_ip() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::Hello {
+                secret: CLUSTER_SECRET.to_string(),
+                server_id: "test-peer".to_string(),
+                peer_port: UNREACHABLE_PEER_PORT,
+                node_id: TEST_CLIENT_NODE_ID,
+                protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
+                advertised_host: Some("gateway.invalid".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::HelloOk { .. })
+        ));
+
+        let expected = format!("gateway.invalid:{UNREACHABLE_PEER_PORT}");
+        wait_until(|| peers.snapshot().iter().any(|(a, _)| *a == expected)).await;
+        // Never learned under the connection's own observed source IP.
+        let observed = format!("127.0.0.1:{UNREACHABLE_PEER_PORT}");
+        assert!(!peers.snapshot().iter().any(|(a, _)| *a == observed));
+    }
+
+    #[tokio::test]
+    async fn a_hello_with_an_empty_advertised_host_falls_back_to_the_observed_ip() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::Hello {
+                secret: CLUSTER_SECRET.to_string(),
+                server_id: "test-peer".to_string(),
+                peer_port: UNREACHABLE_PEER_PORT,
+                node_id: TEST_CLIENT_NODE_ID,
+                protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
+                advertised_host: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::HelloOk { .. })
+        ));
+
+        let expected = format!("127.0.0.1:{UNREACHABLE_PEER_PORT}");
+        wait_until(|| peers.snapshot().iter().any(|(a, _)| *a == expected)).await;
+    }
+
+    #[tokio::test]
     async fn a_rejected_hello_is_never_learned() {
         let TestNode { addr, peers, .. } = spawn_node("node-a").await;
         let mut stream = ClientStream::connect(addr).await.unwrap();
@@ -800,6 +864,7 @@ mod tests {
                 peer_port: UNREACHABLE_PEER_PORT,
                 node_id: TEST_CLIENT_NODE_ID,
                 protocol_version: crate::wire::PEER_PROTOCOL_VERSION + 1,
+                advertised_host: None,
             },
         )
         .await

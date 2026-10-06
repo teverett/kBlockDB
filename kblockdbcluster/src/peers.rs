@@ -74,6 +74,16 @@ pub struct LocalIdentity {
     /// The port this process's own peer listener is bound to, sent in
     /// `Hello` so the other side can dial back.
     pub peer_port: u16,
+    /// This process's own stated host (IP or DNS name, no port) to dial
+    /// back on, sent in `Hello` as `advertised_host` -- `None` leaves a
+    /// peer to dial back on whatever source IP it observed the
+    /// connection arrive from, same as before this field existed. This
+    /// crate itself never sets a default here (it has no concept of "this
+    /// host's own address" -- that's the embedder's business):
+    /// `kblockdbserver` auto-detects its own best-guess outbound IP
+    /// unless its `[cluster].advertised_host` config overrides it (see
+    /// `docs/clustering.md`'s "Peer addresses" section).
+    pub advertised_host: Option<String>,
 }
 
 struct Entry {
@@ -389,6 +399,7 @@ mod tests {
                 cluster_secret: "s".to_string(),
                 server_id: "node-a".to_string(),
                 peer_port: 1,
+                advertised_host: None,
             },
             ReplicationHub::new(),
         )
@@ -407,6 +418,7 @@ mod tests {
                 cluster_secret: "s".to_string(),
                 server_id: "node-a".to_string(),
                 peer_port: 1,
+                advertised_host: None,
             },
             hub.clone(),
         );

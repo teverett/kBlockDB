@@ -146,6 +146,7 @@ read_only = true              # optional, defaults to false
 [cluster]
 peer_port = 8082
 cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
+advertised_host = "10.0.0.2"  # optional; auto-detected by default, see docs/clustering.md's "Peer addresses"
 dead_peer_timeout_secs = 300  # optional; 0 never drops unreachable peers
 keepalive_idle_secs = 30      # optional peer-link TCP keepalive, all > 0
 keepalive_interval_secs = 10

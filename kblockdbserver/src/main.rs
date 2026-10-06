@@ -418,6 +418,7 @@ async fn main() {
                     .local_addr()
                     .map(|a| a.port())
                     .unwrap_or(peer_addr.port()),
+                advertised_host: advertised_host(config.cluster.advertised_host.as_deref()),
             },
             hub.clone(),
         )
@@ -535,6 +536,30 @@ fn primary_local_ip() -> Option<IpAddr> {
     socket.connect((Ipv4Addr::new(192, 0, 2, 1), 9)).ok()?;
     let ip = socket.local_addr().ok()?.ip();
     (!ip.is_unspecified() && !ip.is_loopback()).then_some(ip)
+}
+
+/// What this process sends as `Hello`'s `advertised_host` (see
+/// `kblockdbcluster::peers::LocalIdentity`): `configured` (the
+/// `[cluster].advertised_host` config value) if the operator set one,
+/// otherwise this host's own best-guess outbound IP (`primary_local_ip`)
+/// -- same address `reachable_addr` already picks for the printed
+/// HTTP/data-browser URL when bound to a wildcard address, reused here
+/// so a peer dials back on an address that's actually reachable even
+/// when the connection it observed arrived through something that
+/// rewrote the source IP (a NAT/VPN gateway, most commonly -- see
+/// docs/clustering.md's "Peer addresses"). On a plain, unrouted network
+/// this is the same address the peer would've observed anyway, so
+/// sending it changes nothing there.
+///
+/// `None` only when there's no configured override and this host has no
+/// detectable outbound route at all (same case `primary_local_ip`
+/// itself returns `None` for) -- the peer then falls back to dialing
+/// back on whatever source IP it itself observed, exactly like before
+/// this existed.
+fn advertised_host(configured: Option<&str>) -> Option<String> {
+    configured
+        .map(str::to_string)
+        .or_else(|| primary_local_ip().map(|ip| ip.to_string()))
 }
 
 /// An address a listener is bound to, rewritten into one a client can

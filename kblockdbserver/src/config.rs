@@ -56,6 +56,17 @@ pub struct ClusterConfig {
     /// `cluster_secret`).
     #[serde(default)]
     pub cluster_secret: Option<String>,
+    /// This instance's own host (IP or DNS name, no port) for a peer to
+    /// dial back on -- sent in every outgoing `Hello` as `advertised_host`
+    /// (see `kblockdbcluster::peers::LocalIdentity`/`wire::PeerMessage::
+    /// Hello`), overriding whatever source IP the accepting peer observes
+    /// the connection arrive from. Overrides auto-detection (`main.rs`'s
+    /// `advertised_host` function, which falls back to this instance's
+    /// own best-guess outbound IP when this is unset) -- set this
+    /// explicitly only when that auto-detected address is wrong for your
+    /// topology, e.g. a host with more than one active network path.
+    #[serde(default)]
+    pub advertised_host: Option<String>,
     /// How long a peer *learned* at runtime (it connected in, or was
     /// gossiped) may stay continuously unreachable before it's dropped --
     /// see `kblockdbcluster::peers::PeerSet::prune`. Configured
@@ -558,6 +569,26 @@ mod tests {
         assert!(config.peers.is_empty());
         assert_eq!(config.cluster.cluster_secret, None);
         assert_eq!(config.cluster.peer_port, None);
+        assert_eq!(config.cluster.advertised_host, None);
+    }
+
+    #[test]
+    fn parses_an_advertised_host() {
+        let config = Config::from_toml_str(
+            r#"
+            admin_password = "secret"
+
+            [cluster]
+            peer_port = 8082
+            cluster_secret = "shh"
+            advertised_host = "yoda.internal"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.cluster.advertised_host.as_deref(),
+            Some("yoda.internal")
+        );
     }
 
     #[test]

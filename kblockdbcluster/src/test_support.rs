@@ -458,6 +458,7 @@ pub fn spawn_node_on(
                 cluster_secret: CLUSTER_SECRET.to_string(),
                 server_id: server_id.to_string(),
                 peer_port: addr.port(),
+                advertised_host: None,
             },
             hub.clone(),
         )
