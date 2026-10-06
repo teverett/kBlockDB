@@ -1,9 +1,10 @@
-//! A secondary, equality-only index from a key's value to the coordinates
-//! holding it -- what lets `World::lookup_eq` answer "which cells have
-//! `key == value`" in time proportional to the number of matches, instead
-//! of `World::list_cells`'s full chunk-by-chunk decode of the whole world
-//! (see `World::create_index`'s doc comment for the tradeoff this opts
-//! into per key).
+//! A secondary index from a key's value to the coordinates holding it --
+//! what lets `World::lookup_eq`/`lookup_range` answer "which cells have
+//! `key == value`" or "which cells have `key` between these bounds" in
+//! time proportional to the number of matches, instead of `World::
+//! list_cells`'s full chunk-by-chunk decode of the whole world (see
+//! `World::create_index`'s doc comment for the tradeoff this opts into
+//! per key).
 //!
 //! Backed by `crate::lsm::LsmIndex`, one per indexed key, each at its own
 //! directory (named by key id) under the world's `indexes/` directory --
@@ -21,6 +22,7 @@ use crate::lsm::LsmIndex;
 use crate::value::Value;
 use std::collections::HashMap;
 use std::io;
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -30,10 +32,11 @@ const INDEXES_DIR: &str = "indexes";
 
 /// A `Value` as order-preserving bytes, for `LsmIndex`'s sorted on-disk
 /// storage. Each encoding keeps `Value::PartialEq`'s notion of equality
-/// (what matters for `lookup_eq`) and, as a bonus for free, orders values
-/// the same way `kblockdbquery`'s `<`/`>` comparisons do -- not exploited
-/// today (`LsmIndex` only ever gets exact-match lookups), but means this
-/// encoding wouldn't need to change if range lookups were added later.
+/// (what matters for `lookup_eq`) and orders values the same way
+/// `kblockdbquery`'s `<`/`>` comparisons do, which is what makes
+/// `lookup_range`'s bounded scan (`LsmIndex::range`) sound: a value's
+/// position in this byte ordering is exactly its position in the query
+/// language's own ordering, for every `Value` variant.
 ///
 /// `f64`'s `to_bits` (not IEEE equality/ordering) is what makes a `Value`
 /// hashable/orderable at all here, same reasoning as the old purely
@@ -66,10 +69,6 @@ fn sortable_bytes(value: &Value) -> Vec<u8> {
 
 /// One `World`'s whole set of indexed keys, keyed by schema key id (not
 /// key name -- consistent with how `Chunk` itself addresses columns).
-///
-/// Equality lookups only: there's no ordering exposed here (see
-/// `sortable_bytes`'s doc comment on why the underlying encoding happens
-/// to support it anyway), so `Lt`/`Gt`/etc. still need a full scan.
 pub struct ValueIndex {
     root: PathBuf,
     open: Mutex<HashMap<u32, LsmIndex>>,
@@ -183,6 +182,40 @@ impl ValueIndex {
             .map(Coord::from)
             .collect();
         Ok(Some(coords))
+    }
+
+    /// Every coordinate currently holding a value inside `[lower, upper)`
+    /// under `key_id` -- `lookup_eq`, generalized to a bound instead of
+    /// an exact value, via `LsmIndex::range` over the same
+    /// `sortable_bytes` encoding. `None` if `key_id` isn't indexed, same
+    /// fallback contract as `lookup_eq`.
+    pub fn lookup_range(
+        &self,
+        key_id: u32,
+        lower: Bound<&Value>,
+        upper: Bound<&Value>,
+    ) -> io::Result<Option<Vec<Coord>>> {
+        let open = self.open.lock().unwrap();
+        let Some(lsm) = open.get(&key_id) else {
+            return Ok(None);
+        };
+        let coords = lsm
+            .range(map_sortable_bound(lower), map_sortable_bound(upper))?
+            .into_iter()
+            .map(Coord::from)
+            .collect();
+        Ok(Some(coords))
+    }
+}
+
+/// `sortable_bytes`, applied to a `Bound<&Value>` instead of a bare
+/// `Value` -- for `lookup_range`'s call into `LsmIndex::range`, which
+/// only knows about bytes, not `Value`.
+fn map_sortable_bound(bound: Bound<&Value>) -> Bound<Vec<u8>> {
+    match bound {
+        Bound::Included(v) => Bound::Included(sortable_bytes(v)),
+        Bound::Excluded(v) => Bound::Excluded(sortable_bytes(v)),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
@@ -347,6 +380,74 @@ mod tests {
         let index = ValueIndex::open(dir.as_ref()).unwrap();
         assert!(!index.is_indexed(1));
         assert_eq!(index.indexed_key_ids(), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn lookup_range_finds_every_value_in_bounds() {
+        let dir = TempDir::new("range-basic");
+        let index = ValueIndex::open(dir.as_ref()).unwrap();
+        index.create(1).unwrap();
+        for i in 0..10 {
+            index
+                .record(1, &coord(&[i]), None, Some(&Value::I64(i as i64)))
+                .unwrap();
+        }
+        let mut got = index
+            .lookup_range(1, Bound::Included(&Value::I64(3)), Bound::Excluded(&Value::I64(7)))
+            .unwrap()
+            .unwrap();
+        got.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(got, (3..7).map(|i| coord(&[i])).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn lookup_range_on_an_unindexed_key_is_none() {
+        let dir = TempDir::new("range-unindexed");
+        let index = ValueIndex::open(dir.as_ref()).unwrap();
+        assert_eq!(
+            index
+                .lookup_range(1, Bound::Unbounded, Bound::Unbounded)
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_range_reflects_a_removal() {
+        let dir = TempDir::new("range-removal");
+        let index = ValueIndex::open(dir.as_ref()).unwrap();
+        index.create(1).unwrap();
+        let c = coord(&[0, 0, 0]);
+        index.record(1, &c, None, Some(&Value::I64(5))).unwrap();
+        index.record(1, &c, Some(&Value::I64(5)), None).unwrap();
+
+        assert_eq!(
+            index
+                .lookup_range(1, Bound::Unbounded, Bound::Unbounded)
+                .unwrap(),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_orders_strings_lexicographically() {
+        let dir = TempDir::new("range-strings");
+        let index = ValueIndex::open(dir.as_ref()).unwrap();
+        index.create(1).unwrap();
+        for word in ["apple", "banana", "cherry", "date"] {
+            index
+                .record(1, &coord(&[word.len() as i32]), None, Some(&Value::Str(word.into())))
+                .unwrap();
+        }
+        let got = index
+            .lookup_range(
+                1,
+                Bound::Included(&Value::Str("banana".into())),
+                Bound::Included(&Value::Str("cherry".into())),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.len(), 2);
     }
 
     #[test]

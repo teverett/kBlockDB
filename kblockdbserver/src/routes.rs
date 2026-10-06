@@ -1249,16 +1249,16 @@ async fn run_query(
 /// the same way).
 ///
 /// Tries `query::candidate_coords` first: if `where_clause` narrows down
-/// to a concrete coordinate set (every key compared with `=` at the
-/// expression's top level has an index -- see `kblockdblib::World::
-/// create_index`), this reads just those cells (`World::cell_entry_at`)
-/// instead of decoding the whole world. `candidate_coords` only ever
-/// returns a *superset* when part of `where_clause` couldn't be narrowed
-/// (an `OR`, a `<`/`>` comparison, `EXISTS`, ...), so every candidate is
-/// still re-checked against the full `range`/`where_clause` via
-/// `query::matches` before it's reported as a real match -- same final
-/// result as the full-scan path, just reached without decoding cells that
-/// could never have matched anyway.
+/// to a concrete coordinate set (every key compared with `=`/`<`/`<=`/
+/// `>`/`>=` at the expression's top level has an index -- see
+/// `kblockdblib::World::create_index`), this reads just those cells
+/// (`World::cell_entry_at`) instead of decoding the whole world.
+/// `candidate_coords` only ever returns a *superset* when part of
+/// `where_clause` couldn't be narrowed (an `OR`, `!=`, `EXISTS`, ...), so
+/// every candidate is still re-checked against the full `range`/
+/// `where_clause` via `query::matches` before it's reported as a real
+/// match -- same final result as the full-scan path, just reached
+/// without decoding cells that could never have matched anyway.
 ///
 /// Falls back to the full `World::list_cells` scan, filtered the same way,
 /// whenever `where_clause` is `None` or doesn't narrow at all.
@@ -1268,9 +1268,11 @@ fn matching_cells(
     where_clause: Option<&query::Expr>,
 ) -> std::io::Result<Vec<kblockdblib::CellEntry>> {
     if let Some(expr) = where_clause {
-        if let Some(coords) =
-            query::candidate_coords(expr, &|key, value| world.lookup_eq(key, value))
-        {
+        if let Some(coords) = query::candidate_coords(
+            expr,
+            &|key, value| world.lookup_eq(key, value),
+            &|key, lower, upper| world.lookup_range(key, lower, upper),
+        ) {
             let mut cells = Vec::with_capacity(coords.len());
             for coord in &coords {
                 if let Some(cell) = world.cell_entry_at(coord)? {

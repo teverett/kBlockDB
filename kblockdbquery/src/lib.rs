@@ -74,6 +74,7 @@ use pest::iterators::Pair;
 use pest::Parser;
 use pest_derive::Parser as PestParser;
 use std::fmt;
+use std::ops::Bound;
 
 #[derive(PestParser)]
 #[grammar = "query.pest"]
@@ -746,23 +747,25 @@ fn now_ms() -> i64 {
 // actually touches disk.
 
 /// Tries to narrow `expr` down to a concrete set of candidate coordinates
-/// using `lookup_eq` -- a caller-supplied stand-in for
-/// `kblockdblib::World::lookup_eq`, which answers "every coordinate
-/// currently holding this value under this key" for a key that has a
-/// secondary index built (`World::create_index`), or `None` if it doesn't.
+/// using `lookup_eq`/`lookup_range` -- caller-supplied stand-ins for
+/// `kblockdblib::World::lookup_eq`/`lookup_range`, which answer "every
+/// coordinate currently holding this value" or "...a value within these
+/// bounds" under this key, for a key that has a secondary index built
+/// (`World::create_index`), or `None` if it doesn't.
 ///
-/// Returns `None` if `expr` can't be narrowed at all -- no equality
-/// comparison against an indexed key anywhere at its top level -- in which
-/// case the caller should fall back to its usual full `list_cells` scan
-/// filtered by `matches`/`eval`, exactly as if this function didn't exist.
+/// Returns `None` if `expr` can't be narrowed at all -- no `=`/`<`/`<=`/
+/// `>`/`>=` comparison against an indexed key anywhere at its top level --
+/// in which case the caller should fall back to its usual full
+/// `list_cells` scan filtered by `matches`/`eval`, exactly as if this
+/// function didn't exist.
 ///
 /// A `Some` result is a **superset** of the final answer whenever `expr`
 /// contains anything this function can't itself evaluate -- `Or`, `Not`,
-/// `Exists`, a non-`Eq` comparison, or an equality against a key with no
-/// index. The caller must always re-check every returned coordinate against
-/// the full `expr` (e.g. via `eval` on that coordinate's real `CellEntry`)
-/// before treating it as a genuine match; this function only ever narrows
-/// the search, never decides it.
+/// `Exists`, `Ne`, or a comparison against a key with no index. The
+/// caller must always re-check every returned coordinate against the full
+/// `expr` (e.g. via `eval` on that coordinate's real `CellEntry`) before
+/// treating it as a genuine match; this function only ever narrows the
+/// search, never decides it.
 ///
 /// Only `And` is descended into for narrowing (`Or` can't be narrowed this
 /// way: a coordinate satisfying *either* side might not appear in either
@@ -776,12 +779,31 @@ fn now_ms() -> i64 {
 pub fn candidate_coords(
     expr: &Expr,
     lookup_eq: &dyn Fn(&str, &Value) -> Option<Vec<Coord>>,
+    lookup_range: &dyn Fn(&str, Bound<&Value>, Bound<&Value>) -> Option<Vec<Coord>>,
 ) -> Option<Vec<Coord>> {
     match expr {
         Expr::Compare(Operand::Key(name), CompareOp::Eq, literal) => {
             lookup_eq(name, &literal.to_value())
         }
-        Expr::And(a, b) => match (candidate_coords(a, lookup_eq), candidate_coords(b, lookup_eq)) {
+        Expr::Compare(
+            Operand::Key(name),
+            op @ (CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge),
+            literal,
+        ) => {
+            let value = literal.to_value();
+            let (lower, upper) = match op {
+                CompareOp::Lt => (Bound::Unbounded, Bound::Excluded(&value)),
+                CompareOp::Le => (Bound::Unbounded, Bound::Included(&value)),
+                CompareOp::Gt => (Bound::Excluded(&value), Bound::Unbounded),
+                CompareOp::Ge => (Bound::Included(&value), Bound::Unbounded),
+                CompareOp::Eq | CompareOp::Ne => unreachable!(),
+            };
+            lookup_range(name, lower, upper)
+        }
+        Expr::And(a, b) => match (
+            candidate_coords(a, lookup_eq, lookup_range),
+            candidate_coords(b, lookup_eq, lookup_range),
+        ) {
             (Some(left), Some(right)) => {
                 let right: std::collections::HashSet<Coord> = right.into_iter().collect();
                 Some(left.into_iter().filter(|c| right.contains(c)).collect())
@@ -789,10 +811,9 @@ pub fn candidate_coords(
             (Some(one), None) | (None, Some(one)) => Some(one),
             (None, None) => None,
         },
-        // `Or`/`Not`/`Exists`/a non-`Eq` comparison/an axis or metadata
-        // comparison: none of these can be served by an equality index --
-        // see this function's doc comment on why `Or` in particular isn't
-        // just "union both sides".
+        // `Or`/`Not`/`Exists`/`Ne`/an axis or metadata comparison: none of
+        // these can be served by this index -- see this function's doc
+        // comment on why `Or` in particular isn't just "union both sides".
         _ => None,
     }
 }
@@ -2190,16 +2211,62 @@ mod tests {
         }
     }
 
+    /// Numeric/string ordering good enough for these pure, in-memory
+    /// tests' own fixed value types -- not `kblockdblib::World::
+    /// lookup_range`'s real `I64`/`F64` cross-type reconciliation, which
+    /// is exercised directly against a real `World` in `kblockdblib`'s
+    /// own tests instead.
+    fn compare_values(a: &Value, b: &Value) -> std::cmp::Ordering {
+        match (a, b) {
+            (Value::I64(x), Value::I64(y)) => x.cmp(y),
+            (Value::Str(x), Value::Str(y)) => x.cmp(y),
+            (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+            (Value::F64(x), Value::F64(y)) => x.partial_cmp(y).unwrap(),
+            _ => std::cmp::Ordering::Equal,
+        }
+    }
+
+    /// A `lookup_range` stand-in, same idea as `fake_index` but reporting
+    /// every coordinate whose recorded value falls inside `[lower,
+    /// upper)` instead of matching exactly one.
+    fn fake_range_index<'a>(
+        index: &'a [(&'a str, Vec<(Value, Vec<Coord>)>)],
+    ) -> impl Fn(&str, Bound<&Value>, Bound<&Value>) -> Option<Vec<Coord>> + 'a {
+        move |key, lower, upper| {
+            let (_, entries) = index.iter().find(|(k, _)| *k == key)?;
+            let in_lower = |v: &Value| match lower {
+                Bound::Unbounded => true,
+                Bound::Included(b) => compare_values(v, b) != std::cmp::Ordering::Less,
+                Bound::Excluded(b) => compare_values(v, b) == std::cmp::Ordering::Greater,
+            };
+            let in_upper = |v: &Value| match upper {
+                Bound::Unbounded => true,
+                Bound::Included(b) => compare_values(v, b) != std::cmp::Ordering::Greater,
+                Bound::Excluded(b) => compare_values(v, b) == std::cmp::Ordering::Less,
+            };
+            Some(
+                entries
+                    .iter()
+                    .filter(|(v, _)| in_lower(v) && in_upper(v))
+                    .flat_map(|(_, coords)| coords.clone())
+                    .collect(),
+            )
+        }
+    }
+
     #[test]
     fn candidate_coords_is_none_without_any_indexed_equality() {
-        let lookup = fake_index(&[]);
-        assert_eq!(candidate_coords(&parse_expr("x0 = 1"), &lookup), None);
+        let (lookup, range) = (fake_index(&[]), fake_range_index(&[]));
         assert_eq!(
-            candidate_coords(&parse_expr("material = 'stone'"), &lookup),
+            candidate_coords(&parse_expr("x0 = 1"), &lookup, &range),
             None
         );
         assert_eq!(
-            candidate_coords(&parse_expr("EXISTS(material)"), &lookup),
+            candidate_coords(&parse_expr("material = 'stone'"), &lookup, &range),
+            None
+        );
+        assert_eq!(
+            candidate_coords(&parse_expr("EXISTS(material)"), &lookup, &range),
             None
         );
     }
@@ -2213,8 +2280,8 @@ mod tests {
                 vec![Coord::from([0, 0, 0]), Coord::from([1, 0, 0])],
             )],
         )];
-        let lookup = fake_index(&index);
-        let mut got = candidate_coords(&parse_expr("material = 'stone'"), &lookup).unwrap();
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
+        let mut got = candidate_coords(&parse_expr("material = 'stone'"), &lookup, &range).unwrap();
         got.sort_by(|a, b| a.iter().cmp(b.iter()));
         assert_eq!(got, vec![Coord::from([0, 0, 0]), Coord::from([1, 0, 0])]);
     }
@@ -2222,9 +2289,9 @@ mod tests {
     #[test]
     fn candidate_coords_of_an_indexed_key_with_no_match_is_an_empty_some() {
         let index = [("material", vec![])];
-        let lookup = fake_index(&index);
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
         assert_eq!(
-            candidate_coords(&parse_expr("material = 'stone'"), &lookup),
+            candidate_coords(&parse_expr("material = 'stone'"), &lookup, &range),
             Some(vec![])
         );
     }
@@ -2248,9 +2315,13 @@ mod tests {
                 vec![(Value::I64(7), vec![Coord::from([1, 0, 0]), Coord::from([3, 0, 0])])],
             ),
         ];
-        let lookup = fake_index(&index);
-        let got =
-            candidate_coords(&parse_expr("material = 'stone' AND hardness = 7"), &lookup).unwrap();
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
+        let got = candidate_coords(
+            &parse_expr("material = 'stone' AND hardness = 7"),
+            &lookup,
+            &range,
+        )
+        .unwrap();
         assert_eq!(got, vec![Coord::from([1, 0, 0])]);
     }
 
@@ -2260,12 +2331,16 @@ mod tests {
             "material",
             vec![(Value::Str("stone".into()), vec![Coord::from([0, 0, 0])])],
         )];
-        let lookup = fake_index(&index);
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
         // `hardness` isn't indexed, but `material` is -- the AND should
         // still narrow to material's candidates; the caller is on its own
         // to re-check `hardness > 5` afterward via `eval`.
-        let got =
-            candidate_coords(&parse_expr("material = 'stone' AND hardness > 5"), &lookup).unwrap();
+        let got = candidate_coords(
+            &parse_expr("material = 'stone' AND hardness > 5"),
+            &lookup,
+            &range,
+        )
+        .unwrap();
         assert_eq!(got, vec![Coord::from([0, 0, 0])]);
     }
 
@@ -2275,11 +2350,80 @@ mod tests {
             "material",
             vec![(Value::Str("stone".into()), vec![Coord::from([0, 0, 0])])],
         )];
-        let lookup = fake_index(&index);
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
         assert_eq!(
-            candidate_coords(&parse_expr("material = 'stone' OR x0 = 99"), &lookup),
+            candidate_coords(&parse_expr("material = 'stone' OR x0 = 99"), &lookup, &range),
             None
         );
+    }
+
+    #[test]
+    fn candidate_coords_returns_an_indexed_ranges_coordinates_for_every_comparison() {
+        let index = [(
+            "hardness",
+            vec![
+                (Value::I64(1), vec![Coord::from([1, 0, 0])]),
+                (Value::I64(5), vec![Coord::from([5, 0, 0])]),
+                (Value::I64(9), vec![Coord::from([9, 0, 0])]),
+            ],
+        )];
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
+
+        let mut lt = candidate_coords(&parse_expr("hardness < 5"), &lookup, &range).unwrap();
+        lt.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(lt, vec![Coord::from([1, 0, 0])]);
+
+        let mut le = candidate_coords(&parse_expr("hardness <= 5"), &lookup, &range).unwrap();
+        le.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(le, vec![Coord::from([1, 0, 0]), Coord::from([5, 0, 0])]);
+
+        let mut gt = candidate_coords(&parse_expr("hardness > 5"), &lookup, &range).unwrap();
+        gt.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(gt, vec![Coord::from([9, 0, 0])]);
+
+        let mut ge = candidate_coords(&parse_expr("hardness >= 5"), &lookup, &range).unwrap();
+        ge.sort_by(|a, b| a.iter().cmp(b.iter()));
+        assert_eq!(ge, vec![Coord::from([5, 0, 0]), Coord::from([9, 0, 0])]);
+    }
+
+    #[test]
+    fn candidate_coords_is_none_for_ne_even_on_an_indexed_key() {
+        // `!=` has no equivalent contiguous bound/value set -- always
+        // falls back, same as `Or`/`Not`/`Exists`.
+        let index = [("hardness", vec![(Value::I64(5), vec![Coord::from([5, 0, 0])])])];
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
+        assert_eq!(
+            candidate_coords(&parse_expr("hardness != 5"), &lookup, &range),
+            None
+        );
+    }
+
+    #[test]
+    fn candidate_coords_intersects_an_equality_and_a_range_in_one_and() {
+        let index = [
+            (
+                "material",
+                vec![(
+                    Value::Str("stone".into()),
+                    vec![Coord::from([0, 0, 0]), Coord::from([5, 0, 0])],
+                )],
+            ),
+            (
+                "hardness",
+                vec![
+                    (Value::I64(3), vec![Coord::from([0, 0, 0])]),
+                    (Value::I64(9), vec![Coord::from([5, 0, 0])]),
+                ],
+            ),
+        ];
+        let (lookup, range) = (fake_index(&index), fake_range_index(&index));
+        let got = candidate_coords(
+            &parse_expr("material = 'stone' AND hardness > 5"),
+            &lookup,
+            &range,
+        )
+        .unwrap();
+        assert_eq!(got, vec![Coord::from([5, 0, 0])]);
     }
 
     /// Test-only helper: parses `SELECT * WHERE <src>` and returns just the

@@ -195,7 +195,7 @@ frequency -- unless the key a `WHERE` filters on has a secondary index
 (see "Indexes" below), in which case `SELECT`/`UPDATE`/`DELETE` skip
 `list_cells` and look the matching coordinates up directly.
 
-**Indexes.** `CREATE INDEX ON <key>` builds a secondary equality index on
+**Indexes.** `CREATE INDEX ON <key>` builds a secondary index on
 `key` (see [kblockdblib's design notes](kblockdblib.md) and
 `kblockdblib::World::create_index`): an on-disk map from `key`'s value to
 every coordinate currently holding it (not an in-memory structure -- it
@@ -229,13 +229,15 @@ REBUILD INDEX ON material
 ```
 
 Once an index exists, no further query syntax is needed to benefit from
-it: `SELECT`/`UPDATE`/`DELETE ... WHERE material = 'stone'` automatically
-resolves `material`'s matching coordinates from the index instead of
-scanning every chunk, then still re-checks the full `WHERE` clause against
-each candidate (so an `AND`ed, `OR`ed, or otherwise more complex clause
-stays correct, not just fast). Only `=`/`!=`-style equality against an
-indexed key is ever served directly from it; a `<`/`<=`/`>`/`>=`
-comparison, `EXISTS`, `OR`, or `NOT` still falls back to scanning. `SET`'s
-`WHERE` path doesn't use an index at all: it needs every candidate
+it: `SELECT`/`UPDATE`/`DELETE ... WHERE material = 'stone'` (or `WHERE
+hardness > 5`) automatically resolves the matching coordinates from the
+index instead of scanning every chunk, then still re-checks the full
+`WHERE` clause against each candidate (so an `AND`ed, `OR`ed, or
+otherwise more complex clause stays correct, not just fast). Both
+`=`-style equality and `<`/`<=`/`>`/`>=`-style range comparisons against
+an indexed key are served directly from it; `!=`, `EXISTS`, `OR`, or
+`NOT` still fall back to scanning (`!=` has no equivalent contiguous
+value/bound set an index lookup could return). `SET`'s `WHERE` path
+doesn't use an index at all: it needs every candidate
 *coordinate* in its range, including ones with no cell yet, which a value
 index can't help with.

@@ -34,9 +34,10 @@
 //! addressable costs if this ever needs to scale further -- not correctness
 //! gaps.
 
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 
 /// How many entries accumulate in the in-memory memtable before it's
@@ -178,6 +179,43 @@ impl Segment {
         Ok(out)
     }
 
+    /// Every `(value, coord, flag)` this segment records with a value
+    /// inside `[lower, upper)` (per `Bound`'s own inclusive/exclusive
+    /// semantics on each end) -- same bounded-scan idea as `lookup`,
+    /// generalized from "exactly one value" to "a sorted span of them":
+    /// seek to the latest checkpoint strictly before `lower` (or the start
+    /// of the records, if none qualifies), then scan forward until a
+    /// record's value no longer satisfies `upper`, at which point sorted
+    /// order guarantees nothing further in the file can either.
+    fn range(&self, lower: Bound<&[u8]>, upper: Bound<&[u8]>) -> io::Result<Vec<(Vec<u8>, CoordVec, Flag)>> {
+        let start = match lower {
+            Bound::Unbounded => 0,
+            Bound::Included(v) | Bound::Excluded(v) => {
+                self.checkpoints.partition_point(|c| c.value.as_slice() < v)
+            }
+        };
+        let (offset, record_index) = match start.checked_sub(1) {
+            Some(i) => (self.checkpoints[i].offset, self.checkpoints[i].record_index),
+            None => (4, 0), // just past the entry-count header; no checkpoint qualifies
+        };
+        let mut f = BufReader::new(File::open(&self.path)?);
+        f.seek(SeekFrom::Start(offset))?;
+        let mut remaining = self.entry_count - record_index;
+        let mut out = Vec::new();
+        while remaining > 0 {
+            let (value, coord, flag) = read_record(&mut f)?;
+            remaining -= 1;
+            if !satisfies_upper(&value, upper) {
+                break;
+            }
+            if !satisfies_lower(&value, lower) {
+                continue;
+            }
+            out.push((value, coord, flag));
+        }
+        Ok(out)
+    }
+
     /// Every record in this segment, in file order (= sorted order) -- for
     /// `compact`'s merge. Reads sequentially; never seeks past the footer.
     fn iter_all(&self) -> io::Result<SegmentRecords> {
@@ -204,6 +242,55 @@ impl SegmentRecords {
         }
         self.remaining -= 1;
         read_record(&mut self.reader).map(Some)
+    }
+}
+
+fn satisfies_lower(value: &[u8], lower: Bound<&[u8]>) -> bool {
+    match lower {
+        Bound::Unbounded => true,
+        Bound::Included(b) => value >= b,
+        Bound::Excluded(b) => value > b,
+    }
+}
+
+fn satisfies_upper(value: &[u8], upper: Bound<&[u8]>) -> bool {
+    match upper {
+        Bound::Unbounded => true,
+        Bound::Included(b) => value <= b,
+        Bound::Excluded(b) => value < b,
+    }
+}
+
+/// Whether `[lower, upper)` (per `Bound`'s own semantics on each end)
+/// provably contains no value at all -- `lower` strictly after `upper`,
+/// or the two equal with at least one side excluded. `Unbounded` on
+/// either side can never make a range empty by itself.
+fn range_is_empty(lower: &Bound<Vec<u8>>, upper: &Bound<Vec<u8>>) -> bool {
+    let (lower_value, lower_inclusive) = match lower {
+        Bound::Unbounded => return false,
+        Bound::Included(v) => (v, true),
+        Bound::Excluded(v) => (v, false),
+    };
+    let (upper_value, upper_inclusive) = match upper {
+        Bound::Unbounded => return false,
+        Bound::Included(v) => (v, true),
+        Bound::Excluded(v) => (v, false),
+    };
+    match lower_value.cmp(upper_value) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Equal => !(lower_inclusive && upper_inclusive),
+        std::cmp::Ordering::Less => false,
+    }
+}
+
+/// `bound.as_ref().map(Vec::as_slice)`, spelled out: `Bound::as_ref`
+/// alone would hand back `Bound<&Vec<u8>>`, and `satisfies_lower`/
+/// `satisfies_upper`/`Segment::range` all want `Bound<&[u8]>`.
+fn bound_as_slice(bound: &Bound<Vec<u8>>) -> Bound<&[u8]> {
+    match bound {
+        Bound::Included(v) => Bound::Included(v.as_slice()),
+        Bound::Excluded(v) => Bound::Excluded(v.as_slice()),
+        Bound::Unbounded => Bound::Unbounded,
     }
 }
 
@@ -343,6 +430,45 @@ impl LsmIndex {
             .into_iter()
             .filter(|(_, flag)| *flag == Flag::Present)
             .map(|(coord, _)| coord)
+            .collect())
+    }
+
+    /// Every coordinate currently holding a value inside `[lower, upper)`
+    /// -- `lookup`, generalized from one exact value to a sorted span of
+    /// them. Resolution is keyed by `(value, coord)`, not just `coord`:
+    /// a write that *moves* a coordinate from one value to another always
+    /// tombstones its old `(value, coord)` entry (see `index::ValueIndex::
+    /// record`), so at most one `(value, coord)` pair for a given
+    /// coordinate is ever `Present` across the whole index at once --
+    /// keying on the pair instead of the bare coordinate just lets two
+    /// *different* coordinates' histories under two different values in
+    /// range resolve independently, the same way `lookup` already relies
+    /// on for one value at a time.
+    pub fn range(&self, lower: Bound<Vec<u8>>, upper: Bound<Vec<u8>>) -> io::Result<Vec<CoordVec>> {
+        // `BTreeMap::range` panics on a reversed or degenerate (equal,
+        // both excluded) bound pair -- a caller translating a `WHERE`
+        // clause like `key > 5 AND key < 5` can produce exactly that, and
+        // it's a legitimate "no matches" query, not a bug. Checked once,
+        // up front, rather than guarding every caller.
+        if range_is_empty(&lower, &upper) {
+            return Ok(Vec::new());
+        }
+        let mut seen: HashMap<(Vec<u8>, CoordVec), Flag> = HashMap::new();
+        for (value, coords) in self.memtable.range((lower.clone(), upper.clone())) {
+            for (coord, &flag) in coords {
+                seen.entry((value.clone(), coord.clone())).or_insert(flag);
+            }
+        }
+        let (lower, upper) = (bound_as_slice(&lower), bound_as_slice(&upper));
+        for segment in self.segments.iter().rev() {
+            for (value, coord, flag) in segment.range(lower, upper)? {
+                seen.entry((value, coord)).or_insert(flag);
+            }
+        }
+        Ok(seen
+            .into_iter()
+            .filter(|(_, flag)| *flag == Flag::Present)
+            .map(|((_, coord), _)| coord)
             .collect())
     }
 
@@ -862,6 +988,179 @@ mod tests {
         let mut lsm = LsmIndex::open_with_thresholds(dir.as_ref(), 1, 100).unwrap();
         lsm.insert(v("stone"), c(&[-5, 0, 10, 2])).unwrap();
         assert_eq!(lsm.lookup(&v("stone")).unwrap(), vec![c(&[-5, 0, 10, 2])]);
+    }
+
+    // --- Range ---
+
+    fn sorted(mut coords: Vec<CoordVec>) -> Vec<CoordVec> {
+        coords.sort();
+        coords
+    }
+
+    #[test]
+    fn range_within_the_memtable_finds_every_value_in_bounds() {
+        let dir = TempDir::new("range-memtable");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        for i in 0..10 {
+            lsm.insert(format!("v{i:02}").into_bytes(), c(&[i])).unwrap();
+        }
+        let got = lsm
+            .range(
+                Bound::Included(v("v03")),
+                Bound::Excluded(v("v07")),
+            )
+            .unwrap();
+        assert_eq!(sorted(got), (3..7).map(|i| c(&[i])).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn range_bounds_are_respected_as_included_or_excluded() {
+        let dir = TempDir::new("range-bounds");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        for i in 0..5 {
+            lsm.insert(format!("v{i}").into_bytes(), c(&[i])).unwrap();
+        }
+        assert_eq!(
+            sorted(
+                lsm.range(Bound::Included(v("v1")), Bound::Included(v("v3")))
+                    .unwrap()
+            ),
+            vec![c(&[1]), c(&[2]), c(&[3])]
+        );
+        assert_eq!(
+            sorted(
+                lsm.range(Bound::Excluded(v("v1")), Bound::Excluded(v("v3")))
+                    .unwrap()
+            ),
+            vec![c(&[2])]
+        );
+    }
+
+    #[test]
+    fn unbounded_range_ends_cover_everything_on_that_side() {
+        let dir = TempDir::new("range-unbounded");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        for i in 0..5 {
+            lsm.insert(format!("v{i}").into_bytes(), c(&[i])).unwrap();
+        }
+        assert_eq!(
+            sorted(lsm.range(Bound::Unbounded, Bound::Included(v("v1"))).unwrap()),
+            vec![c(&[0]), c(&[1])]
+        );
+        assert_eq!(
+            sorted(lsm.range(Bound::Excluded(v("v3")), Bound::Unbounded).unwrap()),
+            vec![c(&[4])]
+        );
+        assert_eq!(
+            sorted(lsm.range(Bound::Unbounded, Bound::Unbounded).unwrap()),
+            (0..5).map(|i| c(&[i])).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn range_spans_segments_flushed_across_several_values() {
+        let dir = TempDir::new("range-segments");
+        // Flush threshold 1: every insert becomes its own segment.
+        let mut lsm = LsmIndex::open_with_thresholds(dir.as_ref(), 1, 100).unwrap();
+        for i in 0..10 {
+            lsm.insert(format!("v{i:02}").into_bytes(), c(&[i])).unwrap();
+        }
+        let got = lsm
+            .range(Bound::Included(v("v02")), Bound::Included(v("v05")))
+            .unwrap();
+        assert_eq!(sorted(got), (2..=5).map(|i| c(&[i])).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_coord_moved_out_of_range_is_not_reported_by_a_stale_segment_entry() {
+        let dir = TempDir::new("range-moved-out");
+        let mut lsm = LsmIndex::open_with_thresholds(dir.as_ref(), 1, 100).unwrap();
+        lsm.insert(v("v01"), c(&[0])).unwrap(); // segment 0: in range
+        lsm.remove(v("v01"), c(&[0])).unwrap(); // segment 1: tombstoned
+        lsm.insert(v("v09"), c(&[0])).unwrap(); // segment 2: moved out of range
+
+        let got = lsm
+            .range(Bound::Included(v("v00")), Bound::Included(v("v05")))
+            .unwrap();
+        assert_eq!(got, Vec::<CoordVec>::new());
+    }
+
+    #[test]
+    fn a_coord_moved_into_range_from_outside_is_found() {
+        let dir = TempDir::new("range-moved-in");
+        let mut lsm = LsmIndex::open_with_thresholds(dir.as_ref(), 1, 100).unwrap();
+        lsm.insert(v("v09"), c(&[0])).unwrap(); // segment 0: outside the query range
+        lsm.remove(v("v09"), c(&[0])).unwrap(); // segment 1: tombstoned
+        lsm.insert(v("v01"), c(&[0])).unwrap(); // segment 2: moved into range
+
+        let got = lsm
+            .range(Bound::Included(v("v00")), Bound::Included(v("v05")))
+            .unwrap();
+        assert_eq!(got, vec![c(&[0])]);
+    }
+
+    #[test]
+    fn range_past_the_sparse_index_still_finds_every_match() {
+        // Same shape as `a_lookup_past_the_sparse_index_still_finds_its_value`,
+        // but asking for a span rather than one exact value, so the scan
+        // has to cross several checkpoints (interval 128) and stop at the
+        // right one.
+        let dir = TempDir::new("range-sparse-index");
+        let mut lsm = LsmIndex::open_with_thresholds(dir.as_ref(), 500, 100).unwrap();
+        for i in 0..500 {
+            lsm.insert(format!("v{i:04}").into_bytes(), c(&[i])).unwrap();
+        }
+        let got = lsm
+            .range(Bound::Included(v("v0330")), Bound::Excluded(v("v0335")))
+            .unwrap();
+        assert_eq!(sorted(got), (330..335).map(|i| c(&[i])).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn empty_index_range_is_empty_not_an_error() {
+        let dir = TempDir::new("range-empty");
+        let lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        assert_eq!(
+            lsm.range(Bound::Unbounded, Bound::Unbounded).unwrap(),
+            Vec::<CoordVec>::new()
+        );
+    }
+
+    #[test]
+    fn an_empty_range_where_lower_meets_upper_exclusively_matches_nothing() {
+        let dir = TempDir::new("range-degenerate");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        lsm.insert(v("v1"), c(&[0])).unwrap();
+        assert_eq!(
+            lsm.range(Bound::Excluded(v("v1")), Bound::Excluded(v("v1")))
+                .unwrap(),
+            Vec::<CoordVec>::new()
+        );
+    }
+
+    #[test]
+    fn a_range_where_lower_meets_upper_inclusively_matches_just_that_value() {
+        let dir = TempDir::new("range-single-point");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        lsm.insert(v("v1"), c(&[0])).unwrap();
+        assert_eq!(
+            lsm.range(Bound::Included(v("v1")), Bound::Included(v("v1")))
+                .unwrap(),
+            vec![c(&[0])]
+        );
+    }
+
+    #[test]
+    fn a_reversed_range_matches_nothing_instead_of_panicking() {
+        let dir = TempDir::new("range-reversed");
+        let mut lsm = LsmIndex::create(dir.as_ref()).unwrap();
+        lsm.insert(v("v1"), c(&[0])).unwrap();
+        lsm.insert(v("v9"), c(&[1])).unwrap();
+        assert_eq!(
+            lsm.range(Bound::Included(v("v9")), Bound::Included(v("v1")))
+                .unwrap(),
+            Vec::<CoordVec>::new()
+        );
     }
 }
 

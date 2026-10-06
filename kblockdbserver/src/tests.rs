@@ -2701,6 +2701,96 @@ async fn select_where_and_of_two_indexed_keys_intersects_correctly() {
 }
 
 #[tokio::test]
+async fn select_where_filters_by_a_range_the_same_way_with_or_without_an_index() {
+    let (app, _dir) = test_app();
+    for (coord, hardness) in [("1,2,3", 3), ("4,5,6", 7), ("7,8,9", 9)] {
+        send(
+            app.clone(),
+            put(
+                &format!("/rest/db/db/cells/{coord}/hardness"),
+                json!({"type": "i64", "value": hardness}),
+            ),
+        )
+        .await;
+    }
+
+    let run = |app: axum::Router| async move {
+        let (status, body) = send(
+            app,
+            post("/rest/db/db/query", query("SELECT * WHERE hardness > 5")),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let mut coords: Vec<_> = body["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["coord"].clone())
+            .collect();
+        coords.sort_by_key(|c| c.to_string());
+        coords
+    };
+
+    let unindexed = run(app.clone()).await;
+    assert_eq!(unindexed, vec![json!([4, 5, 6]), json!([7, 8, 9])]);
+
+    send(app.clone(), put_empty("/rest/db/db/indexes/hardness")).await;
+    let indexed = run(app).await;
+    assert_eq!(indexed, unindexed);
+}
+
+#[tokio::test]
+async fn select_where_and_of_an_indexed_equality_and_an_indexed_range_intersects_correctly() {
+    let (app, _dir) = test_app();
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/1,2,3/hardness",
+            json!({"type": "i64", "value": 7}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/material",
+            json!({"type": "str", "value": "stone"}),
+        ),
+    )
+    .await;
+    send(
+        app.clone(),
+        put(
+            "/rest/db/db/cells/4,5,6/hardness",
+            json!({"type": "i64", "value": 3}),
+        ),
+    )
+    .await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/material")).await;
+    send(app.clone(), put_empty("/rest/db/db/indexes/hardness")).await;
+
+    let (status, body) = send(
+        app,
+        post(
+            "/rest/db/db/query",
+            query("SELECT * WHERE material = 'stone' AND hardness > 5"),
+        ),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["total_rows"], 1);
+    assert_eq!(body["rows"][0]["coord"], json!([1, 2, 3]));
+}
+
+#[tokio::test]
 async fn update_and_delete_with_where_still_work_correctly_once_the_key_is_indexed() {
     let (app, _dir) = test_app();
     send(

@@ -10,6 +10,7 @@ use crate::value::{Value, ValueType};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::ops::Bound;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, PoisonError};
@@ -1134,6 +1135,60 @@ impl World {
                 crate::logger::warn(format!(
                     "secondary index lookup failed for key '{key}': {e} -- falling back to a \
                      full scan"
+                ));
+                None
+            }
+        }
+    }
+
+    /// Every coordinate currently holding a value inside `[lower, upper)`
+    /// under `key` (per `Bound`'s own inclusive/exclusive semantics on
+    /// each end), using its secondary index -- `None`/`Some(vec![])`
+    /// mean the same thing as in `lookup_eq`: "not indexed, fall back to
+    /// a full scan" vs. "indexed, this is the real (possibly empty)
+    /// answer".
+    ///
+    /// Each bound reconciles against `key`'s column type the same way
+    /// `lookup_eq` reconciles its one `value` -- with one addition: a
+    /// non-integral `F64` bound against an `I64` column has no exact
+    /// equivalent *value* (`lookup_eq`'s case), but always has an exact
+    /// equivalent *bound*, since no `I64` value ever falls strictly
+    /// between two consecutive integers -- `key > 5.5` on an `I64` column
+    /// is exactly `key >= 6`, `key < 5.5` is exactly `key <= 5`, and so
+    /// on regardless of whether the original bound was inclusive or
+    /// exclusive (see `fit_bound_to_column_type`). A bound against a
+    /// `Str`/`Bool` column that could never match anything at all (a
+    /// numeric bound against either, or vice versa) makes the whole
+    /// query `Some(vec![])`, same "doesn't apply, not an error" rule
+    /// `eval_compare` applies to a single comparison.
+    pub fn lookup_range(
+        &self,
+        key: &str,
+        lower: Bound<&Value>,
+        upper: Bound<&Value>,
+    ) -> Option<Vec<Coord>> {
+        let schema = self.schema();
+        let key_id = schema.id_for_key(key)?;
+        if !self.value_index.is_indexed(key_id) {
+            return None;
+        }
+        let column_type = schema.type_for_key(key)?;
+        drop(schema);
+        let Some(lower) = fit_bound_to_column_type(lower, column_type, true) else {
+            return Some(Vec::new());
+        };
+        let Some(upper) = fit_bound_to_column_type(upper, column_type, false) else {
+            return Some(Vec::new());
+        };
+        match self
+            .value_index
+            .lookup_range(key_id, lower.as_ref(), upper.as_ref())
+        {
+            Ok(result) => result,
+            Err(e) => {
+                crate::logger::warn(format!(
+                    "secondary index range lookup failed for key '{key}': {e} -- falling back \
+                     to a full scan"
                 ));
                 None
             }
@@ -2412,6 +2467,61 @@ fn normalize_value_for_type(value: &Value, target: ValueType) -> Option<Value> {
         }
         _ => None,
     }
+}
+
+/// `normalize_value_for_type`, generalized to one bound of a `WHERE key
+/// <op> <literal>` range query (`World::lookup_range`) instead of an
+/// exact-match literal (`lookup_eq`): a literal with no exact equivalent
+/// *value* in `target`'s type still usually has an exact equivalent
+/// *bound*, since there's no `I64` value strictly between two
+/// consecutive integers -- `key > 5.5` on an `I64` column is exactly
+/// `key >= 6`, `key < 5.5` is exactly `key <= 5`, regardless of whether
+/// the original bound was inclusive or exclusive (there's no `I64`
+/// exactly equal to `5.5` either way, so tightening always lands on
+/// `Included`). `is_lower` picks the tightening direction (`ceil` vs
+/// `floor`); irrelevant whenever `value` already reconciles exactly.
+///
+/// A literal entirely outside `target`'s representable range collapses
+/// to `Some(Bound::Unbounded)` (every `target`-typed value already
+/// satisfies it, e.g. a lower bound of `-1e300` against an `I64` column)
+/// or `None` (no `target`-typed value ever can, same as a `Str`/`Bool`
+/// mismatch) -- whichever direction that extreme bound's own `is_lower`
+/// makes true.
+fn fit_bound_to_column_type(
+    bound: Bound<&Value>,
+    target: ValueType,
+    is_lower: bool,
+) -> Option<Bound<Value>> {
+    let (value, inclusive) = match bound {
+        Bound::Unbounded => return Some(Bound::Unbounded),
+        Bound::Included(v) => (v, true),
+        Bound::Excluded(v) => (v, false),
+    };
+    if let Some(exact) = normalize_value_for_type(value, target) {
+        return Some(if inclusive {
+            Bound::Included(exact)
+        } else {
+            Bound::Excluded(exact)
+        });
+    }
+    // Only a non-integral (or out-of-range) `F64` against an `I64` column
+    // reaches here -- every other mismatch (a `Str`/`Bool` against
+    // anything, or a numeric value against a `Str`/`Bool` column) can
+    // never match, and `normalize_value_for_type` already said so.
+    let (Value::F64(f), ValueType::I64) = (value, target) else {
+        return None;
+    };
+    if f.is_nan() {
+        return None; // NaN never satisfies an ordering comparison either
+    }
+    if *f > i64::MAX as f64 {
+        return if is_lower { None } else { Some(Bound::Unbounded) };
+    }
+    if *f < i64::MIN as f64 {
+        return if is_lower { Some(Bound::Unbounded) } else { None };
+    }
+    let tightened = if is_lower { f.ceil() } else { f.floor() };
+    Some(Bound::Included(Value::I64(tightened as i64)))
 }
 
 /// What last-write-wins compares a cell/key's current state by: when it
@@ -5921,6 +6031,180 @@ mod tests {
         w.create_index("material").unwrap();
 
         assert_eq!(w.lookup_eq("material", &Value::Bool(true)), Some(vec![]));
+    }
+
+    // --- Range index lookups ---
+
+    fn sorted_coords(mut coords: Vec<Coord>) -> Vec<Coord> {
+        coords.sort_by(|a, b| a.iter().cmp(b.iter()));
+        coords
+    }
+
+    #[test]
+    fn lookup_range_on_an_unindexed_key_is_none() {
+        let dir = TempDir::new("range-unindexed");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(5)).unwrap();
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Unbounded, Bound::Unbounded),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_range_on_a_never_written_key_is_none() {
+        let dir = TempDir::new("range-unwritten");
+        let w = create(&dir);
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Unbounded, Bound::Unbounded),
+            None
+        );
+    }
+
+    #[test]
+    fn lookup_range_finds_every_matching_value_inclusive_and_exclusive() {
+        let dir = TempDir::new("range-basic");
+        let w = create(&dir);
+        for i in 0..10 {
+            w.set(&coord3(i, 0, 0), "hardness", Value::I64(i as i64)).unwrap();
+        }
+        w.create_index("hardness").unwrap();
+
+        let got = w
+            .lookup_range(
+                "hardness",
+                Bound::Included(&Value::I64(3)),
+                Bound::Excluded(&Value::I64(7)),
+            )
+            .unwrap();
+        assert_eq!(
+            sorted_coords(got),
+            (3..7).map(|i| coord3(i, 0, 0)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn lookup_range_with_an_unbounded_side_covers_everything_on_that_side() {
+        let dir = TempDir::new("range-unbounded-side");
+        let w = create(&dir);
+        for i in 0..5 {
+            w.set(&coord3(i, 0, 0), "hardness", Value::I64(i as i64)).unwrap();
+        }
+        w.create_index("hardness").unwrap();
+
+        assert_eq!(
+            sorted_coords(w.lookup_range("hardness", Bound::Unbounded, Bound::Included(&Value::I64(1))).unwrap()),
+            vec![coord3(0, 0, 0), coord3(1, 0, 0)]
+        );
+        assert_eq!(
+            sorted_coords(w.lookup_range("hardness", Bound::Excluded(&Value::I64(3)), Bound::Unbounded).unwrap()),
+            vec![coord3(4, 0, 0)]
+        );
+    }
+
+    #[test]
+    fn lookup_range_stays_live_after_a_write_moves_a_coord_out_of_range() {
+        let dir = TempDir::new("range-live-update");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(5)).unwrap();
+        w.create_index("hardness").unwrap();
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Included(&Value::I64(0)), Bound::Included(&Value::I64(10))),
+            Some(vec![coord3(0, 0, 0)])
+        );
+
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(99)).unwrap();
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Included(&Value::I64(0)), Bound::Included(&Value::I64(10))),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_reconciles_an_int_bound_against_an_f64_column() {
+        let dir = TempDir::new("range-int-bound-vs-f64-column");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "density", Value::F64(5.0)).unwrap();
+        w.create_index("density").unwrap();
+
+        assert_eq!(
+            w.lookup_range("density", Bound::Included(&Value::I64(5)), Bound::Unbounded),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        assert_eq!(
+            w.lookup_range("density", Bound::Excluded(&Value::I64(5)), Bound::Unbounded),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_tightens_a_fractional_float_bound_against_an_i64_column() {
+        let dir = TempDir::new("range-fractional-bound-vs-i64-column");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(6)).unwrap();
+        w.create_index("hardness").unwrap();
+
+        // `> 5.5` on an I64 column is exactly `>= 6`.
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Excluded(&Value::F64(5.5)), Bound::Unbounded),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        // `< 6.5` on an I64 column is exactly `<= 6`.
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Unbounded, Bound::Excluded(&Value::F64(6.5))),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        // `< 5.5` excludes it.
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Unbounded, Bound::Excluded(&Value::F64(5.5))),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_of_a_mismatched_non_numeric_type_is_a_precise_empty_result() {
+        let dir = TempDir::new("range-type-mismatch");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.create_index("material").unwrap();
+
+        assert_eq!(
+            w.lookup_range("material", Bound::Included(&Value::I64(0)), Bound::Unbounded),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_with_a_wildly_out_of_range_float_bound_against_an_i64_column() {
+        let dir = TempDir::new("range-extreme-bound");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(6)).unwrap();
+        w.create_index("hardness").unwrap();
+
+        // Every I64 is >= an astronomically small lower bound.
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Included(&Value::F64(-1e300)), Bound::Unbounded),
+            Some(vec![coord3(0, 0, 0)])
+        );
+        // No I64 is >= an astronomically large lower bound.
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Included(&Value::F64(1e300)), Bound::Unbounded),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn lookup_range_against_a_nan_bound_matches_nothing() {
+        let dir = TempDir::new("range-nan-bound");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(6)).unwrap();
+        w.create_index("hardness").unwrap();
+
+        assert_eq!(
+            w.lookup_range("hardness", Bound::Included(&Value::F64(f64::NAN)), Bound::Unbounded),
+            Some(vec![])
+        );
     }
 
     // --- Content digest ---

@@ -286,13 +286,19 @@ value for it; a rare column doesn't cost a full-world rewrite.
 
 ## Indexes
 
-A secondary equality index on one key, letting `lookup_eq` answer "which
-cells have `key == value`" in time proportional to the number of matches
-instead of a full `list_cells` scan:
+A secondary index on one key, letting `lookup_eq`/`lookup_range` answer
+"which cells have `key == value`" or "which cells have `key` between
+these bounds" in time proportional to the number of matches instead of a
+full `list_cells` scan:
 
 ```rust
 world.create_index("material")?;
 world.lookup_eq("material", &kblockdblib::Value::Str("stone".into()))?;
+world.lookup_range(
+    "hardness",
+    std::ops::Bound::Included(&kblockdblib::Value::I64(5)),
+    std::ops::Bound::Unbounded,
+)?;
 world.drop_index("material")?;
 world.rebuild_index("material")?; // discards and rebuilds from scratch
 world.indexed_keys(); // every key currently indexed, sorted
@@ -309,8 +315,16 @@ world.indexed_keys(); // every key currently indexed, sorted
   in one call, for a caller that suspects an index has gone stale (it
   shouldn't -- every write path keeps it in sync; this is the recovery
   lever in case that invariant were ever violated).
-- Equality only: a `<`/`>` comparison on an indexed key still needs a
-  full scan.
+- `lookup_range(key, lower, upper)` serves `<`/`<=`/`>`/`>=` the same
+  way `lookup_eq` serves `=`: both ends are `std::ops::Bound`, so
+  `Unbounded` on either side leaves that end open. A literal that
+  doesn't fit the column's type exactly still usually has an exact
+  *bound* even without an exact *value* -- `hardness > 5.5` on an `I64`
+  column is reconciled to exactly `hardness >= 6`, the same numeric
+  cross-type reconciliation `lookup_eq`/`eval_compare` already do for
+  `=`, generalized to a bound (see `lookup_range`'s own doc comment for
+  the exact rules, including the `Str`/`Bool` mismatch and
+  out-of-`I64`-range cases).
 
 **Backed by an on-disk LSM structure, not an in-memory map** (`crate::lsm`,
 wrapped per-key by `crate::index::ValueIndex`), so an index on a key most
@@ -487,8 +501,8 @@ packed value array. That costs two different things:
   (`chunk_cells(axes, chunk_dim)`) is computed at runtime from the owning
   world's axis count and chunk size (both per-world runtime parameters,
   not compile-time constants -- see the axis-count/chunking bullets above).
-- `kblockdblib/src/index.rs`  -- `ValueIndex`, the equality-only secondary
-  index registry a key can be built on (see "Indexes" above): one
+- `kblockdblib/src/index.rs`  -- `ValueIndex`, the secondary index
+  registry a key can be built on (see "Indexes" above): one
   `crate::lsm::LsmIndex` per indexed key id, plus the `Value` ->
   order-preserving-bytes encoding (`sortable_bytes`) `lsm.rs` itself
   stays opaque to. `World` is what backfills a brand new index and keeps
