@@ -323,6 +323,78 @@ writes from then on (it's accurate, just no longer wanted) until the
 operator runs `DROP INDEX` again, which the live `IndexOp` path still
 replicates immediately to whoever's currently connected.
 
+## Sync check
+
+Equal version vectors (see `GET /rest/cluster`'s `sync` field) mean two
+nodes have *seen the same number of writes* -- not that their data is
+actually identical. A bug, an out-of-band edit, or a replication path
+that silently drops something could in principle leave two nodes with
+equal vectors but different real content, with nothing in the version-
+vector machinery to notice. The sync check is a second, independent
+signal that compares actual data, not operation counts.
+
+Each node optionally maintains a **content digest** per database
+(`kblockdblib::World::with_content_digest`/`content_digest`): the XOR of
+a deterministic hash over every currently-live cell/key's coordinate,
+key, value, and metadata. XOR makes it incrementally maintainable --
+every `set`/`remove` folds its change in with one extra lookup, so the
+digest never needs a full rescan to stay current, and (being order-
+independent) two nodes that reach the same data via writes applied in a
+different order still land on the same value. `kblockdbserver` turns
+this on for every database automatically whenever clustering is
+configured (off otherwise -- a standalone server has no peer to compare
+against, so the per-write cost would buy nothing).
+
+Every ~60 seconds (independent of `Synced`'s own ~5-second cadence --
+see "Catch-up" above), each link sends a `SyncReport`
+(`kblockdbcluster::wire::SyncReport`): the sender's current content
+digest and indexed-key set for every database it has one for. The
+receiver compares each against its own current state and logs a warning
+on any disagreement, recording the result for `GET /rest/cluster` to
+show as `sync_check`/`sync_checked_at_ms` per peer (see
+[kblockdbserver.md](kblockdbserver.md)). Like `IndexOp`/`IndexState`,
+this carries no stamp and isn't tracked by any catch-up -- it's a
+diagnostic signal, not data that itself needs to converge.
+
+`content_in_sync: false` means this node's and the peer's data for that
+database genuinely differ, not just that one is behind -- worth
+investigating (check `sync`/`behind_by`/`ahead_by` first: a node that's
+still catching up will legitimately disagree until it finishes).
+`indexed_keys_in_sync: false` most often means a `DROP INDEX` didn't
+reach this peer (see "Index operations" above) -- re-running it while
+both sides are connected fixes it. A database the peer reports that this
+node has no content digest for (never enabled -- shouldn't happen once
+clustering is configured, but possible right after startup before the
+first digest backfill finishes) is skipped, not reported as a mismatch.
+
+### Drill-down: which chunk is actually different
+
+A single content digest covers a whole database, so `content_in_sync:
+false` says *that* two nodes disagree, not *where*. Finding that cheaply
+without a full rescan on every routine check needs a structure that's
+granular but doesn't have to be maintained incrementally -- a full
+recursive Merkle tree is the standard answer, but it's more machinery
+than a diagnostic signal that fires rarely (only on an actual mismatch)
+needs.
+
+Instead, the moment `content_in_sync` comes back `false` for a database,
+the node that noticed asks that peer, on the same connection, for its
+`chunk_digests()` (`kblockdblib::World::chunk_digests`): one XOR per
+currently non-empty chunk, computed fresh with a full scan on demand --
+the same cost class as `list_cells`, never maintained incrementally, and
+never sent unprompted. XORing every value in that map together
+reproduces exactly what the whole-database `content_digest()` computes,
+so a mismatch there is guaranteed to show up as a disagreement somewhere
+in the chunk map too.
+
+The peer answers with one `ChunkDigests`
+(`kblockdbcluster::wire::ChunkDigests`), and the asking node diffs it
+against its own `chunk_digests()` for the same database to find exactly
+which chunk key(s) differ or exist on only one side -- surfaced as
+`differing_chunks` on that database's `sync_check` entry (`null` until
+the drill-down completes, typically a couple of seconds after
+`content_in_sync` first turns `false`).
+
 ## Limitations
 
 This is a v1, intentionally minimal design:
@@ -337,7 +409,7 @@ This is a v1, intentionally minimal design:
   would then be accepted. This needs a key's very first write anywhere to
   arrive after its delete, so it's rare.
 - **Upgrade every node together.** Servers only link with a peer speaking
-  exactly the same peer protocol version (5), so a mixed-version cluster
+  exactly the same peer protocol version (8), so a mixed-version cluster
   doesn't replicate at all between old and new servers.
 - **Never copy `.cluster/` to another server.** It holds the node id;
   two servers sharing one would each take the other for itself and

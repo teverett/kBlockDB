@@ -366,6 +366,8 @@ async fn cluster_reports_every_peer_with_its_connection_status() {
             "sync": "unknown",
             "behind_by": 0,
             "ahead_by": 0,
+            "sync_check": null,
+            "sync_checked_at_ms": null,
         })
     };
     assert_eq!(body["hostname"], json!("node-a"));
@@ -437,6 +439,124 @@ async fn cluster_reports_when_each_peer_last_synced() {
     assert_eq!(body["peers"][1]["last_synced_ms"], json!(null));
     let now = body["now_ms"].as_u64().unwrap();
     assert!(now >= before && now <= kblockdbcluster::hub::now_ms());
+}
+
+#[tokio::test]
+async fn cluster_reports_this_instances_own_content_digest() {
+    let dir = std::env::temp_dir().join(format!(
+        "kblockdbserver-test-content-digests-{}",
+        std::process::id()
+    ));
+    let databases = Databases::new(&dir, TEST_SHAPE).with_content_digest(true);
+    databases.create(DB, None).unwrap();
+    let db = databases.get(DB).unwrap();
+    db.set(&[0, 0, 0], "material", kblockdblib::Value::Str("stone".into()))
+        .unwrap();
+    let expected = format!("{:016x}", db.content_digest().unwrap());
+    let state = test_state(databases);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["content_digests"],
+        json!([{ "database": DB, "content_digest": expected }])
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn cluster_reports_no_content_digests_when_none_are_enabled() {
+    let (status, body) = send(test_app().0, get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["content_digests"], json!([]));
+}
+
+#[tokio::test]
+async fn cluster_surfaces_a_peers_sync_report() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("10.0.0.2:8082", true)]);
+    peers.insert_claim("10.0.0.2:8082", 0xB0);
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+    state.peer_sync.lock().unwrap().insert(
+        0xB0,
+        crate::cluster::PeerSyncStatus {
+            received_at_ms: 1_790_000_000_000,
+            databases: vec![crate::cluster::DatabaseSyncStatus {
+                database: "db".to_string(),
+                content_in_sync: false,
+                indexed_keys_in_sync: true,
+                local_content_digest: 0x1111,
+                peer_content_digest: 0x2222,
+                local_indexed_keys: vec!["material".to_string()],
+                peer_indexed_keys: vec!["material".to_string()],
+                differing_chunks: None,
+            }],
+        },
+    );
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["peers"][0]["sync_checked_at_ms"],
+        json!(1_790_000_000_000u64)
+    );
+    assert_eq!(
+        body["peers"][0]["sync_check"],
+        json!([{
+            "database": "db",
+            "content_in_sync": false,
+            "indexed_keys_in_sync": true,
+            "local_content_digest": "0000000000001111",
+            "peer_content_digest": "0000000000002222",
+            "local_indexed_keys": ["material"],
+            "peer_indexed_keys": ["material"],
+            "differing_chunks": null,
+        }])
+    );
+}
+
+#[tokio::test]
+async fn cluster_surfaces_a_completed_drill_downs_differing_chunks() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("10.0.0.2:8082", true)]);
+    peers.insert_claim("10.0.0.2:8082", 0xB0);
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+    state.peer_sync.lock().unwrap().insert(
+        0xB0,
+        crate::cluster::PeerSyncStatus {
+            received_at_ms: 1_790_000_000_000,
+            databases: vec![crate::cluster::DatabaseSyncStatus {
+                database: "db".to_string(),
+                content_in_sync: false,
+                indexed_keys_in_sync: true,
+                local_content_digest: 0x1111,
+                peer_content_digest: 0x2222,
+                local_indexed_keys: vec!["material".to_string()],
+                peer_indexed_keys: vec!["material".to_string()],
+                differing_chunks: Some(vec![vec![0, 0, 0], vec![3, 0, 0]]),
+            }],
+        },
+    );
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        body["peers"][0]["sync_check"][0]["differing_chunks"],
+        json!([[0, 0, 0], [3, 0, 0]])
+    );
+}
+
+#[tokio::test]
+async fn cluster_reports_no_sync_check_before_any_report_arrives() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("10.0.0.2:8082", true)]);
+    peers.insert_claim("10.0.0.2:8082", 0xB0);
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"][0]["sync_check"], json!(null));
+    assert_eq!(body["peers"][0]["sync_checked_at_ms"], json!(null));
 }
 
 #[tokio::test]

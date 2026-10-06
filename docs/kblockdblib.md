@@ -333,6 +333,58 @@ small header/footer, replaying the WAL) -- unlike the very first
 world with a huge existing index reopens cheaply, not in time proportional
 to how much it indexes.
 
+## Content digest
+
+A running checksum of a world's entire current content, for comparing
+against another world's (another node's, in a cluster -- see
+`docs/clustering.md`'s "Sync check") without comparing cell by cell:
+
+```rust
+let world = kblockdblib::World::create("./data", 3, 10_000, 32)?
+    .with_content_digest(true)?;
+world.content_digest(); // Some(u64), once enabled
+```
+
+- Off by default -- `with_content_digest(false)` (or never calling it)
+  costs nothing. Turning it on makes every `set`/`remove` (and their
+  region/replicated/batch counterparts) fetch the cell/key's *old* value
+  and metadata before overwriting it, for *every* key, not just indexed
+  ones -- unlike a secondary index, there's no "only pay for what you
+  use" here, since the digest covers everything. Worth it only once
+  something is actually going to compare this world's digest against a
+  peer's.
+- The digest itself is the XOR of a deterministic hash
+  (`DefaultHasher`, not `HashMap`'s randomly-seeded default -- the same
+  content must hash the same way on every node, every run) over every
+  currently-live cell/key's coordinate, key, value, and metadata. XOR is
+  what makes it maintainable incrementally: a write folds its old
+  contribution out and its new one in with one `^=`, and -- being
+  order-independent -- two worlds that reach the same data via writes
+  applied in a different order land on the same value. It's a checksum
+  for catching accidental divergence, not a cryptographic proof: a
+  coincidental cancellation is possible in principle, vanishingly
+  unlikely in practice with a 64-bit hash.
+- Turning it on for the first time on a world with existing data costs
+  one `list_cells`-equivalent full scan to compute a starting value --
+  same one-time cost `create_index` pays for a brand new index. After
+  that it's persisted (`content_digest.bin` at the world root) and
+  loaded directly on every later `open`, no rescan needed.
+
+`World::chunk_digests()` answers the follow-up question once two worlds'
+whole-database digests have already shown a mismatch: *which* chunk is
+actually different. It returns every currently non-empty chunk's own
+digest (same per-entry hash as `content_digest`, just grouped by chunk
+key instead of XORed into one running total), keyed by the chunk's own
+coordinate, not a cell coordinate. Unlike `content_digest`, it needs no
+flag enabled and isn't maintained incrementally -- it's a full,
+chunk-by-chunk scan recomputed fresh on every call, the same cost class
+as `list_cells`, meant to be called rarely (only after a mismatch is
+already known) rather than on any routine cadence. XORing every value
+it returns together reproduces exactly what `content_digest()` computes
+from the same data, so comparing two worlds' `chunk_digests()` for the
+same database always pinpoints a mismatch `content_digest()` already
+flagged, down to the chunk.
+
 ## Compression
 
 `World::with_compression(bool)` -- off by default -- zstd-compresses

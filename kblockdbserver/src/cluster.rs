@@ -13,8 +13,51 @@ use crate::error::ApiError;
 use crate::state::AppState;
 use kblockdbcluster::server::ReplicationSink;
 use kblockdbcluster::source::ChangeSource;
-use kblockdbcluster::wire::{ChangeEntry, ChangeOp, IndexOp};
+use kblockdbcluster::wire::{ChangeEntry, ChangeOp, DatabaseSync, IndexOp};
 use kblockdblib::{CellMeta, Change, ChangeKind, Stamp, Value, VersionVector};
+
+/// One peer's latest `SyncReport`, compared against this server's own
+/// current state at the moment it arrived -- see `AppState::
+/// apply_sync_report` (which both logs any mismatch and records one of
+/// these) and `routes.rs`'s `/rest/cluster` surfacing.
+#[derive(Debug, Clone)]
+pub struct PeerSyncStatus {
+    /// This server's own clock, when the report was applied.
+    pub received_at_ms: u64,
+    pub databases: Vec<DatabaseSyncStatus>,
+}
+
+/// One database's comparison, for one peer's report -- only ever built
+/// for a database *this* server also has a content digest for (see
+/// `AppState::apply_sync_report`); a database the peer reported that this
+/// server doesn't know about (yet, or at all) is simply skipped, not
+/// reported as a mismatch -- there's nothing to compare it against.
+#[derive(Debug, Clone)]
+pub struct DatabaseSyncStatus {
+    pub database: String,
+    pub content_in_sync: bool,
+    pub indexed_keys_in_sync: bool,
+    /// This server's own `World::content_digest()` for this database, as
+    /// of the moment the comparison ran -- for `/rest/cluster` to show
+    /// side by side with `peer_content_digest`, so a mismatch is visibly
+    /// a mismatch, not just a bare `false`.
+    pub local_content_digest: u64,
+    /// The peer's own reported digest for this database, from the same
+    /// `SyncReport` -- equal to `local_content_digest` exactly when
+    /// `content_in_sync` is `true`.
+    pub peer_content_digest: u64,
+    /// Sorted, for a stable, directly-comparable rendering.
+    pub local_indexed_keys: Vec<String>,
+    pub peer_indexed_keys: Vec<String>,
+    /// `None` until a drill-down for this mismatch completes (see
+    /// `AppState::apply_chunk_digests`); `Some(chunks)` once it does, where
+    /// `chunks` is every chunk key (sorted) that the peer's
+    /// `chunk_digests()` disagreed with this server's own on, or that
+    /// only one side had. Only ever requested when `content_in_sync` is
+    /// `false`, so this stays `None` for a database that's actually in
+    /// sync.
+    pub differing_chunks: Option<Vec<Vec<i32>>>,
+}
 
 impl ReplicationSink for AppState {
     async fn apply_set(
@@ -143,6 +186,109 @@ impl ReplicationSink for AppState {
             Err(e) => Err(format!("{e:?}")),
         }
     }
+
+    /// Compares `report` -- `from_node`'s current fingerprint for each of
+    /// its databases -- against this server's own, logging any
+    /// disagreement and recording the result for `/rest/cluster` to
+    /// surface (`AppState::peer_sync`). A database `report` names that
+    /// this server has no content digest for (never enabled, or a
+    /// database it doesn't have at all) is skipped, not reported as a
+    /// mismatch -- there's nothing on this side to compare it against.
+    ///
+    /// Returns every database whose content digest disagreed, so
+    /// `kblockdbcluster::server::handle_connection` can ask `from_node`
+    /// for a chunk-digest drill-down on each one (see
+    /// `apply_chunk_digests`) -- an indexed-keys-only disagreement isn't
+    /// included, since there's no chunk to localize that to.
+    async fn apply_sync_report(&self, from_node: u64, report: Vec<DatabaseSync>) -> Vec<String> {
+        let mut databases = Vec::with_capacity(report.len());
+        let mut mismatched = Vec::new();
+        for peer_db in report {
+            let local = self
+                .with_database(&peer_db.database, |w| {
+                    Ok((w.content_digest(), w.indexed_keys()))
+                })
+                .await;
+            let Ok((Some(local_digest), mut local_keys)) = local else {
+                continue;
+            };
+            local_keys.sort();
+            let mut peer_keys = peer_db.indexed_keys;
+            peer_keys.sort();
+            let content_in_sync = local_digest == peer_db.content_digest;
+            let indexed_keys_in_sync = local_keys == peer_keys;
+            if !content_in_sync || !indexed_keys_in_sync {
+                eprintln!(
+                    "cluster sync check: this server and peer node {from_node:016x} disagree on \
+                     database '{}' -- content_in_sync={content_in_sync} (local digest \
+                     {local_digest:016x}, peer {:016x}), indexed_keys_in_sync={indexed_keys_in_sync} \
+                     (local {local_keys:?}, peer {peer_keys:?})",
+                    peer_db.database, peer_db.content_digest,
+                );
+            }
+            if !content_in_sync {
+                mismatched.push(peer_db.database.clone());
+            }
+            databases.push(DatabaseSyncStatus {
+                database: peer_db.database,
+                content_in_sync,
+                indexed_keys_in_sync,
+                local_content_digest: local_digest,
+                peer_content_digest: peer_db.content_digest,
+                local_indexed_keys: local_keys,
+                peer_indexed_keys: peer_keys,
+                differing_chunks: None,
+            });
+        }
+        let status = PeerSyncStatus {
+            received_at_ms: kblockdbcluster::hub::now_ms(),
+            databases,
+        };
+        self.peer_sync.lock().unwrap().insert(from_node, status);
+        mismatched
+    }
+
+    /// Diffs `digests` -- `from_node`'s `chunk_digests()` for `database`,
+    /// sent in reply to this server's drill-down request -- against this
+    /// server's own, to find exactly which chunk(s) the whole-database
+    /// mismatch `apply_sync_report` already found is in. Logs the result
+    /// and fills in `differing_chunks` on the matching `DatabaseSyncStatus`
+    /// entry recorded for `from_node` (a no-op if that entry is somehow
+    /// gone by the time the reply arrives, e.g. a fresher `SyncReport`
+    /// already replaced it).
+    async fn apply_chunk_digests(
+        &self,
+        from_node: u64,
+        database: String,
+        digests: Vec<(Vec<i32>, u64)>,
+    ) {
+        let local = match self.with_database(&database, |w| w.chunk_digests()).await {
+            Ok(local) => local,
+            Err(_) => return,
+        };
+        let mut peer: std::collections::HashMap<Vec<i32>, u64> = digests.into_iter().collect();
+        let mut differing = Vec::new();
+        for (chunk_key, local_digest) in &local {
+            let chunk_key = chunk_key.to_vec();
+            match peer.remove(&chunk_key) {
+                Some(peer_digest) if peer_digest == *local_digest => {}
+                _ => differing.push(chunk_key),
+            }
+        }
+        differing.extend(peer.into_keys());
+        differing.sort();
+        eprintln!(
+            "cluster sync check: drill-down against peer node {from_node:016x} for database \
+             '{database}' found {} differing chunk(s): {differing:?}",
+            differing.len()
+        );
+        if let Some(status) = self.peer_sync.lock().unwrap().get_mut(&from_node) {
+            if let Some(db_status) = status.databases.iter_mut().find(|d| d.database == database)
+            {
+                db_status.differing_chunks = Some(differing);
+            }
+        }
+    }
 }
 
 fn change_from_entry(entry: &ChangeEntry) -> Change {
@@ -211,6 +357,36 @@ impl ChangeSource for AppState {
             out.extend(world.indexed_keys().into_iter().map(|key| (database.clone(), key)));
         }
         Ok(out)
+    }
+
+    fn sync_state(&self) -> Result<Vec<DatabaseSync>, String> {
+        let names = self.databases.list().map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        for database in names {
+            let world = match self.databases.get(&database) {
+                Ok(world) => world,
+                Err(ApiError::NotFound(_)) => continue,
+                Err(e) => return Err(format!("{e:?}")),
+            };
+            if let Some(content_digest) = world.content_digest() {
+                out.push(DatabaseSync {
+                    database,
+                    content_digest,
+                    indexed_keys: world.indexed_keys(),
+                });
+            }
+        }
+        Ok(out)
+    }
+
+    fn chunk_digests(&self, database: &str) -> Result<Vec<(Vec<i32>, u64)>, String> {
+        let world = match self.databases.get(database) {
+            Ok(world) => world,
+            Err(ApiError::NotFound(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(format!("{e:?}")),
+        };
+        let digests = world.chunk_digests().map_err(|e| e.to_string())?;
+        Ok(digests.into_iter().map(|(k, v)| (k.to_vec(), v)).collect())
     }
 }
 
@@ -457,6 +633,205 @@ mod tests {
         assert_eq!(state.indexed_keys().unwrap(), Vec::new());
     }
 
+    #[test]
+    fn sync_state_reports_every_digested_databases_fingerprint() {
+        let dir = temp_dir("sync-state");
+        let state = test_state_with_digest(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.create_index("material").unwrap();
+
+        let report = state.sync_state().unwrap();
+        assert_eq!(report.len(), 1);
+        assert_eq!(report[0].database, DB);
+        assert_eq!(report[0].indexed_keys, vec!["material".to_string()]);
+        assert_eq!(report[0].content_digest, db.content_digest().unwrap());
+    }
+
+    #[test]
+    fn sync_state_is_empty_when_no_database_has_a_content_digest() {
+        let dir = temp_dir("sync-state-no-digest");
+        // Plain `test_state` -- content digests disabled.
+        let state = test_state(&dir.0);
+        assert_eq!(state.sync_state().unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn change_source_chunk_digests_matches_the_worlds_own() {
+        let dir = temp_dir("change-source-chunk-digests");
+        let state = test_state(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.set(&[40, 0, 0], "material", Value::Str("dirt".into()))
+            .unwrap();
+
+        let mut got = state.chunk_digests(DB).unwrap();
+        got.sort();
+        let mut expected: Vec<(Vec<i32>, u64)> = db
+            .chunk_digests()
+            .unwrap()
+            .into_iter()
+            .map(|(k, v)| (k.to_vec(), v))
+            .collect();
+        expected.sort();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn change_source_chunk_digests_for_an_unseen_database_is_empty() {
+        let dir = temp_dir("change-source-chunk-digests-unseen");
+        let state = test_state(&dir.0);
+        assert_eq!(state.chunk_digests("never-created").unwrap(), Vec::new());
+    }
+
+    #[tokio::test]
+    async fn apply_sync_report_records_a_matching_comparison() {
+        let dir = temp_dir("sync-report-match");
+        let state = test_state_with_digest(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.create_index("material").unwrap();
+
+        let report = vec![kblockdbcluster::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: db.content_digest().unwrap(),
+            indexed_keys: vec!["material".to_string()],
+        }];
+        state.apply_sync_report(0xA, report).await;
+
+        let stored = state.peer_sync.lock().unwrap().get(&0xA).unwrap().clone();
+        assert_eq!(stored.databases.len(), 1);
+        assert!(stored.databases[0].content_in_sync);
+        assert!(stored.databases[0].indexed_keys_in_sync);
+    }
+
+    #[tokio::test]
+    async fn apply_sync_report_records_a_mismatch() {
+        let dir = temp_dir("sync-report-mismatch");
+        let state = test_state_with_digest(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.create_index("material").unwrap();
+
+        // Wrong digest, and an indexed-key set the peer doesn't have.
+        let report = vec![kblockdbcluster::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: db.content_digest().unwrap() ^ 1,
+            indexed_keys: vec![],
+        }];
+        state.apply_sync_report(0xB, report).await;
+
+        let stored = state.peer_sync.lock().unwrap().get(&0xB).unwrap().clone();
+        assert_eq!(stored.databases.len(), 1);
+        assert!(!stored.databases[0].content_in_sync);
+        assert!(!stored.databases[0].indexed_keys_in_sync);
+        assert_eq!(
+            stored.databases[0].local_indexed_keys,
+            vec!["material".to_string()]
+        );
+        assert_eq!(stored.databases[0].peer_indexed_keys, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn apply_sync_report_skips_a_database_with_no_local_digest() {
+        let dir = temp_dir("sync-report-no-local-digest");
+        // Note: plain `test_state`, not `test_state_with_digest` -- this
+        // server has no content digest enabled on `DB` at all.
+        let state = test_state(&dir.0);
+
+        let report = vec![kblockdbcluster::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: 42,
+            indexed_keys: vec![],
+        }];
+        state.apply_sync_report(0xC, report).await;
+
+        let stored = state.peer_sync.lock().unwrap().get(&0xC).unwrap().clone();
+        assert!(stored.databases.is_empty());
+    }
+
+    #[tokio::test]
+    async fn apply_sync_report_returns_the_mismatched_database() {
+        let dir = temp_dir("sync-report-returns-mismatch");
+        let state = test_state_with_digest(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+
+        let matching_report = vec![kblockdbcluster::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: db.content_digest().unwrap(),
+            indexed_keys: vec![],
+        }];
+        assert_eq!(
+            state.apply_sync_report(0xA, matching_report).await,
+            Vec::<String>::new()
+        );
+
+        let mismatched_report = vec![kblockdbcluster::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: db.content_digest().unwrap() ^ 1,
+            indexed_keys: vec![],
+        }];
+        assert_eq!(
+            state.apply_sync_report(0xA, mismatched_report).await,
+            vec![DB.to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_chunk_digests_records_exactly_which_chunks_differ() {
+        let dir = temp_dir("chunk-digests-diff");
+        let state = test_state_with_digest(&dir.0);
+        let db = state.databases.get(DB).unwrap();
+        db.set(&[0, 0, 0], "material", Value::Str("stone".into()))
+            .unwrap();
+        db.set(&[40, 0, 0], "material", Value::Str("dirt".into()))
+            .unwrap();
+        // Seed a prior sync-report entry for this peer/database, same as
+        // a real drill-down's request would have already recorded.
+        state.peer_sync.lock().unwrap().insert(
+            0xA,
+            PeerSyncStatus {
+                received_at_ms: 1,
+                databases: vec![DatabaseSyncStatus {
+                    database: DB.to_string(),
+                    content_in_sync: false,
+                    indexed_keys_in_sync: true,
+                    local_content_digest: 0,
+                    peer_content_digest: 1,
+                    local_indexed_keys: vec![],
+                    peer_indexed_keys: vec![],
+                    differing_chunks: None,
+                }],
+            },
+        );
+
+        let mut local = db.chunk_digests().unwrap().into_iter().collect::<Vec<_>>();
+        local.sort_by_key(|(k, _)| k.to_vec());
+        // The peer agrees on the chunk holding (0, 0, 0), disagrees on the
+        // chunk holding (40, 0, 0), and is missing a third chunk entirely.
+        let peer_digests: Vec<(Vec<i32>, u64)> = vec![
+            (local[0].0.to_vec(), local[0].1),
+            (local[1].0.to_vec(), local[1].1 ^ 1),
+            (vec![9, 9, 9], 0xDEAD),
+        ];
+
+        state
+            .apply_chunk_digests(0xA, DB.to_string(), peer_digests)
+            .await;
+
+        let stored = state.peer_sync.lock().unwrap().get(&0xA).unwrap().clone();
+        let differing = stored.databases[0].differing_chunks.clone().unwrap();
+        let mut expected = vec![local[1].0.to_vec(), vec![9, 9, 9]];
+        expected.sort();
+        assert_eq!(differing, expected);
+    }
+
     const DB: &str = "db";
 
     fn test_state(dir: &std::path::Path) -> AppState {
@@ -476,6 +851,20 @@ mod tests {
             },
         );
         AppState::new(databases, Arc::new(credentials))
+    }
+
+    /// `test_state`, with every database's content digest enabled -- for
+    /// tests exercising `sync_state`/`apply_sync_report`, which have
+    /// nothing to report or compare without one.
+    fn test_state_with_digest(dir: &std::path::Path) -> AppState {
+        let shape = WorldShape {
+            axes: 3,
+            world_dim: 100,
+            chunk_dim: 32,
+        };
+        let databases = Databases::new(dir, shape).with_content_digest(true);
+        databases.create(DB, None).unwrap();
+        AppState::new(databases, Arc::new(HashMap::new()))
     }
 
     struct TempDir(std::path::PathBuf);

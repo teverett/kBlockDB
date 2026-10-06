@@ -82,6 +82,7 @@ pub struct Databases {
     max_cached_chunks: Option<usize>,
     compression: bool,
     tombstone_retention: Option<std::time::Duration>,
+    content_digest: bool,
     open: Arc<Mutex<HashMap<String, Arc<World>>>>,
 }
 
@@ -94,6 +95,7 @@ impl Databases {
             max_cached_chunks: None,
             compression: false,
             tombstone_retention: None,
+            content_digest: false,
             open: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -121,6 +123,16 @@ impl Databases {
         self
     }
 
+    /// Makes every database maintain a content digest -- see
+    /// `World::with_content_digest`. Set only when clustering is on (a
+    /// standalone server has no peer to compare against, so the extra
+    /// per-write cost would buy nothing); `false` (the default) leaves it
+    /// off.
+    pub fn with_content_digest(mut self, enabled: bool) -> Self {
+        self.content_digest = enabled;
+        self
+    }
+
     pub fn default_shape(&self) -> WorldShape {
         self.default_shape
     }
@@ -129,7 +141,7 @@ impl Databases {
         self.data_dir.join(name)
     }
 
-    fn apply_settings(&self, world: World) -> World {
+    fn apply_settings(&self, world: World) -> io::Result<World> {
         let mut world = world
             .with_compression(self.compression)
             .with_tombstone_retention(self.tombstone_retention);
@@ -139,7 +151,7 @@ impl Databases {
         if let Some(n) = self.max_cached_chunks {
             world = world.with_max_cached_chunks(n);
         }
-        world
+        world.with_content_digest(self.content_digest)
     }
 
     fn table(&self) -> std::sync::MutexGuard<'_, HashMap<String, Arc<World>>> {
@@ -196,7 +208,7 @@ impl Databases {
                 "no such database '{name}' -- create it first"
             )));
         }
-        let world = Arc::new(self.apply_settings(World::open(&path)?));
+        let world = Arc::new(self.apply_settings(World::open(&path)?)?);
         Ok(table.entry(name.to_string()).or_insert(world).clone())
     }
 
@@ -226,7 +238,7 @@ impl Databases {
             shape.axes,
             shape.world_dim,
             shape.chunk_dim,
-        )?));
+        )?)?);
         table.insert(name.to_string(), world);
         drop(table);
         kblockdblib::logger::info(format!("created database '{name}' at {}", path.display()));
@@ -290,6 +302,14 @@ pub struct AppState {
     /// because it connected in -- with live link status (see
     /// `kblockdbcluster::peers`). `None` unless clustering is configured.
     pub peers: Option<kblockdbcluster::peers::PeerSet>,
+    /// The latest sync-comparison result received from each peer (keyed
+    /// by their cluster node id) -- see `cluster.rs`'s
+    /// `apply_sync_report`, which both logs any mismatch and records it
+    /// here, and `routes.rs`'s `/rest/cluster` surfacing. `Arc<Mutex<_>>`
+    /// (not tied to `replication`/`peers` being `Some`) so every clone of
+    /// this `AppState` shares the same map; empty until clustering is
+    /// configured and at least one peer has sent a `SyncReport`.
+    pub peer_sync: Arc<Mutex<HashMap<u64, crate::cluster::PeerSyncStatus>>>,
     credentials: Arc<HashMap<String, Account>>,
 }
 
@@ -300,6 +320,7 @@ impl AppState {
             hostname: Arc::from(os_hostname()),
             replication: None,
             peers: None,
+            peer_sync: Arc::new(Mutex::new(HashMap::new())),
             credentials,
         }
     }

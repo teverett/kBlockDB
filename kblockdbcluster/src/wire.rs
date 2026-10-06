@@ -48,10 +48,13 @@ pub const MAX_FRAME_LEN: u32 = 64 * 1024 * 1024;
 /// reasoning, applied here to peer links instead of end-user ones.
 /// Version 4 added stamps and version vectors; version 5 added `IndexOp`
 /// (cluster-wide `CREATE INDEX`/`DROP INDEX`/`REBUILD INDEX`); version 6
-/// added `IndexState` (catch-up for a peer that missed a live `IndexOp`).
-/// A server only links with a peer speaking exactly this version (see
-/// `server.rs`).
-pub const PEER_PROTOCOL_VERSION: u8 = 6;
+/// added `IndexState` (catch-up for a peer that missed a live `IndexOp`);
+/// version 7 added `SyncReport` (the periodic "do we actually hold the
+/// same data" check); version 8 added `ChunkDigestsRequest`/
+/// `ChunkDigests` (the on-mismatch drill-down that localizes which
+/// chunk(s) a `SyncReport` disagreement is in). A server only links with
+/// a peer speaking exactly this version (see `server.rs`).
+pub const PEER_PROTOCOL_VERSION: u8 = 8;
 
 /// `created`/`updated`/`version` as reported by the peer that originated
 /// this write -- applied verbatim by the receiving side (see
@@ -111,6 +114,19 @@ pub enum IndexOp {
     Rebuild,
 }
 
+/// One database's current fingerprint, as reported by `SyncReport` --
+/// what the sender's `source::ChangeSource::sync_state` returns for it.
+/// `content_digest` is `kblockdblib::World::content_digest()`'s value
+/// (always present: a report is only ever built for a database the
+/// sender maintains one for -- see `sync_state`'s doc comment), and
+/// `indexed_keys` its current `World::indexed_keys()`, sorted.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DatabaseSync {
+    pub database: String,
+    pub content_digest: u64,
+    pub indexed_keys: Vec<String>,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum PeerMessage {
     Hello {
@@ -168,6 +184,42 @@ pub enum PeerMessage {
     /// never drops anything merely for being absent from it, same
     /// one-way-only spirit as `IndexOp` itself.
     IndexState(Vec<(String, String)>),
+    /// The sender's current fingerprint for every database it holds a
+    /// content digest for -- see [`DatabaseSync`]. Sent periodically
+    /// (every 60s, independent of `Synced`'s own 5s cadence -- see
+    /// `client.rs`), compared by the receiver against its own local
+    /// state (`server.rs`'s `apply_sync_report`) to answer "do we
+    /// actually hold the same data," not just "have we seen the same
+    /// number of writes" (which equal version vectors already show).
+    /// Carries no stamp and isn't tracked by any catch-up -- like
+    /// `IndexOp`/`IndexState`, this is a diagnostic signal, not data
+    /// that must converge.
+    SyncReport(Vec<DatabaseSync>),
+    /// A reply to a drill-down request: the sender's
+    /// `kblockdblib::World::chunk_digests()` for one database, as `(chunk
+    /// key, digest)` pairs. Sent only when a `SyncReport` first showed a
+    /// `content_digest` mismatch for that database (see
+    /// `hub::publish_drill_down_request` and `client.rs`'s handling of
+    /// it) -- never on a routine cadence, since it costs the sender a
+    /// full scan (see `chunk_digests`'s own doc comment). The receiver
+    /// diffs this against its own `chunk_digests()` for the same
+    /// database to find exactly which chunk(s) differ (`server.rs`'s
+    /// `apply_chunk_digests`). Like `SyncReport`, this is a diagnostic
+    /// signal, not data that must converge.
+    ChunkDigests {
+        database: String,
+        digests: Vec<(Vec<i32>, u64)>,
+    },
+    /// Accepting side to connecting side, same direction as
+    /// `CatchUpRequest`: "your last `SyncReport` disagreed with me on
+    /// `database` -- send me your `chunk_digests()` for it." Sent right
+    /// after `apply_sync_report` finds a mismatch (see `server.rs`'s
+    /// `handle_connection`); the connecting side answers with exactly one
+    /// `ChunkDigests` for the same database (`client.rs`'s handling of
+    /// it).
+    ChunkDigestsRequest {
+        database: String,
+    },
 }
 
 #[derive(Debug, PartialEq)]
@@ -264,6 +316,31 @@ pub fn encode(msg: &PeerMessage) -> Vec<u8> {
                 put_string(&mut buf, key);
             }
         }
+        PeerMessage::SyncReport(reports) => {
+            buf.push(9);
+            buf.extend_from_slice(&(reports.len() as u32).to_le_bytes());
+            for report in reports {
+                put_string(&mut buf, &report.database);
+                buf.extend_from_slice(&report.content_digest.to_le_bytes());
+                buf.extend_from_slice(&(report.indexed_keys.len() as u32).to_le_bytes());
+                for key in &report.indexed_keys {
+                    put_string(&mut buf, key);
+                }
+            }
+        }
+        PeerMessage::ChunkDigests { database, digests } => {
+            buf.push(10);
+            put_string(&mut buf, database);
+            buf.extend_from_slice(&(digests.len() as u32).to_le_bytes());
+            for (chunk_key, digest) in digests {
+                put_coord(&mut buf, chunk_key);
+                buf.extend_from_slice(&digest.to_le_bytes());
+            }
+        }
+        PeerMessage::ChunkDigestsRequest { database } => {
+            buf.push(11);
+            put_string(&mut buf, database);
+        }
     }
     buf
 }
@@ -340,6 +417,36 @@ pub fn decode(payload: &[u8]) -> Result<PeerMessage, DecodeError> {
                 .collect::<Result<Vec<_>, DecodeError>>()?;
             Ok(PeerMessage::IndexState(entries))
         }
+        9 => {
+            let count = r.u32()? as usize;
+            let reports = (0..count)
+                .map(|_| {
+                    let database = r.string()?;
+                    let content_digest = r.u64()?;
+                    let key_count = r.u32()? as usize;
+                    let indexed_keys = (0..key_count)
+                        .map(|_| r.string())
+                        .collect::<Result<Vec<_>, DecodeError>>()?;
+                    Ok(DatabaseSync {
+                        database,
+                        content_digest,
+                        indexed_keys,
+                    })
+                })
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(PeerMessage::SyncReport(reports))
+        }
+        10 => {
+            let database = r.string()?;
+            let count = r.u32()? as usize;
+            let digests = (0..count)
+                .map(|_| Ok((r.coord()?, r.u64()?)))
+                .collect::<Result<Vec<_>, DecodeError>>()?;
+            Ok(PeerMessage::ChunkDigests { database, digests })
+        }
+        11 => Ok(PeerMessage::ChunkDigestsRequest {
+            database: r.string()?,
+        }),
         other => Err(DecodeError::UnknownTag(other)),
     }
 }
@@ -664,6 +771,45 @@ mod tests {
             ("other".to_string(), "density".to_string()),
         ]));
         roundtrip(PeerMessage::IndexState(vec![]));
+    }
+
+    #[test]
+    fn sync_report_round_trips() {
+        roundtrip(PeerMessage::SyncReport(vec![
+            DatabaseSync {
+                database: "demo".to_string(),
+                content_digest: 0xDEAD_BEEF_1234_5678,
+                indexed_keys: vec!["material".to_string(), "hardness".to_string()],
+            },
+            DatabaseSync {
+                database: "other".to_string(),
+                content_digest: 0,
+                indexed_keys: vec![],
+            },
+        ]));
+        roundtrip(PeerMessage::SyncReport(vec![]));
+    }
+
+    #[test]
+    fn chunk_digests_round_trips() {
+        roundtrip(PeerMessage::ChunkDigests {
+            database: "demo".to_string(),
+            digests: vec![
+                (vec![0, 0, 0], 0xDEAD_BEEF_1234_5678),
+                (vec![1, -2, 3, 0], 0),
+            ],
+        });
+        roundtrip(PeerMessage::ChunkDigests {
+            database: "demo".to_string(),
+            digests: vec![],
+        });
+    }
+
+    #[test]
+    fn chunk_digests_request_round_trips() {
+        roundtrip(PeerMessage::ChunkDigestsRequest {
+            database: "demo".to_string(),
+        });
     }
 
     #[test]

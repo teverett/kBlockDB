@@ -326,7 +326,11 @@ async fn main() {
                 .cluster_secret
                 .as_ref()
                 .map(|_| config.cluster.tombstone_retention()),
-        );
+        )
+        // Same reasoning: a content digest only matters once something
+        // (the periodic peer sync check) is actually going to compare it
+        // against another node's -- see `World::with_content_digest`.
+        .with_content_digest(config.cluster.cluster_secret.is_some());
     let existing = databases.list().unwrap_or_else(|e| {
         eprintln!("failed to read data directory {data_dir}: {e}");
         std::process::exit(1);

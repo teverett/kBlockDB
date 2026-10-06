@@ -95,6 +95,117 @@ const _: () = assert!(
 
 type ChunkKey = Coord;
 
+/// Name of the file at a world's root persisting its current content
+/// digest (see `World::with_content_digest`) -- 8 little-endian bytes,
+/// rewritten in full on every change (not appended -- a single `u64` has
+/// no history worth keeping).
+const CONTENT_DIGEST_FILE: &str = "content_digest.bin";
+
+/// A deterministic hash of one cell/key's full content -- its coordinate,
+/// key name, value, and metadata -- used as `World`'s content digest's
+/// per-entry contribution (see `ContentDigest`). Built from
+/// `DefaultHasher` directly, not `RandomState`/`HashMap`'s default: that
+/// one reseeds randomly per process, which would make two different
+/// server processes compute different hashes for identical content --
+/// useless for comparing one node's data against another's, the entire
+/// point here. `DefaultHasher::new()` uses fixed keys, so the same
+/// content always hashes the same way, on any node, any run.
+fn entry_digest(coord: &[i32], key: &str, value: &Value, meta: &CellMeta) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    coord.hash(&mut h);
+    key.hash(&mut h);
+    match value {
+        Value::Str(s) => {
+            0u8.hash(&mut h);
+            s.hash(&mut h);
+        }
+        Value::F64(f) => {
+            1u8.hash(&mut h);
+            f.to_bits().hash(&mut h);
+        }
+        Value::I64(n) => {
+            2u8.hash(&mut h);
+            n.hash(&mut h);
+        }
+        Value::Bool(b) => {
+            3u8.hash(&mut h);
+            b.hash(&mut h);
+        }
+    }
+    meta.created_at_ms.hash(&mut h);
+    meta.modified_at_ms.hash(&mut h);
+    meta.version.hash(&mut h);
+    h.finish()
+}
+
+/// A world's running content digest: the XOR of `entry_digest` over every
+/// currently-live cell/key -- order-independent (XOR doesn't care what
+/// order its operands arrive in), so it can be maintained incrementally,
+/// one write at a time, without ever needing every cell in memory or on
+/// disk at once the way recomputing it from a full scan would. Two worlds
+/// with the same digest almost certainly hold the same data; this is a
+/// checksum for catching accidental divergence (a missed replicated
+/// write, a bug, an out-of-band edit), not a cryptographic proof -- a
+/// coincidental XOR cancellation is possible in principle, vanishingly
+/// unlikely in practice with a 64-bit hash.
+///
+/// Persisted to `CONTENT_DIGEST_FILE` on every change -- cheap relative to
+/// the chunk file rewrite that already happens on every single-cell write
+/// (see `World`'s "Concurrency" doc comment), so there's no reason to
+/// defer it or batch it.
+struct ContentDigest {
+    value: Mutex<u64>,
+    path: PathBuf,
+}
+
+impl ContentDigest {
+    /// Loads a persisted digest from `path`, or (if nothing's there yet)
+    /// computes one from scratch via `backfill` and persists that --
+    /// `World::with_content_digest`'s one-time cost for a world that
+    /// already has data when the digest is first turned on, same spirit
+    /// as `create_index`'s backfill.
+    fn open(path: PathBuf, backfill: impl FnOnce() -> io::Result<u64>) -> io::Result<ContentDigest> {
+        let value = if path.exists() {
+            let bytes = fs::read(&path)?;
+            let bytes: [u8; 8] = bytes.try_into().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("corrupt {CONTENT_DIGEST_FILE}: expected 8 bytes"),
+                )
+            })?;
+            u64::from_le_bytes(bytes)
+        } else {
+            let value = backfill()?;
+            fs::write(&path, value.to_le_bytes())?;
+            value
+        };
+        Ok(ContentDigest {
+            value: Mutex::new(value),
+            path,
+        })
+    }
+
+    fn get(&self) -> u64 {
+        *self.value.lock().unwrap()
+    }
+
+    /// Folds in one entry's change: XORs out `old`'s contribution (if it
+    /// had one) and XORs in `new`'s (if it has one), persisting the
+    /// result.
+    fn update(&self, old: Option<u64>, new: Option<u64>) -> io::Result<()> {
+        let mut value = self.value.lock().unwrap();
+        if let Some(h) = old {
+            *value ^= h;
+        }
+        if let Some(h) = new {
+            *value ^= h;
+        }
+        fs::write(&self.path, value.to_le_bytes())
+    }
+}
+
 /// Milliseconds since the Unix epoch, for stamping `CellMeta` on every
 /// `set` -- the clock is read here, once per `set`/`set_region` call, and
 /// passed down to `Chunk::set` as a plain argument rather than read there,
@@ -407,6 +518,9 @@ pub struct World {
     /// (no keys indexed, zero overhead on every write) until a caller asks
     /// for one.
     value_index: ValueIndex,
+    /// This world's running content digest, if enabled (see
+    /// `with_content_digest`) -- `None` means disabled, the default.
+    content_digest: Option<ContentDigest>,
 }
 
 // `World` needs to be usable as `Arc<World>` shared across threads (see its
@@ -515,6 +629,7 @@ impl World {
             compression: false,
             tombstone_retention: None,
             value_index,
+            content_digest: None,
         })
     }
 
@@ -610,6 +725,61 @@ impl World {
     /// `with_compression`.
     pub fn compression(&self) -> bool {
         self.compression
+    }
+
+    /// Turns this world's content digest on or off -- off by default.
+    /// When on, every `set`/`remove` (and their region/replicated/batch
+    /// counterparts) updates a running digest of every currently-live
+    /// cell's content -- coordinate, key, value, and metadata -- so
+    /// `content_digest()` can answer "does this world's data match
+    /// another node's" without comparing cell by cell. Meant for a
+    /// clustered deployment's periodic sync check
+    /// (`kblockdbcluster`/`docs/clustering.md`), not for everyday use --
+    /// see `ContentDigest`'s doc comment for the digest itself and why
+    /// XOR makes it incremental.
+    ///
+    /// Off by default because it isn't free: unlike a secondary index
+    /// (paid only by the keys someone actually indexes), the digest
+    /// covers *every* key, so turning it on costs one extra in-memory
+    /// lookup -- the cell's *old* value and metadata, needed to remove
+    /// their old contribution before folding in the new one -- on every
+    /// write, for every key. Worth it only when something is actually
+    /// going to compare this world's digest against a peer's.
+    ///
+    /// Turning it on for the first time on a world that already has data
+    /// costs one `list_cells`-equivalent full scan, to compute a
+    /// starting value -- same one-time cost `create_index` pays for a
+    /// brand new index. After that, it's persisted (`content_digest.bin`
+    /// at the world root) and loaded directly on every later `open`, no
+    /// rescan needed. Turning it back off stops maintaining it but
+    /// leaves that file as-is (harmless, just unread while disabled) --
+    /// turning it on again later picks the old value back up rather than
+    /// rescanning again, which is correct exactly because disabled means
+    /// "stopped updating it," not "the data changed without it."
+    pub fn with_content_digest(mut self, enabled: bool) -> io::Result<Self> {
+        if !enabled {
+            self.content_digest = None;
+            return Ok(self);
+        }
+        if self.content_digest.is_none() {
+            let path = self.root.join(CONTENT_DIGEST_FILE);
+            self.content_digest = Some(ContentDigest::open(path, || {
+                let mut value = 0u64;
+                for cell in self.list_cells()? {
+                    for (key, cell_value, meta) in &cell.values {
+                        value ^= entry_digest(&cell.coord, key, cell_value, meta);
+                    }
+                }
+                Ok(value)
+            })?);
+        }
+        Ok(self)
+    }
+
+    /// This world's current content digest, or `None` if not enabled --
+    /// see `with_content_digest`.
+    pub fn content_digest(&self) -> Option<u64> {
+        self.content_digest.as_ref().map(ContentDigest::get)
     }
 
     /// Locks `schema` (recovering rather than panicking if a prior panic
@@ -746,16 +916,32 @@ impl World {
         let mut chunk_keys = Vec::new();
         collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
         let mut purged = 0u64;
+        let digested = self.digest_enabled();
         for ckey in &chunk_keys {
             // `with_chunk_write` is what makes this safe against
             // concurrent single-cell writes: it takes the same per-chunk
             // lock they do, and writes the chunk back out (or deletes it,
             // if this emptied it) exactly as they would.
-            if self.with_chunk_maybe_write(ckey, |chunk| {
+            let (removed, old_hashes) = self.with_chunk_maybe_write(ckey, |chunk| {
+                let old_hashes: Vec<u64> = digested
+                    .then(|| {
+                        chunk
+                            .column_entries(key_id)
+                            .into_iter()
+                            .map(|(local_idx, value, meta)| {
+                                entry_digest(&self.unsplit(ckey, local_idx), key, &value, &meta)
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
                 let removed = chunk.remove_column(key_id);
-                (removed, removed)
-            })? {
+                ((removed, old_hashes), removed)
+            })?;
+            if removed {
                 purged += 1;
+            }
+            for old_hash in old_hashes {
+                self.apply_digest_update(Some(old_hash), None);
             }
         }
         self.value_index.drop_index(key_id)?;
@@ -855,6 +1041,31 @@ impl World {
     ) {
         if let Err(e) = self.value_index.record(key_id, coord, old, new) {
             crate::logger::warn(format!("secondary index update failed at {coord:?}: {e}"));
+        }
+    }
+
+    /// Whether this world's content digest is enabled -- see
+    /// `with_content_digest`. A write-path call site checks this (cheap:
+    /// no locking, just reading an `Option`) to decide whether it's worth
+    /// fetching a cell/key's *old* value and metadata at all.
+    fn digest_enabled(&self) -> bool {
+        self.content_digest.is_some()
+    }
+
+    /// `ContentDigest::update`, logging (rather than propagating) a
+    /// failure -- the same "fall back, don't fail the write" stance
+    /// `record_index_change` takes, for the same reason: the digest is a
+    /// derived summary, not the data itself. `old`/`new` are already-
+    /// computed `entry_digest` hashes (or `None`, meaning "wasn't/isn't
+    /// set"), not raw values -- every call site computes them inline,
+    /// right where it already has the old and new value/metadata at
+    /// hand, rather than carrying clones of either out to here.
+    fn apply_digest_update(&self, old: Option<u64>, new: Option<u64>) {
+        let Some(digest) = &self.content_digest else {
+            return;
+        };
+        if let Err(e) = digest.update(old, new) {
+            crate::logger::warn(format!("content digest update failed: {e}"));
         }
     }
 
@@ -1001,6 +1212,60 @@ impl World {
         }
         cells.sort_by(|a, b| a.coord.iter().cmp(b.coord.iter()));
         Ok(cells)
+    }
+
+    /// Every currently non-empty chunk's own content digest -- the XOR of
+    /// `entry_digest` over just that chunk's live cells, keyed by the
+    /// chunk's own coordinate (not a cell coordinate -- see `split`'s doc
+    /// comment on what a chunk key means). A chunk with nothing live in
+    /// it has no entry at all, same as it has no file on disk.
+    ///
+    /// Unlike `content_digest()`, this is always available, whether or
+    /// not `with_content_digest` is enabled -- and it isn't incrementally
+    /// maintained: it's a full chunk-by-chunk scan, the same cost class
+    /// as `list_cells`, recomputed fresh on every call. Meant for
+    /// localizing a mismatch `content_digest()` already reported some
+    /// other way (see `docs/clustering.md`'s "Sync check"): comparing two
+    /// nodes' `chunk_digests()` for the same database pinpoints exactly
+    /// which chunk(s) differ, which the single whole-world digest can't
+    /// -- not for routine use, since it costs a full scan every time.
+    ///
+    /// XORing every value in the returned map together reproduces
+    /// exactly what `content_digest()` computes from the same data (both
+    /// use the same per-entry hash, just grouped differently -- XOR
+    /// doesn't care about grouping), so a whole-database mismatch is
+    /// guaranteed to show up as a difference somewhere in this map too:
+    /// either a shared chunk key with a different value, or a chunk
+    /// present on only one side.
+    pub fn chunk_digests(&self) -> io::Result<HashMap<Coord, u64>> {
+        let mut chunk_keys = Vec::new();
+        collect_chunk_keys(&self.root, self.axes, &mut Vec::new(), &mut chunk_keys)?;
+        let key_names: Vec<Option<String>> = {
+            let schema = self.schema();
+            (0..schema.id_space() as u32)
+                .map(|id| schema.key_for_id(id).map(str::to_string))
+                .collect()
+        };
+        let mut out = HashMap::new();
+        for ckey in &chunk_keys {
+            let entries_by_cell = self.with_chunk_read(ckey, Chunk::entries_by_local_idx)?;
+            let mut digest = 0u64;
+            let mut any = false;
+            for (local_idx, entries) in entries_by_cell {
+                let coord = self.unsplit(ckey, local_idx);
+                for (key_id, value, meta) in entries {
+                    let Some(name) = key_names.get(key_id as usize).and_then(Clone::clone) else {
+                        continue;
+                    };
+                    digest ^= entry_digest(&coord, &name, &value, &meta);
+                    any = true;
+                }
+            }
+            if any {
+                out.insert(ckey.clone(), digest);
+            }
+        }
+        Ok(out)
     }
 
     /// This single coordinate's full cell state (every key set there,
@@ -1412,16 +1677,27 @@ impl World {
         // before touching any chunk, as a normal `InvalidInput` error.
         let key_id = self.schema().intern(key, value.value_type())?;
         let now_ms = now_ms();
-        // Only indexed keys pay for reading the old value back out of the
-        // chunk before overwriting it -- see `create_index`'s doc comment
-        // on the "zero overhead for unindexed keys" guarantee.
+        // Only indexed keys (or, below, a digest-enabled world) pay for
+        // reading the old value back out of the chunk before overwriting
+        // it -- see `create_index`'s doc comment on the "zero overhead
+        // for unindexed keys" guarantee.
         let indexed = self.value_index.is_indexed(key_id);
+        let digested = self.digest_enabled();
         let new_value_for_index = indexed.then(|| value.clone());
-        let (result, old_value) = self.with_chunk_write(&ckey, |chunk| {
-            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+        let new_value_for_digest = digested.then(|| value.clone());
+        let ((meta, stamp), old_value, old_hash) = self.with_chunk_write(&ckey, |chunk| {
+            let old_value = (indexed || digested).then(|| chunk.get(local_idx, key_id)).flatten();
+            let old_hash = digested
+                .then(|| {
+                    old_value
+                        .as_ref()
+                        .zip(chunk.get_meta(local_idx, key_id))
+                        .map(|(v, m)| entry_digest(coord, key, v, &m))
+                })
+                .flatten();
             let stamp = stamp();
             let meta = chunk.set_stamped(local_idx, key_id, value, now_ms, stamp);
-            ((meta, stamp), old_value)
+            ((meta, stamp), old_value, old_hash)
         })?;
         if indexed {
             self.record_index_change(
@@ -1431,7 +1707,11 @@ impl World {
                 new_value_for_index.as_ref(),
             );
         }
-        Ok(result)
+        if digested {
+            let new_hash = new_value_for_digest.map(|v| entry_digest(coord, key, &v, &meta));
+            self.apply_digest_update(old_hash, new_hash);
+        }
+        Ok((meta, stamp))
     }
 
     /// Applies a replicated write -- `value`/`meta` as reported by the
@@ -1475,11 +1755,21 @@ impl World {
         let (ckey, local_idx) = self.split(coord)?;
         let key_id = self.schema().intern(key, value.value_type())?;
         let indexed = self.value_index.is_indexed(key_id);
+        let digested = self.digest_enabled();
         let new_value_for_index = indexed.then(|| value.clone());
-        let (wins, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
-            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+        let new_value_for_digest = digested.then(|| value.clone());
+        let (wins, old_value, old_hash) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = (indexed || digested).then(|| chunk.get(local_idx, key_id)).flatten();
+            let old_hash = digested
+                .then(|| {
+                    old_value
+                        .as_ref()
+                        .zip(chunk.get_meta(local_idx, key_id))
+                        .map(|(v, m)| entry_digest(coord, key, v, &m))
+                })
+                .flatten();
             let wins = apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp);
-            ((wins, old_value), wins)
+            ((wins, old_value, old_hash), wins)
         })?;
         if indexed && wins {
             self.record_index_change(
@@ -1488,6 +1778,10 @@ impl World {
                 old_value.as_ref(),
                 new_value_for_index.as_ref(),
             );
+        }
+        if digested && wins {
+            let new_hash = new_value_for_digest.map(|v| entry_digest(coord, key, &v, &meta));
+            self.apply_digest_update(old_hash, new_hash);
         }
         Ok(wins)
     }
@@ -1524,9 +1818,18 @@ impl World {
             return Ok(false); // never interned anywhere: nothing to remove
         };
         let indexed = self.value_index.is_indexed(key_id);
+        let digested = self.digest_enabled();
         let keep_tombstones = self.tombstone_retention.is_some();
-        let (wins, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
-            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+        let (wins, old_value, old_hash) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = (indexed || digested).then(|| chunk.get(local_idx, key_id)).flatten();
+            let old_hash = digested
+                .then(|| {
+                    old_value
+                        .as_ref()
+                        .zip(chunk.get_meta(local_idx, key_id))
+                        .map(|(v, m)| entry_digest(coord, key, v, &m))
+                })
+                .flatten();
             let wins = apply_remove_if_newer(
                 chunk,
                 local_idx,
@@ -1535,10 +1838,13 @@ impl World {
                 stamp,
                 keep_tombstones,
             );
-            ((wins, old_value), wins)
+            ((wins, old_value, old_hash), wins)
         })?;
         if indexed && wins {
             self.record_index_change(key_id, &Coord::from(coord), old_value.as_ref(), None);
+        }
+        if digested && wins {
+            self.apply_digest_update(old_hash, None);
         }
         Ok(wins)
     }
@@ -1589,10 +1895,11 @@ impl World {
                     chunk_order.push(ckey);
                     Vec::new()
                 })
-                .push((i, local_idx, key_id, change.kind, change.stamp));
+                .push((i, local_idx, key_id, change.key, change.kind, change.stamp));
         }
 
         let keep_tombstones = self.tombstone_retention.is_some();
+        let digested = self.digest_enabled();
         for ckey in chunk_order {
             let group = by_chunk.remove(&ckey).unwrap_or_default();
             let indices: Vec<usize> = group.iter().map(|(i, ..)| *i).collect();
@@ -1607,12 +1914,23 @@ impl World {
                 let mut applied: Vec<bool> = Vec::with_capacity(group.len());
                 let mut index_updates: Vec<(usize, u32, Option<Value>, Option<Value>)> =
                     Vec::new();
-                for (_, local_idx, key_id, kind, stamp) in group {
+                let mut digest_updates: Vec<(Option<u64>, Option<u64>)> = Vec::new();
+                for (_, local_idx, key_id, key, kind, stamp) in group {
                     let indexed = self.value_index.is_indexed(key_id);
-                    let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+                    let old_value = (indexed || digested)
+                        .then(|| chunk.get(local_idx, key_id))
+                        .flatten();
+                    let old_hash = digested
+                        .then(|| {
+                            old_value.as_ref().zip(chunk.get_meta(local_idx, key_id)).map(
+                                |(v, m)| entry_digest(&self.unsplit(&ckey, local_idx), &key, v, &m),
+                            )
+                        })
+                        .flatten();
                     let wins = match kind {
                         ChangeKind::Set(value, meta) => {
                             let new_for_index = indexed.then(|| value.clone());
+                            let new_for_digest = digested.then(|| value.clone());
                             let wins =
                                 apply_set_if_newer(chunk, local_idx, key_id, value, meta, stamp);
                             if indexed && wins {
@@ -1622,6 +1940,12 @@ impl World {
                                     old_value.clone(),
                                     new_for_index,
                                 ));
+                            }
+                            if digested && wins {
+                                let new_hash = new_for_digest.map(|v| {
+                                    entry_digest(&self.unsplit(&ckey, local_idx), &key, &v, &meta)
+                                });
+                                digest_updates.push((old_hash, new_hash));
                             }
                             wins
                         }
@@ -1637,16 +1961,19 @@ impl World {
                             if indexed && wins {
                                 index_updates.push((local_idx, key_id, old_value.clone(), None));
                             }
+                            if digested && wins {
+                                digest_updates.push((old_hash, None));
+                            }
                             wins
                         }
                     };
                     applied.push(wins);
                 }
                 let changed = applied.iter().any(|&a| a);
-                ((applied, index_updates), changed)
+                ((applied, index_updates, digest_updates), changed)
             });
             match outcome {
-                Ok((applied, index_updates)) => {
+                Ok((applied, index_updates, digest_updates)) => {
                     for (local_idx, key_id, old, new) in index_updates {
                         self.record_index_change(
                             key_id,
@@ -1654,6 +1981,9 @@ impl World {
                             old.as_ref(),
                             new.as_ref(),
                         );
+                    }
+                    for (old_hash, new_hash) in digest_updates {
+                        self.apply_digest_update(old_hash, new_hash);
                     }
                     for (i, applied) in indices.into_iter().zip(applied) {
                         results[i] = Some(Ok(applied));
@@ -1709,14 +2039,26 @@ impl World {
         let at_ms = now_ms();
         let keep_tombstones = self.tombstone_retention.is_some();
         let indexed = self.value_index.is_indexed(key_id);
-        let (removed, old_value) = self.with_chunk_maybe_write(&ckey, |chunk| {
-            let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+        let digested = self.digest_enabled();
+        let (removed, old_value, old_hash) = self.with_chunk_maybe_write(&ckey, |chunk| {
+            let old_value = (indexed || digested).then(|| chunk.get(local_idx, key_id)).flatten();
+            let old_hash = digested
+                .then(|| {
+                    old_value
+                        .as_ref()
+                        .zip(chunk.get_meta(local_idx, key_id))
+                        .map(|(v, m)| entry_digest(coord, key, v, &m))
+                })
+                .flatten();
             let removed = remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp);
             let changed = removed.is_some();
-            ((removed, old_value), changed)
+            ((removed, old_value, old_hash), changed)
         })?;
         if indexed && removed.is_some() {
             self.record_index_change(key_id, &Coord::from(coord), old_value.as_ref(), None);
+        }
+        if digested && removed.is_some() {
+            self.apply_digest_update(old_hash, None);
         }
         crate::logger::info(format!("removed key '{key}' at {coord:?}"));
         Ok(removed.map(|stamp| (at_ms, stamp)))
@@ -1864,6 +2206,7 @@ impl World {
         let key_id = self.schema().intern(key, value_type)?;
         let now_ms = now_ms();
         let indexed = self.value_index.is_indexed(key_id);
+        let digested = self.digest_enabled();
         let mut metas = vec![
             (
                 CellMeta {
@@ -1876,11 +2219,22 @@ impl World {
             volume
         ];
         let mut index_updates: Vec<(Coord, Option<Value>, Option<Value>)> = Vec::new();
+        let mut digest_updates: Vec<(Option<u64>, Option<u64>)> = Vec::new();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
-            let updates = self.with_chunk_write(&ckey, |chunk| {
+            let (updates, deltas) = self.with_chunk_write(&ckey, |chunk| {
                 let mut updates = Vec::new();
+                let mut deltas = Vec::new();
                 for (i, local_idx) in cells {
-                    let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+                    let old_value = (indexed || digested)
+                        .then(|| chunk.get(local_idx, key_id))
+                        .flatten();
+                    let old_hash = digested
+                        .then(|| {
+                            old_value.as_ref().zip(chunk.get_meta(local_idx, key_id)).map(
+                                |(v, m)| entry_digest(&self.unsplit(&ckey, local_idx), key, v, &m),
+                            )
+                        })
+                        .flatten();
                     let stamp = stamp();
                     let meta =
                         chunk.set_stamped(local_idx, key_id, values[i].clone(), now_ms, stamp);
@@ -1892,13 +2246,26 @@ impl World {
                             Some(values[i].clone()),
                         ));
                     }
+                    if digested {
+                        let new_hash = entry_digest(
+                            &self.unsplit(&ckey, local_idx),
+                            key,
+                            &values[i],
+                            &meta,
+                        );
+                        deltas.push((old_hash, Some(new_hash)));
+                    }
                 }
-                updates
+                (updates, deltas)
             })?;
             index_updates.extend(updates);
+            digest_updates.extend(deltas);
         }
         for (coord, old, new) in index_updates {
             self.record_index_change(key_id, &coord, old.as_ref(), new.as_ref());
+        }
+        for (old_hash, new_hash) in digest_updates {
+            self.apply_digest_update(old_hash, new_hash);
         }
         crate::logger::info(format!(
             "set region {region:?} key '{key}' from {volume} per-cell values"
@@ -1941,21 +2308,33 @@ impl World {
         };
         let keep_tombstones = self.tombstone_retention.is_some();
         let indexed = self.value_index.is_indexed(key_id);
+        let digested = self.digest_enabled();
         for (ckey, cells) in self.group_region_by_chunk(region)? {
             let removed_here = self.with_chunk_maybe_write(&ckey, |chunk| {
-                let removed_here: Vec<(usize, Stamp, Option<Value>)> = cells
+                let removed_here: Vec<(usize, Stamp, Option<Value>, Option<u64>)> = cells
                     .into_iter()
                     .filter_map(|(_, local_idx)| {
-                        let old_value = indexed.then(|| chunk.get(local_idx, key_id)).flatten();
+                        let old_value = (indexed || digested)
+                            .then(|| chunk.get(local_idx, key_id))
+                            .flatten();
+                        let old_hash = digested
+                            .then(|| {
+                                old_value.as_ref().zip(chunk.get_meta(local_idx, key_id)).map(
+                                    |(v, m)| {
+                                        entry_digest(&self.unsplit(&ckey, local_idx), key, v, &m)
+                                    },
+                                )
+                            })
+                            .flatten();
                         remove_stamping(chunk, local_idx, key_id, at_ms, keep_tombstones, stamp)
-                            .map(|stamp| (local_idx, stamp, old_value))
+                            .map(|stamp| (local_idx, stamp, old_value, old_hash))
                     })
                     .collect();
                 let changed = !removed_here.is_empty();
                 (removed_here, changed)
             })?;
             if indexed {
-                for (local_idx, _, old_value) in &removed_here {
+                for (local_idx, _, old_value, _) in &removed_here {
                     self.record_index_change(
                         key_id,
                         &self.unsplit(&ckey, *local_idx),
@@ -1964,10 +2343,15 @@ impl World {
                     );
                 }
             }
+            if digested {
+                for (_, _, _, old_hash) in &removed_here {
+                    self.apply_digest_update(*old_hash, None);
+                }
+            }
             removed.cells.extend(
                 removed_here
                     .into_iter()
-                    .map(|(local_idx, stamp, _)| (self.unsplit(&ckey, local_idx), stamp)),
+                    .map(|(local_idx, stamp, ..)| (self.unsplit(&ckey, local_idx), stamp)),
             );
         }
         crate::logger::info(format!(
@@ -2000,8 +2384,11 @@ impl World {
 }
 
 /// One change in `World::apply_changes`, resolved against its chunk:
-/// (input index, local cell index, key id, the change, its stamp).
-type PendingChange = (usize, usize, u32, ChangeKind, Stamp);
+/// (input index, local cell index, key id, key name, the change, its
+/// stamp). The key name is carried alongside the id (a small, cheap
+/// clone) only so a digest-enabled world can compute `entry_digest`
+/// without a second schema lookup per change.
+type PendingChange = (usize, usize, u32, String, ChangeKind, Stamp);
 
 /// Converts `value` to `target`'s type if it can possibly equal a value of
 /// that type, mirroring the numeric cross-type equality `kblockdbquery`'s
@@ -5534,5 +5921,409 @@ mod tests {
         w.create_index("material").unwrap();
 
         assert_eq!(w.lookup_eq("material", &Value::Bool(true)), Some(vec![]));
+    }
+
+    // --- Content digest ---
+
+    #[test]
+    fn disabled_by_default_content_digest_is_none() {
+        let dir = TempDir::new("digest-disabled-default");
+        let w = create(&dir);
+        assert_eq!(w.content_digest(), None);
+    }
+
+    #[test]
+    fn enabling_an_empty_world_starts_at_a_fixed_baseline() {
+        let dir = TempDir::new("digest-empty-baseline");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        // An empty world's digest is the XOR of nothing: zero, every
+        // time, on every node -- the trivial but real baseline every
+        // write then moves away from.
+        assert_eq!(w.content_digest(), Some(0));
+    }
+
+    #[test]
+    fn a_set_changes_the_digest_and_a_matching_remove_undoes_it() {
+        let dir = TempDir::new("digest-set-remove");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let empty = w.content_digest().unwrap();
+
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let after_set = w.content_digest().unwrap();
+        assert_ne!(after_set, empty);
+
+        w.remove(&coord3(0, 0, 0), "material").unwrap();
+        assert_eq!(w.content_digest(), Some(empty));
+    }
+
+    #[test]
+    fn two_worlds_with_identical_data_written_in_different_orders_agree() {
+        // The whole point of an XOR digest: order-independent. Two
+        // worlds that end up holding the same data, even via writes in a
+        // different order (as two real cluster nodes applying the same
+        // changes via different replication paths might), must land on
+        // the same digest. Uses `apply_replicated` with an explicit,
+        // identical `CellMeta` for both worlds rather than `set` (which
+        // stamps each write with the real wall clock) -- the digest
+        // hashes metadata too, so comparing two independently-timed
+        // `set` calls for equality would be comparing real timestamps
+        // that have no reason to match, not testing this property.
+        let dir_a = TempDir::new("digest-order-a");
+        let dir_b = TempDir::new("digest-order-b");
+        let a = create(&dir_a).with_content_digest(true).unwrap();
+        let b = create(&dir_b).with_content_digest(true).unwrap();
+        let meta = CellMeta {
+            created_at_ms: 100,
+            modified_at_ms: 100,
+            version: 0,
+        };
+
+        a.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), meta)
+            .unwrap();
+        a.apply_replicated(&coord3(1, 0, 0), "material", Value::Str("dirt".into()), meta)
+            .unwrap();
+        b.apply_replicated(&coord3(1, 0, 0), "material", Value::Str("dirt".into()), meta)
+            .unwrap();
+        b.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), meta)
+            .unwrap();
+
+        assert_eq!(a.content_digest(), b.content_digest());
+    }
+
+    #[test]
+    fn a_different_value_at_the_same_cell_changes_the_digest() {
+        let dir_a = TempDir::new("digest-differs-a");
+        let dir_b = TempDir::new("digest-differs-b");
+        let a = create(&dir_a).with_content_digest(true).unwrap();
+        let b = create(&dir_b).with_content_digest(true).unwrap();
+
+        a.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        b.set(&coord3(0, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+
+        assert_ne!(a.content_digest(), b.content_digest());
+    }
+
+    #[test]
+    fn overwriting_a_cell_folds_out_the_old_value_and_in_the_new_one() {
+        let dir = TempDir::new("digest-overwrite");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let after_stone = w.content_digest().unwrap();
+
+        w.set(&coord3(0, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        let after_dirt = w.content_digest().unwrap();
+        assert_ne!(after_stone, after_dirt);
+
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        // Back to the same value -- metadata (version, timestamps)
+        // changed along the way, but a fresh third write landing on the
+        // original value again isn't required to reproduce the exact
+        // same digest, since metadata is part of what's hashed. Just
+        // confirm it moved again, consistently.
+        assert_ne!(w.content_digest(), Some(after_dirt));
+    }
+
+    #[test]
+    fn set_region_and_remove_region_update_the_digest() {
+        let dir = TempDir::new("digest-region");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let empty = w.content_digest().unwrap();
+
+        let region = Region::new([0, 0, 0], [2, 1, 1]);
+        w.set_region(
+            &region,
+            "material",
+            &[Value::Str("stone".into()), Value::Str("dirt".into())],
+        )
+        .unwrap();
+        let after_set = w.content_digest().unwrap();
+        assert_ne!(after_set, empty);
+
+        w.remove_region(&region, "material").unwrap();
+        assert_eq!(w.content_digest(), Some(empty));
+    }
+
+    #[test]
+    fn apply_replicated_and_apply_replicated_remove_update_the_digest() {
+        let dir = TempDir::new("digest-replicated");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let empty = w.content_digest().unwrap();
+
+        let meta = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        w.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), meta)
+            .unwrap();
+        assert_ne!(w.content_digest(), Some(empty));
+
+        w.apply_replicated_remove(&coord3(0, 0, 0), "material", 2)
+            .unwrap();
+        assert_eq!(w.content_digest(), Some(empty));
+    }
+
+    #[test]
+    fn a_replicated_write_that_loses_last_write_wins_does_not_change_the_digest() {
+        let dir = TempDir::new("digest-replicated-loses");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let newer = CellMeta {
+            created_at_ms: 100,
+            modified_at_ms: 100,
+            version: 0,
+        };
+        w.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), newer)
+            .unwrap();
+        let after_newer = w.content_digest().unwrap();
+
+        // Older than what's already there -- discarded, so the digest
+        // must not move.
+        let older = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        let applied = w
+            .apply_replicated(&coord3(0, 0, 0), "material", Value::Str("dirt".into()), older)
+            .unwrap();
+        assert!(!applied);
+        assert_eq!(w.content_digest(), Some(after_newer));
+    }
+
+    #[test]
+    fn apply_changes_batch_updates_the_digest() {
+        let dir = TempDir::new("digest-apply-changes");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let empty = w.content_digest().unwrap();
+
+        let meta = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        let results = w.apply_changes(vec![
+            Change {
+                coord: coord3(0, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Set(Value::Str("stone".into()), meta),
+                stamp: Stamp::NONE,
+            },
+            Change {
+                coord: coord3(1, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Set(Value::Str("dirt".into()), meta),
+                stamp: Stamp::NONE,
+            },
+        ]);
+        assert!(results.iter().all(|r| *r.as_ref().unwrap()));
+        let after_batch = w.content_digest().unwrap();
+        assert_ne!(after_batch, empty);
+
+        let remove_results = w.apply_changes(vec![
+            Change {
+                coord: coord3(0, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Removed(2),
+                stamp: Stamp::NONE,
+            },
+            Change {
+                coord: coord3(1, 0, 0),
+                key: "material".into(),
+                kind: ChangeKind::Removed(2),
+                stamp: Stamp::NONE,
+            },
+        ]);
+        assert!(remove_results.iter().all(|r| *r.as_ref().unwrap()));
+        assert_eq!(w.content_digest(), Some(empty));
+    }
+
+    #[test]
+    fn remove_column_folds_out_every_cell_it_held() {
+        let dir = TempDir::new("digest-remove-column");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        let empty = w.content_digest().unwrap();
+
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(1, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        assert_ne!(w.content_digest(), Some(empty));
+
+        w.remove_column("material").unwrap();
+        assert_eq!(w.content_digest(), Some(empty));
+    }
+
+    #[test]
+    fn enabling_the_digest_on_a_world_with_existing_data_backfills_it() {
+        let dir = TempDir::new("digest-backfill");
+        let w = create(&dir);
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(1, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+
+        // Computed independently, straight from `list_cells`, before
+        // `with_content_digest` ever runs -- not compared against a
+        // second `World`'s own live-maintained digest, since two
+        // separately-created worlds would pick up different real
+        // wall-clock timestamps in their `CellMeta` (which the digest
+        // hashes) and could never match on that basis alone.
+        let mut expected = 0u64;
+        for cell in w.list_cells().unwrap() {
+            for (key, value, meta) in &cell.values {
+                expected ^= entry_digest(&cell.coord, key, value, meta);
+            }
+        }
+
+        let w = w.with_content_digest(true).unwrap();
+        assert_eq!(w.content_digest(), Some(expected));
+        assert_ne!(expected, 0);
+    }
+
+    #[test]
+    fn a_content_digest_survives_closing_and_reopening_the_world() {
+        let dir = TempDir::new("digest-reopen");
+        let before = {
+            let w = create(&dir).with_content_digest(true).unwrap();
+            w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+                .unwrap();
+            w.content_digest().unwrap()
+        };
+
+        // A brand new `World` over the same directory, with the digest
+        // turned on again -- this can only report the same value by
+        // having read `content_digest.bin` back, not from any in-memory
+        // state carried over.
+        let w = World::open(&dir).unwrap().with_content_digest(true).unwrap();
+        assert_eq!(w.content_digest(), Some(before));
+    }
+
+    #[test]
+    fn disabling_then_reenabling_the_digest_picks_up_where_it_left_off() {
+        let dir = TempDir::new("digest-disable-reenable");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let value = w.content_digest().unwrap();
+
+        let w = w.with_content_digest(false).unwrap();
+        assert_eq!(w.content_digest(), None);
+
+        let w = w.with_content_digest(true).unwrap();
+        assert_eq!(w.content_digest(), Some(value));
+    }
+
+    #[test]
+    fn a_write_to_an_unrelated_key_does_not_change_the_digest_of_a_removed_one() {
+        // Sanity check that per-entry hashing really is scoped by key
+        // name, not just coordinate -- two different keys at the same
+        // cell must contribute independently.
+        let dir = TempDir::new("digest-independent-keys");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        let after_material = w.content_digest().unwrap();
+
+        w.set(&coord3(0, 0, 0), "hardness", Value::I64(7)).unwrap();
+        let after_hardness = w.content_digest().unwrap();
+        assert_ne!(after_material, after_hardness);
+
+        w.remove(&coord3(0, 0, 0), "hardness").unwrap();
+        assert_eq!(w.content_digest(), Some(after_material));
+    }
+
+    // --- Chunk digests ---
+
+    #[test]
+    fn chunk_digests_is_empty_for_an_empty_world() {
+        let dir = TempDir::new("chunk-digests-empty");
+        let w = create(&dir);
+        assert!(w.chunk_digests().unwrap().is_empty());
+    }
+
+    #[test]
+    fn chunk_digests_does_not_require_content_digest_to_be_enabled() {
+        let dir = TempDir::new("chunk-digests-no-flag-needed");
+        let w = create(&dir); // content digest left off
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        assert_eq!(w.chunk_digests().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn chunk_digests_has_one_entry_per_non_empty_chunk() {
+        let dir = TempDir::new("chunk-digests-per-chunk");
+        let w = create(&dir);
+        // Same chunk (default chunk_dim 32).
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(1, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        // A different chunk.
+        w.set(&coord3(100, 0, 0), "material", Value::Str("sand".into()))
+            .unwrap();
+
+        assert_eq!(w.chunk_digests().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn chunk_digests_xor_together_to_the_whole_database_digest() {
+        let dir = TempDir::new("chunk-digests-xor-to-whole");
+        let w = create(&dir).with_content_digest(true).unwrap();
+        w.set(&coord3(0, 0, 0), "material", Value::Str("stone".into()))
+            .unwrap();
+        w.set(&coord3(100, 0, 0), "material", Value::Str("dirt".into()))
+            .unwrap();
+        w.set(&coord3(-50, 7, 0), "hardness", Value::I64(3))
+            .unwrap();
+
+        let combined = w.chunk_digests().unwrap().values().fold(0u64, |a, &b| a ^ b);
+        assert_eq!(Some(combined), w.content_digest());
+    }
+
+    #[test]
+    fn a_different_value_in_one_chunk_changes_only_that_chunks_digest() {
+        let dir_a = TempDir::new("chunk-digests-differ-a");
+        let dir_b = TempDir::new("chunk-digests-differ-b");
+        let a = create(&dir_a);
+        let b = create(&dir_b);
+        let meta = CellMeta {
+            created_at_ms: 1,
+            modified_at_ms: 1,
+            version: 0,
+        };
+        // Same chunk, same everything, on both.
+        a.apply_replicated(&coord3(100, 0, 0), "material", Value::Str("dirt".into()), meta)
+            .unwrap();
+        b.apply_replicated(&coord3(100, 0, 0), "material", Value::Str("dirt".into()), meta)
+            .unwrap();
+        // A different chunk -- different value on each.
+        a.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("stone".into()), meta)
+            .unwrap();
+        b.apply_replicated(&coord3(0, 0, 0), "material", Value::Str("sand".into()), meta)
+            .unwrap();
+
+        let (digests_a, digests_b) = (a.chunk_digests().unwrap(), b.chunk_digests().unwrap());
+        // Chunk *keys* are coordinates divided by `chunk_dim` (see
+        // `split`), not cell coordinates -- (100, 0, 0) at the default
+        // chunk_dim (32) falls in chunk key (3, 0, 0).
+        let shared_chunk = coord3(100i32.div_euclid(DEFAULT_CHUNK_DIM as i32), 0, 0);
+        let differing_chunk = coord3(0, 0, 0);
+        assert_eq!(
+            digests_a.get(&shared_chunk),
+            digests_b.get(&shared_chunk),
+            "the untouched-by-the-difference chunk must still match"
+        );
+        assert_ne!(
+            digests_a.get(&differing_chunk),
+            digests_b.get(&differing_chunk),
+            "the chunk holding the differing value must disagree"
+        );
     }
 }

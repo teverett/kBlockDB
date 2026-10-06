@@ -6,7 +6,7 @@
 //! connecting side.
 
 use crate::peers::PeerSet;
-use crate::wire::{ChangeEntry, ChangeOp, IndexOp, PeerMessage};
+use crate::wire::{ChangeEntry, ChangeOp, DatabaseSync, IndexOp, PeerMessage};
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use tokio::net::{TcpListener, TcpStream};
@@ -68,6 +68,44 @@ pub trait ReplicationSink: Clone + Send + Sync + 'static {
     ) -> impl Future<Output = Result<(), String>> + Send {
         let _ = (database, key, op);
         async move { Ok(()) }
+    }
+
+    /// Records `from_node`'s periodic sync report (see
+    /// `wire::PeerMessage::SyncReport`/`source::ChangeSource::sync_state`)
+    /// -- normally by comparing each database's reported content digest
+    /// and indexed-key set against this process's own current ones, and
+    /// logging (or otherwise surfacing, e.g. for a REST status endpoint)
+    /// any mismatch. Returns the names of whichever databases disagreed
+    /// on content (not indexed keys -- those don't localize to a chunk):
+    /// `handle_connection` asks `from_node` for a `ChunkDigests` drill-down
+    /// on each one it gets back (see `wire::PeerMessage::
+    /// ChunkDigestsRequest`). The default does nothing and reports no
+    /// mismatch: an embedder with no concept of a content digest has
+    /// nothing meaningful to compare `report` against.
+    fn apply_sync_report(
+        &self,
+        from_node: u64,
+        report: Vec<DatabaseSync>,
+    ) -> impl Future<Output = Vec<String>> + Send {
+        let _ = (from_node, report);
+        async move { Vec::new() }
+    }
+
+    /// Diffs `digests` -- `from_node`'s `chunk_digests()` for `database`,
+    /// sent in reply to this process's `ChunkDigestsRequest` -- against
+    /// this process's own, to find exactly which chunk(s) a whole-database
+    /// `apply_sync_report` mismatch is in, and surfaces the result however
+    /// the embedder sees fit (logging, a REST status endpoint, ...). The
+    /// default does nothing: an embedder with no concept of a chunk digest
+    /// has nothing to compare `digests` against.
+    fn apply_chunk_digests(
+        &self,
+        from_node: u64,
+        database: String,
+        digests: Vec<(Vec<i32>, u64)>,
+    ) -> impl Future<Output = ()> + Send {
+        let _ = (from_node, database, digests);
+        async move {}
     }
 }
 
@@ -251,10 +289,28 @@ async fn handle_connection<S: ReplicationSink>(
                     }
                 }
             }
-            // Only Hello/ChangeBatch/PeerList/Synced/IndexOp/IndexState
-            // travel this direction -- anything else is a protocol error,
-            // but per this module's "one bad frame doesn't end the
-            // connection" policy, just skip it rather than disconnecting.
+            PeerMessage::SyncReport(report) => {
+                let mismatched = sink.apply_sync_report(node_id, report).await;
+                for database in mismatched {
+                    let request = PeerMessage::ChunkDigestsRequest { database };
+                    if crate::wire::write_message(&mut stream, &request)
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+            // The connecting side's reply to a `ChunkDigestsRequest` this
+            // same loop just sent it.
+            PeerMessage::ChunkDigests { database, digests } => {
+                sink.apply_chunk_digests(node_id, database, digests).await;
+            }
+            // Only Hello/ChangeBatch/PeerList/Synced/IndexOp/IndexState/
+            // SyncReport/ChunkDigests travel this direction -- anything
+            // else is a protocol error, but per this module's "one bad
+            // frame doesn't end the connection" policy, just skip it
+            // rather than disconnecting.
             _ => continue,
         }
     }
@@ -834,6 +890,71 @@ mod tests {
         wait_until(|| {
             sink.index_ops()
                 == vec![(DB.to_string(), "material".to_string(), IndexOp::Create)]
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_sync_report_is_applied_via_the_sink() {
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        hello(&mut stream, CLUSTER_SECRET).await;
+
+        let report = vec![DatabaseSync {
+            database: DB.to_string(),
+            content_digest: 0x1234,
+            indexed_keys: vec!["material".to_string()],
+        }];
+        crate::wire::write_message(&mut stream, &PeerMessage::SyncReport(report.clone()))
+            .await
+            .unwrap();
+
+        wait_until(|| sink.sync_reports() == vec![(TEST_CLIENT_NODE_ID, report.clone())]).await;
+    }
+
+    #[tokio::test]
+    async fn a_sync_report_mismatch_drills_down_and_the_reply_reaches_the_sink() {
+        let TestNode { addr, sink, .. } = spawn_node("node-a").await;
+        sink.seed_mismatched(vec![DB.to_string()]);
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        hello(&mut stream, CLUSTER_SECRET).await;
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::CatchUpRequest { .. })
+        ));
+
+        let report = vec![DatabaseSync {
+            database: DB.to_string(),
+            content_digest: 0x1234,
+            indexed_keys: vec![],
+        }];
+        crate::wire::write_message(&mut stream, &PeerMessage::SyncReport(report))
+            .await
+            .unwrap();
+
+        // The sink said `DB` mismatched, so the server asks straight back
+        // on this same connection for its chunk digests.
+        assert_eq!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::ChunkDigestsRequest {
+                database: DB.to_string()
+            })
+        );
+
+        let digests = vec![(vec![0, 0, 0], 0xABCD_u64)];
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::ChunkDigests {
+                database: DB.to_string(),
+                digests: digests.clone(),
+            },
+        )
+        .await
+        .unwrap();
+
+        wait_until(|| {
+            sink.chunk_digests_received()
+                == vec![(TEST_CLIENT_NODE_ID, DB.to_string(), digests.clone())]
         })
         .await;
     }

@@ -517,6 +517,23 @@ impl Chunk {
         self.columns.remove(&key_id).is_some() || had_tombstones
     }
 
+    /// Every `(local_idx, value, meta)` currently set for `key_id` in this
+    /// chunk -- `entries_by_local_idx` restricted to one column, for a
+    /// caller that's about to drop that whole column (`World::
+    /// remove_column`) and needs to know what it held, e.g. to fold each
+    /// entry's removal into a content digest. Empty if `key_id` has no
+    /// column here.
+    pub fn column_entries(&self, key_id: u32) -> Vec<(usize, Value, CellMeta)> {
+        let Some(col) = self.columns.get(&key_id) else {
+            return Vec::new();
+        };
+        col.presence
+            .iter_set()
+            .enumerate()
+            .map(|(rank, local_idx)| (local_idx, col.value_at(rank), col.meta[rank]))
+            .collect()
+    }
+
     /// True if no cell in this chunk has any value set and no tombstone is
     /// recorded -- such chunks aren't written to disk at all (see
     /// `World::flush_one`), which is how a mostly empty 10,000^3 world

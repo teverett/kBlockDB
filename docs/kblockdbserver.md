@@ -268,7 +268,7 @@ A cell value on the wire is a small tagged JSON object:
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[],"node_id":null,"vector":{}}` |
-| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","node_id":"1f2e3d4c5b6a7980","vector":{...},"seq":42,"now_ms":1735689600456,"peers":[{"host":"10.0.0.2:8082","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"seq":17,"last_synced_ms":1735689598001,"sync":"in_sync","behind_by":0,"ahead_by":0}]}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","node_id":"1f2e3d4c5b6a7980","vector":{...},"seq":42,"now_ms":1735689600456,"content_digests":[{"database":"demo","content_digest":"a1b2c3d4e5f60718"}],"peers":[{"host":"10.0.0.2:8082","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"seq":17,"last_synced_ms":1735689598001,"sync":"in_sync","behind_by":0,"ahead_by":0,"sync_check":[{"database":"demo","content_in_sync":true,"indexed_keys_in_sync":true,"local_content_digest":"a1b2c3d4e5f60718","peer_content_digest":"a1b2c3d4e5f60718","local_indexed_keys":["material"],"peer_indexed_keys":["material"],"differing_chunks":null}],"sync_checked_at_ms":1735689600123}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -306,15 +306,50 @@ configured.
 
 `GET /rest/cluster` (auth required, unlike `/rest/health`) reports
 `{"hostname": ..., "node_id": ..., "vector": {...}, "seq": N, "now_ms": ...,
+"content_digests": [{"database": ..., "content_digest": "..."}, ...],
 "peers": [{"host": ..., "connected": true | false, "node_id": ..., "vector":
 {...}, "seq": N | null, "last_synced_ms": ... | null, "sync":
 "in_sync" | "behind" | "ahead" | "diverged" | "unknown", "behind_by": N,
-"ahead_by": N}, ...]}` -- every peer this instance knows about, connected
-or not, with its version vector as it last reported it and how that
-compares with this instance's (see clustering.md). A peer
-is known once it's configured in `[[peers]]` *or* has connected in; either
-way it's replicated to and from (peers have no direction -- see
-clustering.md's "Peers are symmetric").
+"ahead_by": N, "sync_check": [{"database": ..., "content_in_sync": bool,
+"indexed_keys_in_sync": bool, "local_content_digest": "...",
+"peer_content_digest": "...", "local_indexed_keys": [...],
+"peer_indexed_keys": [...], "differing_chunks": [[...], ...] | null}, ...]
+| null, "sync_checked_at_ms": N | null},
+...]}` -- every peer this instance knows about, connected or not, with its
+version vector as it last reported it and how that compares with this
+instance's (see clustering.md). A peer is known once it's configured in
+`[[peers]]` *or* has connected in; either way it's replicated to and from
+(peers have no direction -- see clustering.md's "Peers are symmetric").
+
+`content_digests` is this instance's own current
+`kblockdblib::World::content_digest()`, as hex, for every database it
+has one for -- independent of any peer, what this instance itself
+currently holds. Empty unless clustering is configured (see
+clustering.md's "Sync check" on why a standalone server never enables
+this).
+
+`sync_check`/`sync_checked_at_ms` are this peer's latest periodic sync
+report (every 60s, independent of `last_synced_ms`'s own cadence -- see
+clustering.md's "Sync check"): a real content-equality comparison, not
+just "have we seen the same number of writes" (`sync`/`behind_by`/
+`ahead_by` already answer that). `null` until the first report arrives
+(allow ~60s after a link comes up) or if neither side has a content
+digest enabled on anything. `content_in_sync` is `false` only if this
+instance's and the peer's actual data for that database genuinely
+differ -- not merely that they've seen a different number of writes;
+`local_content_digest`/`peer_content_digest` are the actual hex
+checksums being compared, equal exactly when `content_in_sync` is
+`true`. `indexed_keys_in_sync` catches a `DROP INDEX` the peer missed
+while disconnected (see clustering.md's "Index operations" on why that
+can't self-correct). A database the peer reports that this instance has
+no content digest for is simply omitted from `sync_check`, not reported
+as a mismatch. `differing_chunks` localizes a `content_in_sync: false`
+to the actual chunk(s) involved, via an on-demand drill-down this
+instance automatically requests from the peer the moment it sees the
+mismatch (see clustering.md's "Drill-down: which chunk is actually
+different"); it stays `null` for a database that's in sync, and briefly
+`null` right after a mismatch is first seen, while that drill-down is
+still in flight.
 
 `/rest/db/{db}/stats` walks the on-disk chunk files under that database's
 directory and reports: `total_chunks` (chunk files currently on disk --
@@ -512,10 +547,14 @@ The **Cluster** tab lists every host this server knows about -- itself,
 plus every peer, whether configured or learned because it connected in --
 from `GET /rest/cluster`: each one's node id, sequence number, connected /
 not connected status, sync state against this server (in sync, behind,
-ahead, diverged -- both version vectors on hover), and when it last
-synced. It refreshes every 5 seconds while it's open, pausing while the
-page is hidden, without flickering; a failed refresh keeps the last rows
-and says so underneath.
+ahead, diverged -- both version vectors on hover), when it last synced,
+and its current content-digest checksum for each database it has one
+for (`content_digests` for this server's own row, `sync_check`'s
+`peer_content_digest` for a peer's row) -- a peer's checksum renders in
+red if it disagrees with this server's own for that database. It
+refreshes every 5 seconds while it's open, pausing while the page is
+hidden, without flickering; a failed refresh keeps the last rows and
+says so underneath.
 
 The open tab is kept in the URL (`/#cluster` for the Cluster tab), so a
 browser refresh reopens the same tab, `/#cluster` can be bookmarked, and

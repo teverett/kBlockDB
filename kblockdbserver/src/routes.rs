@@ -60,6 +60,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use kblockdbcluster::hub::Stamper;
+use kblockdbcluster::source::ChangeSource;
 use kblockdblib::{VersionVector, LEGACY_BIT};
 use kblockdbquery as query;
 use serde::{Deserialize, Serialize};
@@ -251,6 +252,64 @@ pub struct ClusterPeer {
     behind_by: u64,
     /// Roughly how many writes the peer has that this instance doesn't.
     ahead_by: u64,
+    /// Per-database comparison from this peer's latest periodic sync
+    /// report (see docs/clustering.md's "Sync check") -- whether this
+    /// instance's content digest and indexed-key set for each database
+    /// *actually* matches the peer's, not just whether they've seen the
+    /// same number of writes (which `sync`/`behind_by`/`ahead_by` above
+    /// already show). `null` until at least one report has arrived from
+    /// this peer (right after the link comes up, allow ~60s).
+    sync_check: Option<Vec<DatabaseSyncCheck>>,
+    /// This instance's clock, when that report was last received;
+    /// `null` alongside `sync_check`.
+    sync_checked_at_ms: Option<u64>,
+}
+
+/// One database's comparison against a peer's reported fingerprint --
+/// see `ClusterPeer::sync_check` and `crate::cluster::DatabaseSyncStatus`
+/// (this is its REST-facing shape).
+#[derive(Serialize, ToSchema)]
+pub struct DatabaseSyncCheck {
+    database: String,
+    /// Whether this instance's `kblockdblib::World::content_digest()`
+    /// for this database matches what the peer reported -- a real
+    /// content-equality check, not an operation-count heuristic.
+    content_in_sync: bool,
+    /// Whether this instance's indexed-key set for this database matches
+    /// the peer's -- catches a `DROP INDEX` the peer missed while
+    /// disconnected (see docs/clustering.md's "Index operations" on why
+    /// that can't self-correct on its own).
+    indexed_keys_in_sync: bool,
+    /// Both sorted, for an easy side-by-side diff when they disagree.
+    local_indexed_keys: Vec<String>,
+    peer_indexed_keys: Vec<String>,
+    /// This instance's own `kblockdblib::World::content_digest()` for this
+    /// database, and what the peer reported, both as lowercase hex (same
+    /// formatting as `node_id` elsewhere in this response) -- so the
+    /// Cluster tab can show the actual checksums side by side, not just
+    /// `content_in_sync`'s bare `true`/`false`. Equal exactly when
+    /// `content_in_sync` is `true`.
+    local_content_digest: String,
+    peer_content_digest: String,
+    /// Which chunk(s) a `content_in_sync: false` localizes to, from the
+    /// drill-down this instance automatically requests on a content
+    /// mismatch (see docs/clustering.md's "Sync check"). `null` while
+    /// `content_in_sync` is `true` (nothing to localize), or while that
+    /// drill-down is still in flight -- allow a few seconds after
+    /// `content_in_sync` first turns `false` before treating `null` here
+    /// as itself a problem.
+    differing_chunks: Option<Vec<Vec<i32>>>,
+}
+
+/// This instance's own current content digest for one database -- see
+/// `ClusterResponse::content_digests` and
+/// `kblockdblib::World::content_digest`. Independent of any peer: what
+/// this instance itself currently holds, as hex (same formatting as
+/// `node_id`).
+#[derive(Serialize, ToSchema)]
+pub struct ContentDigestEntry {
+    database: String,
+    content_digest: String,
 }
 
 /// How a peer's version vector compares with this instance's.
@@ -322,7 +381,33 @@ pub struct ClusterResponse {
     /// This instance's current time, ms since the Unix epoch -- the clock
     /// each peer's `last_synced_ms` is by, for working out how long ago.
     now_ms: u64,
+    /// This instance's own current content digest for every database it
+    /// has one for (see `kblockdblib::World::with_content_digest`) --
+    /// what the Cluster tab shows on this instance's own row, independent
+    /// of any peer. Empty if content digests aren't enabled anywhere
+    /// (always true when unclustered -- see docs/clustering.md's "Sync
+    /// check").
+    content_digests: Vec<ContentDigestEntry>,
     peers: Vec<ClusterPeer>,
+}
+
+/// This instance's own `sync_state()` (see
+/// `kblockdbcluster::source::ChangeSource`), as `ClusterResponse::
+/// content_digests` shows it -- hex-formatted, sorted by database name
+/// for a stable rendering. Empty (not an error) if content digests
+/// aren't enabled anywhere.
+fn content_digests(state: &AppState) -> Vec<ContentDigestEntry> {
+    let mut entries: Vec<ContentDigestEntry> = state
+        .sync_state()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| ContentDigestEntry {
+            database: d.database,
+            content_digest: format!("{:016x}", d.content_digest),
+        })
+        .collect();
+    entries.sort_by(|a, b| a.database.cmp(&b.database));
+    entries
 }
 
 #[utoipa::path(
@@ -343,6 +428,7 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
             vector: BTreeMap::new(),
             seq: None,
             now_ms: kblockdbcluster::hub::now_ms(),
+            content_digests: content_digests(&state),
             peers: Vec::new(),
         });
     };
@@ -363,6 +449,14 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
                     .and_then(|theirs| theirs.get(id))
                     .or_else(|| mine.get(id))
             });
+            let peer_sync = node_id.and_then(|id| {
+                state
+                    .peer_sync
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&id)
+                    .cloned()
+            });
             ClusterPeer {
                 host,
                 connected,
@@ -373,6 +467,22 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
                 sync,
                 behind_by,
                 ahead_by,
+                sync_checked_at_ms: peer_sync.as_ref().map(|s| s.received_at_ms),
+                sync_check: peer_sync.map(|s| {
+                    s.databases
+                        .into_iter()
+                        .map(|d| DatabaseSyncCheck {
+                            database: d.database,
+                            content_in_sync: d.content_in_sync,
+                            indexed_keys_in_sync: d.indexed_keys_in_sync,
+                            local_content_digest: format!("{:016x}", d.local_content_digest),
+                            peer_content_digest: format!("{:016x}", d.peer_content_digest),
+                            local_indexed_keys: d.local_indexed_keys,
+                            peer_indexed_keys: d.peer_indexed_keys,
+                            differing_chunks: d.differing_chunks,
+                        })
+                        .collect()
+                }),
             }
         })
         .collect();
@@ -382,6 +492,7 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
         seq: mine.get(peer_set.node_id()),
         now_ms: kblockdbcluster::hub::now_ms(),
         vector: vector_json(&mine),
+        content_digests: content_digests(&state),
         peers,
     })
 }

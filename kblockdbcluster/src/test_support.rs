@@ -10,7 +10,7 @@
 
 use crate::server::ReplicationSink;
 use crate::source::ChangeSource;
-use crate::wire::{ChangeEntry, ChangeOp, IndexOp};
+use crate::wire::{ChangeEntry, ChangeOp, DatabaseSync, IndexOp};
 use kblockdblib::{CellMeta, Stamp, Value, VersionVector};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -49,6 +49,27 @@ pub struct RecordingSink {
     /// `ChangeSource::indexed_keys()`, for tests exercising `IndexState`
     /// reconciliation on connect.
     indexed: Arc<Mutex<std::collections::HashSet<(String, String)>>>,
+    /// This sink's own `sync_state()` content, seeded by `seed_sync_state`
+    /// -- what it reports as its current fingerprint, for a test playing
+    /// the "already has a digest" side of a `SyncReport` exchange.
+    sync_state: Arc<Mutex<Vec<DatabaseSync>>>,
+    /// Every `apply_sync_report` call this sink has received, in order,
+    /// as `(from_node, report)` -- for a test to assert a `SyncReport`
+    /// actually reached it.
+    sync_reports: Arc<Mutex<Vec<(u64, Vec<DatabaseSync>)>>>,
+    /// Database names `apply_sync_report` should report as mismatched --
+    /// what it returns, for a test to drive the drill-down request that
+    /// follows. Seeded by `seed_mismatched`; empty (no drill-down) by
+    /// default.
+    mismatched: Arc<Mutex<Vec<String>>>,
+    /// This sink's own `chunk_digests()` content, seeded by
+    /// `seed_chunk_digests` -- what it reports in reply to a
+    /// `ChunkDigestsRequest`.
+    chunk_digests: Arc<Mutex<HashMap<String, Vec<(Vec<i32>, u64)>>>>,
+    /// Every `apply_chunk_digests` call this sink has received, in order,
+    /// as `(from_node, database, digests)` -- for a test to assert a
+    /// `ChunkDigests` reply actually reached it.
+    chunk_digests_received: Arc<Mutex<Vec<(u64, String, Vec<(Vec<i32>, u64)>)>>>,
     /// When `true`, the next `apply_set`/`apply_remove` call returns an
     /// error instead of recording anything, then resets to `false` --
     /// see `fail_next`.
@@ -193,6 +214,43 @@ impl RecordingSink {
             .unwrap()
             .insert((database.to_string(), key.to_string()));
     }
+
+    /// Sets what this sink's own `sync_state()` reports -- the "already
+    /// has a digest" side of a `SyncReport` exchange test.
+    pub fn seed_sync_state(&self, reports: Vec<DatabaseSync>) {
+        *self.sync_state.lock().unwrap() = reports;
+    }
+
+    /// Every `SyncReport` this sink has received via `apply_sync_report`,
+    /// as `(from_node, report)`, in order.
+    pub fn sync_reports(&self) -> Vec<(u64, Vec<DatabaseSync>)> {
+        self.sync_reports.lock().unwrap().clone()
+    }
+
+    /// Sets which database names `apply_sync_report` reports as
+    /// mismatched (its return value) -- what drives `handle_connection`
+    /// into sending a `ChunkDigestsRequest` for each, in a drill-down
+    /// test.
+    pub fn seed_mismatched(&self, databases: Vec<String>) {
+        *self.mismatched.lock().unwrap() = databases;
+    }
+
+    /// Sets what this sink's own `chunk_digests()` reports for `database`
+    /// -- the "already has the data" side of a `ChunkDigests` exchange
+    /// test.
+    pub fn seed_chunk_digests(&self, database: &str, digests: Vec<(Vec<i32>, u64)>) {
+        self.chunk_digests
+            .lock()
+            .unwrap()
+            .insert(database.to_string(), digests);
+    }
+
+    /// Every `ChunkDigests` reply this sink has received via
+    /// `apply_chunk_digests`, as `(from_node, database, digests)`, in
+    /// order.
+    pub fn chunk_digests_received(&self) -> Vec<(u64, String, Vec<(Vec<i32>, u64)>)> {
+        self.chunk_digests_received.lock().unwrap().clone()
+    }
 }
 
 impl ReplicationSink for RecordingSink {
@@ -243,6 +301,23 @@ impl ReplicationSink for RecordingSink {
         drop(indexed);
         self.index_ops.lock().unwrap().push((database, key, op));
         Ok(())
+    }
+
+    async fn apply_sync_report(&self, from_node: u64, report: Vec<DatabaseSync>) -> Vec<String> {
+        self.sync_reports.lock().unwrap().push((from_node, report));
+        self.mismatched.lock().unwrap().clone()
+    }
+
+    async fn apply_chunk_digests(
+        &self,
+        from_node: u64,
+        database: String,
+        digests: Vec<(Vec<i32>, u64)>,
+    ) {
+        self.chunk_digests_received
+            .lock()
+            .unwrap()
+            .push((from_node, database, digests));
     }
 }
 
@@ -304,6 +379,20 @@ impl ChangeSource for RecordingSink {
         let mut entries: Vec<(String, String)> = self.indexed.lock().unwrap().iter().cloned().collect();
         entries.sort();
         Ok(entries)
+    }
+
+    fn sync_state(&self) -> Result<Vec<DatabaseSync>, String> {
+        Ok(self.sync_state.lock().unwrap().clone())
+    }
+
+    fn chunk_digests(&self, database: &str) -> Result<Vec<(Vec<i32>, u64)>, String> {
+        Ok(self
+            .chunk_digests
+            .lock()
+            .unwrap()
+            .get(database)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 

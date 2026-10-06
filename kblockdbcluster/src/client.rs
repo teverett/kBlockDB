@@ -125,6 +125,17 @@ const SYNCED_INTERVAL: Duration = if cfg!(test) {
     Duration::from_secs(5)
 };
 
+/// How often this link sends a `SyncReport` (see `source::ChangeSource::
+/// sync_state`) -- its own cadence, slower and independent of
+/// `SYNCED_INTERVAL`: a content digest comparison is a periodic
+/// "actually verify the data matches" check, not part of the
+/// write-replication/catch-up machinery `Synced` confirms.
+const SYNC_REPORT_INTERVAL: Duration = if cfg!(test) {
+    Duration::from_millis(100)
+} else {
+    Duration::from_secs(60)
+};
+
 /// Catch-up batches buffered between the blocking scan and the link: a
 /// slow peer holds the scan back instead of it buffering a whole database.
 const CATCH_UP_BUFFER: usize = 4;
@@ -295,6 +306,14 @@ async fn connect_and_forward(
     let mut index_state_sent = false;
     let mut synced_tick = tokio::time::interval(SYNCED_INTERVAL);
     synced_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Starts ticking immediately (unlike waiting for the first `Synced`,
+    // `IndexState`'s reasoning doesn't apply here: a `SyncReport` only
+    // ever reports on databases this process already has a content
+    // digest for -- see `ChangeSource::sync_state`'s doc comment -- so
+    // there's no "reports on a database that doesn't exist yet" race to
+    // avoid).
+    let mut sync_report_tick = tokio::time::interval(SYNC_REPORT_INTERVAL);
+    sync_report_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     resync.borrow_and_update();
 
     loop {
@@ -314,6 +333,12 @@ async fn connect_and_forward(
                 match msg {
                     Some(Ok(PeerMessage::CatchUpRequest { known })) => {
                         request_catch_up(known, &mut catch_up);
+                    }
+                    // The accepting side's last `SyncReport` disagreed on
+                    // `database` -- send it our own `chunk_digests()` for
+                    // it, so it can find exactly which chunk(s) differ.
+                    Some(Ok(PeerMessage::ChunkDigestsRequest { database })) => {
+                        send_chunk_digests(&mut writer, peers, database).await?;
                     }
                     // Nothing else is expected this direction; skip it.
                     Some(Ok(_)) => {}
@@ -438,6 +463,9 @@ async fn connect_and_forward(
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
                 }
             }
+            _ = sync_report_tick.tick() => {
+                send_sync_report(&mut writer, peers).await?;
+            }
         }
     }
 }
@@ -511,6 +539,50 @@ async fn send_index_state<W: AsyncWrite + Unpin>(
         return Ok(());
     }
     crate::wire::write_message(stream, &PeerMessage::IndexState(entries)).await
+}
+
+/// Sends this process's current sync state (see `source::ChangeSource::
+/// sync_state`) as one `SyncReport` frame, on its own `SYNC_REPORT_
+/// INTERVAL` cadence -- or nothing if there's no change source or it
+/// reports on no databases (no content digest enabled anywhere), same
+/// "no reason to send an empty frame" reasoning as `send_index_state`.
+async fn send_sync_report<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    peers: &PeerSet,
+) -> std::io::Result<()> {
+    let Some(source) = peers.change_source().cloned() else {
+        return Ok(());
+    };
+    let report = tokio::task::spawn_blocking(move || source.sync_state())
+        .await
+        .map_err(|e| std::io::Error::other(format!("sync_state panicked: {e}")))?
+        .map_err(std::io::Error::other)?;
+    if report.is_empty() {
+        return Ok(());
+    }
+    crate::wire::write_message(stream, &PeerMessage::SyncReport(report)).await
+}
+
+/// Sends this process's `chunk_digests()` for `database` (see
+/// `source::ChangeSource::chunk_digests`) as one `ChunkDigests` frame, in
+/// reply to a `ChunkDigestsRequest` -- unlike `send_sync_report`/
+/// `send_index_state`, always sent (even if empty), since it's a direct
+/// answer to an explicit request rather than something offered on a
+/// cadence.
+async fn send_chunk_digests<W: AsyncWrite + Unpin>(
+    stream: &mut W,
+    peers: &PeerSet,
+    database: String,
+) -> std::io::Result<()> {
+    let Some(source) = peers.change_source().cloned() else {
+        return Ok(());
+    };
+    let for_scan = database.clone();
+    let digests = tokio::task::spawn_blocking(move || source.chunk_digests(&for_scan))
+        .await
+        .map_err(|e| std::io::Error::other(format!("chunk_digests panicked: {e}")))?
+        .map_err(std::io::Error::other)?;
+    crate::wire::write_message(stream, &PeerMessage::ChunkDigests { database, digests }).await
 }
 
 #[cfg(test)]
@@ -894,6 +966,85 @@ mod tests {
                 == vec![(DB.to_string(), "material".to_string(), crate::wire::IndexOp::Create)]
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn connecting_periodically_sends_its_sync_state_which_the_peer_applies() {
+        let source = RecordingSink::new();
+        let report = vec![crate::wire::DatabaseSync {
+            database: DB.to_string(),
+            content_digest: 0xABCD,
+            indexed_keys: vec!["material".to_string()],
+        }];
+        source.seed_sync_state(report.clone());
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let peers = catch_up_peers(&source, 64);
+        let me = peers.node_id();
+        peers.add(addr.to_string());
+
+        wait_until(|| sink.sync_reports().contains(&(me, report.clone()))).await;
+    }
+
+    #[tokio::test]
+    async fn a_chunk_digests_request_is_answered_on_the_same_connection() {
+        let source = RecordingSink::new();
+        let digests = vec![(vec![1, 0, 0], 0xABCD_u64), (vec![-1, 0, 0], 0)];
+        source.seed_chunk_digests(DB, digests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peers = catch_up_peers(&source, 64);
+        peers.add(listener.local_addr().unwrap().to_string());
+        let mut stream = accept_link(&listener).await;
+        let request = PeerMessage::CatchUpRequest {
+            known: VersionVector::new(),
+        };
+        crate::wire::write_message(&mut stream, &request)
+            .await
+            .unwrap();
+        read_until_synced(&mut stream).await;
+
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::ChunkDigestsRequest {
+                database: DB.to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Idle `Synced` ticks (`SYNCED_INTERVAL`, 100ms in tests) keep
+        // firing independently of this request, so skip over any that
+        // land first rather than assuming the very next frame is the
+        // reply.
+        let reply = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                match crate::wire::read_message(&mut stream).await.unwrap() {
+                    Some(PeerMessage::Synced { .. }) => continue,
+                    other => return other,
+                }
+            }
+        })
+        .await
+        .expect("no ChunkDigests within 2s");
+        assert_eq!(
+            reply,
+            Some(PeerMessage::ChunkDigests {
+                database: DB.to_string(),
+                digests,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sync_report_is_sent_when_there_is_no_sync_state() {
+        // No seeded sync state -- `send_sync_report` must not send an
+        // empty frame (harmless either way, but there's no reason to).
+        let TestNode { addr, sink, .. } = spawn_node("node-b").await;
+        let peers = catch_up_peers(&RecordingSink::new(), 64);
+        peers.add(addr.to_string());
+
+        wait_until(|| peers.snapshot() == vec![(addr.to_string(), true)]).await;
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        assert!(sink.sync_reports().is_empty());
     }
 
     #[tokio::test]

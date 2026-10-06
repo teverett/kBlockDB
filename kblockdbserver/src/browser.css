@@ -97,6 +97,8 @@ p.updated { color: #888; font-size: 0.85rem; margin-top: 0.5rem; }
 p.updated.failed { color: #c0392b; }
 td.last-synced-never { color: #888; font-style: italic; }
 td.sync-unknown { color: #888; font-style: italic; }
+td.checksum { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.85rem; color: #555; }
+td.checksum span.checksum-mismatch { color: #c0392b; font-weight: 600; }
 .pager {
   display: flex;
   align-items: center;

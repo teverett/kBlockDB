@@ -5,7 +5,7 @@
 //! [`ChangeSource::changes_since`] on a blocking thread and streams what
 //! it yields as ordinary `ChangeBatch` frames.
 
-use crate::wire::ChangeEntry;
+use crate::wire::{ChangeEntry, DatabaseSync};
 use kblockdblib::VersionVector;
 
 pub trait ChangeSource: Send + Sync + 'static {
@@ -42,6 +42,42 @@ pub trait ChangeSource: Send + Sync + 'static {
     /// secondary index (or that doesn't want to replicate this) simply
     /// never sends a reconciliation.
     fn indexed_keys(&self) -> Result<Vec<(String, String)>, String> {
+        Ok(Vec::new())
+    }
+
+    /// This process's current fingerprint for every database it
+    /// maintains a content digest for (see
+    /// `kblockdblib::World::with_content_digest`/`content_digest`) --
+    /// sent periodically (every 60s, its own cadence, independent of
+    /// catch-up/`IndexState`) as a `wire::PeerMessage::SyncReport`, so
+    /// the periodic cluster sync check (`docs/clustering.md`) can answer
+    /// "does this node actually hold the same data as its peers," not
+    /// just "has it seen the same number of writes" (what equal version
+    /// vectors already show).
+    ///
+    /// A database with no digest enabled simply isn't included -- this
+    /// is a report of what *can* be compared, not a claim about every
+    /// database this process happens to hold. Blocking, same as
+    /// `changes_since`/`indexed_keys`. The default reports nothing: an
+    /// embedder with no concept of a content digest never sends one.
+    fn sync_state(&self) -> Result<Vec<DatabaseSync>, String> {
+        Ok(Vec::new())
+    }
+
+    /// This process's `kblockdblib::World::chunk_digests()` for `database`,
+    /// as `(chunk key, digest)` pairs -- sent in reply to a
+    /// `wire::PeerMessage::ChunkDigestsRequest`, itself only ever sent
+    /// after a `SyncReport` already showed a whole-database mismatch (see
+    /// `server::ReplicationSink::apply_sync_report`'s return value). Unlike
+    /// `sync_state`, this isn't periodic and isn't filtered by "do I have
+    /// a digest enabled" -- the request already implies the asker wants
+    /// to localize a mismatch it already knows is there.
+    ///
+    /// Blocking, same as the rest of this trait. The default reports
+    /// nothing: an embedder with no concept of a chunk digest (or no such
+    /// database) never answers.
+    fn chunk_digests(&self, database: &str) -> Result<Vec<(Vec<i32>, u64)>, String> {
+        let _ = database;
         Ok(Vec::new())
     }
 }

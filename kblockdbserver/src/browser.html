@@ -70,6 +70,7 @@
           <th>Status</th>
           <th title="This peer's version vector -- every write it's guaranteed to have, per origin -- compared with this server's">Sync</th>
           <th title="When this peer last confirmed it had sent this server everything, by this server's clock">Last synced</th>
+          <th title="Each database's current content digest, as that node itself reports it -- a real content-equality check, not just an operation count. Red means this server's own digest for that database disagrees (allow ~60s after a link comes up for the first report to arrive).">Checksum</th>
         </tr>
       </thead>
       <tbody id="cluster-rows"></tbody>
@@ -445,7 +446,51 @@
     tr.appendChild(statusTd);
     tr.appendChild(peer ? syncCell(peer, self) : cell("td", ""));
     tr.appendChild(peer ? lastSyncedCell(peer.last_synced_ms, self.now_ms) : cell("td", ""));
+    tr.appendChild(checksumCell(peer ? peerChecksumEntries(peer) : selfChecksumEntries(self)));
     return tr;
+  }
+
+  // This server's own row: one entry per database it has a content
+  // digest for (see `/rest/cluster`'s top-level `content_digests` --
+  // independent of any peer, since this is what this server itself
+  // currently holds).
+  function selfChecksumEntries(self) {
+    return (self.content_digests || []).map(function (d) {
+      return { database: d.database, content_digest: d.content_digest };
+    });
+  }
+
+  // A peer's row: one entry per database in its latest `sync_check` --
+  // the checksum it reported for itself (`peer_content_digest`), flagged
+  // as a mismatch when this server's own digest for that database
+  // (`content_in_sync`) disagrees.
+  function peerChecksumEntries(peer) {
+    return (peer.sync_check || []).map(function (d) {
+      return {
+        database: d.database,
+        content_digest: d.peer_content_digest,
+        in_sync: d.content_in_sync,
+      };
+    });
+  }
+
+  // One `<td>` listing every `{database, content_digest, in_sync?}` entry,
+  // one per line -- `in_sync === false` (only ever set for a peer, never
+  // this server's own row) renders in red.
+  function checksumCell(entries) {
+    const td = document.createElement("td");
+    td.className = "checksum";
+    entries.forEach(function (e, i) {
+      if (i > 0) td.appendChild(document.createElement("br"));
+      const span = document.createElement("span");
+      span.textContent = e.database + ": " + e.content_digest;
+      if (e.in_sync === false) {
+        span.className = "checksum-mismatch";
+        span.title = "disagrees with this server's own digest for '" + e.database + "'";
+      }
+      td.appendChild(span);
+    });
+    return td;
   }
 
   // `ms` (since the Unix epoch, by the server's clock) as a local time plus
