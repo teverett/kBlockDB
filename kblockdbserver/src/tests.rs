@@ -593,6 +593,24 @@ async fn cluster_reports_no_seq_when_unclustered() {
 }
 
 #[tokio::test]
+async fn cluster_reports_this_instances_own_peer_port_when_clustered() {
+    let (databases, _dir) = test_databases();
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peer_set(&[]));
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    // `peer_set`'s own `LocalIdentity` fixes this at 1.
+    assert_eq!(body["peer_port"], json!(1));
+}
+
+#[tokio::test]
+async fn cluster_reports_no_peer_port_when_unclustered() {
+    let (status, body) = send(test_app().0, get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peer_port"], json!(null));
+}
+
+#[tokio::test]
 async fn cluster_reports_this_instances_own_local_ip_when_detectable() {
     let (status, body) = send(test_app().0, get("/rest/cluster")).await;
     assert_eq!(status, StatusCode::OK);

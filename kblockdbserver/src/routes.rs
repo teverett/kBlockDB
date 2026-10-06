@@ -391,6 +391,10 @@ fn compare_vectors(mine: &VersionVector, theirs: &VersionVector) -> (SyncState, 
 pub struct ClusterResponse {
     /// This instance's own name, same as `HealthResponse::hostname`.
     hostname: String,
+    /// The port this instance's own peer-replication listener is bound
+    /// to -- what a peer actually dials `hostname`/`local_ip` on. `null`
+    /// unless clustering is configured.
+    peer_port: Option<u16>,
     /// This instance's own best-guess outbound IP (`main.rs`'s
     /// `primary_local_ip`), shown alongside `hostname` the same way a
     /// peer's `observed_ip` is shown alongside its `host` -- purely
@@ -452,6 +456,7 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
     let Some(peer_set) = state.peers.as_ref() else {
         return Json(ClusterResponse {
             hostname: state.hostname.to_string(),
+            peer_port: None,
             local_ip,
             node_id: None,
             vector: BTreeMap::new(),
@@ -519,6 +524,7 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
         .collect();
     Json(ClusterResponse {
         hostname: state.hostname.to_string(),
+        peer_port: Some(peer_set.identity().peer_port),
         local_ip,
         node_id: Some(node_id_hex(peer_set.node_id())),
         seq: mine.get(peer_set.node_id()),

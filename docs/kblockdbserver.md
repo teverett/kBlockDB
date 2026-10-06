@@ -269,7 +269,7 @@ A cell value on the wire is a small tagged JSON object:
 | Method | Path | Body | Response |
 |---|---|---|---|
 | `GET` | `/rest/health` | | `200` `{"status":"ok","hostname":"db-1","database_count":2,"timestamp":1735689600,"peers":[],"node_id":null,"vector":{}}` |
-| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","local_ip":"10.0.0.1","node_id":"1f2e3d4c5b6a7980","vector":{...},"seq":42,"now_ms":1735689600456,"content_digests":[{"database":"demo","content_digest":"a1b2c3d4e5f60718"}],"peers":[{"host":"db-2:8082","observed_ip":"10.0.0.2","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"seq":17,"last_synced_ms":1735689598001,"sync":"in_sync","behind_by":0,"ahead_by":0,"sync_check":[{"database":"demo","content_in_sync":true,"indexed_keys_in_sync":true,"local_content_digest":"a1b2c3d4e5f60718","peer_content_digest":"a1b2c3d4e5f60718","local_indexed_keys":["material"],"peer_indexed_keys":["material"],"differing_chunks":null}],"sync_checked_at_ms":1735689600123}]}` |
+| `GET` | `/rest/cluster` | | `200` `{"hostname":"db-1","peer_port":8082,"local_ip":"10.0.0.1","node_id":"1f2e3d4c5b6a7980","vector":{...},"seq":42,"now_ms":1735689600456,"content_digests":[{"database":"demo","content_digest":"a1b2c3d4e5f60718"}],"peers":[{"host":"db-2:8082","observed_ip":"10.0.0.2","connected":true,"node_id":"0a1b2c3d4e5f6071","vector":{...},"seq":17,"last_synced_ms":1735689598001,"sync":"in_sync","behind_by":0,"ahead_by":0,"sync_check":[{"database":"demo","content_in_sync":true,"indexed_keys_in_sync":true,"local_content_digest":"a1b2c3d4e5f60718","peer_content_digest":"a1b2c3d4e5f60718","local_indexed_keys":["material"],"peer_indexed_keys":["material"],"differing_chunks":null}],"sync_checked_at_ms":1735689600123}]}` |
 | `GET` | `/rest/db/{db}/cells/{coords}/{key}` | | `200 {"value": <value>, "created_at_ms": ..., "modified_at_ms": ..., "version": ...}`, or `404` if unset or `{db}` doesn't exist |
 | `PUT` | `/rest/db/{db}/cells/{coords}/{key}` | `<value>` | `204` |
 | `DELETE` | `/rest/db/{db}/cells/{coords}/{key}` | | `204` |
@@ -306,8 +306,8 @@ exactly the same writes. Both are `null`/empty unless clustering is
 configured.
 
 `GET /rest/cluster` (auth required, unlike `/rest/health`) reports
-`{"hostname": ..., "local_ip": ... | null, "node_id": ..., "vector": {...},
-"seq": N, "now_ms": ...,
+`{"hostname": ..., "peer_port": N | null, "local_ip": ... | null,
+"node_id": ..., "vector": {...}, "seq": N, "now_ms": ...,
 "content_digests": [{"database": ..., "content_digest": "..."}, ...],
 "peers": [{"host": ..., "observed_ip": ... | null, "connected": true | false,
 "node_id": ..., "vector": {...}, "seq": N | null, "last_synced_ms": ... | null,
@@ -330,14 +330,16 @@ currently holds. Empty unless clustering is configured (see
 clustering.md's "Sync check" on why a standalone server never enables
 this).
 
-`local_ip` is this instance's own best-guess outbound IP, and a peer's
-`observed_ip` is the real TCP source address its connection to this
-instance last arrived from -- both purely informational (see
-clustering.md's "Peer addresses"), never themselves used to decide
-where this instance actually dials back (that's always `host`, built
-from a peer's own `advertised_host`). `observed_ip` is `null` when it's
-identical to `host` already (nothing to add) or the peer hasn't
-connected in.
+`peer_port` is this instance's own peer-replication listener port --
+`null` unless clustering is configured, same as a peer's own `host`
+already carries its port alongside its address. `local_ip` is this
+instance's own best-guess outbound IP, and a peer's `observed_ip` is the
+real TCP source address its connection to this instance last arrived
+from -- both purely informational (see clustering.md's "Peer
+addresses"), never themselves used to decide where this instance
+actually dials back (that's always `host`, built from a peer's own
+`advertised_host`). `observed_ip` is `null` when it's identical to
+`host` already (nothing to add) or the peer hasn't connected in.
 
 `sync_check`/`sync_checked_at_ms` are this peer's latest periodic sync
 report (every 60s, independent of `last_synced_ms`'s own cadence -- see

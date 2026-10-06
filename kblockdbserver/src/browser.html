@@ -595,9 +595,10 @@
         return;
       }
 
+      const selfName = data.peer_port ? data.hostname + ":" + data.peer_port : data.hostname;
       const rows = [
         clusterRow(
-          hostLabel(data.hostname, data.local_ip),
+          hostLabel(selfName, data.local_ip),
           data.node_id,
           data.seq,
           true,
