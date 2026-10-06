@@ -190,6 +190,17 @@ fn node_id_hex(node_id: u64) -> String {
     format!("{node_id:016x}")
 }
 
+/// `peer_set.observed_ip(host)`, but `None` instead of `Some` when it
+/// would just repeat `host`'s own address verbatim (a peer known by a
+/// plain IP, say, where "observed" and "known" are the exact same
+/// string) -- nothing useful to show twice. Compares against `host`
+/// with its port stripped, since `observed_ip` itself never carries one.
+fn observed_ip_if_distinct(host: &str, peer_set: &kblockdbcluster::peers::PeerSet) -> Option<String> {
+    let ip = peer_set.observed_ip(host)?.to_string();
+    let host_without_port = host.rsplit_once(':').map_or(host, |(h, _)| h);
+    (host_without_port != ip).then_some(ip)
+}
+
 /// A version vector as JSON shows it: keyed by `node_id_hex`, with a
 /// node's legacy pseudo-origin (see `kblockdblib::legacy_origin`) as its
 /// id plus `-legacy`.
@@ -222,9 +233,19 @@ fn peer_snapshot(state: &AppState) -> Vec<(String, bool)> {
 /// unreachable, with `connected` saying which.
 #[derive(Serialize, ToSchema)]
 pub struct ClusterPeer {
-    /// The peer's address -- as configured in `[[peers]]`, or
-    /// `<source IP>:<its peer port>` if it was learned by connecting in.
+    /// The peer's address -- as configured in `[[peers]]`, or its own
+    /// `advertised_host` (its hostname, by default -- see
+    /// docs/clustering.md's "Peer addresses") combined with its peer
+    /// port, if it was learned by connecting in.
     host: String,
+    /// The real TCP source address this peer's connection *to* this
+    /// instance was last observed arriving from -- purely informational,
+    /// never used to decide where this instance actually dials back
+    /// (that's always `host`). `null` for a peer this instance has only
+    /// ever dialed out to, one that hasn't connected in yet, or one
+    /// whose observed address is already identical to `host` (nothing
+    /// to add by repeating it).
+    observed_ip: Option<String>,
     /// Whether this instance's link to it is up right now.
     connected: bool,
     /// The peer's node id (see `HealthResponse::node_id`); `null` until
@@ -370,6 +391,12 @@ fn compare_vectors(mine: &VersionVector, theirs: &VersionVector) -> (SyncState, 
 pub struct ClusterResponse {
     /// This instance's own name, same as `HealthResponse::hostname`.
     hostname: String,
+    /// This instance's own best-guess outbound IP (`main.rs`'s
+    /// `primary_local_ip`), shown alongside `hostname` the same way a
+    /// peer's `observed_ip` is shown alongside its `host` -- purely
+    /// informational. `null` if this host has no detectable outbound
+    /// route at all.
+    local_ip: Option<String>,
     /// Same as `HealthResponse::node_id`.
     node_id: Option<String>,
     /// Same as `HealthResponse::vector`.
@@ -421,9 +448,11 @@ fn content_digests(state: &AppState) -> Vec<ContentDigestEntry> {
     security(("basic_auth" = [])),
 )]
 async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
+    let local_ip = crate::primary_local_ip().map(|ip| ip.to_string());
     let Some(peer_set) = state.peers.as_ref() else {
         return Json(ClusterResponse {
             hostname: state.hostname.to_string(),
+            local_ip,
             node_id: None,
             vector: BTreeMap::new(),
             seq: None,
@@ -457,8 +486,10 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
                     .get(&id)
                     .cloned()
             });
+            let observed_ip = observed_ip_if_distinct(&host, peer_set);
             ClusterPeer {
                 host,
+                observed_ip,
                 connected,
                 node_id: node_id.map(node_id_hex),
                 vector: theirs.as_ref().map(vector_json),
@@ -488,6 +519,7 @@ async fn cluster(State(state): State<AppState>) -> Json<ClusterResponse> {
         .collect();
     Json(ClusterResponse {
         hostname: state.hostname.to_string(),
+        local_ip,
         node_id: Some(node_id_hex(peer_set.node_id())),
         seq: mine.get(peer_set.node_id()),
         now_ms: kblockdbcluster::hub::now_ms(),

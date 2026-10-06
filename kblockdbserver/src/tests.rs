@@ -359,6 +359,7 @@ async fn cluster_reports_every_peer_with_its_connection_status() {
     let not_yet_linked = |host: &str, connected: bool| {
         json!({
             "host": host,
+            "observed_ip": null,
             "connected": connected,
             "node_id": null,
             "vector": null,
@@ -440,6 +441,30 @@ async fn cluster_reports_when_each_peer_last_synced() {
     assert_eq!(body["peers"][1]["last_synced_ms"], json!(null));
     let now = body["now_ms"].as_u64().unwrap();
     assert!(now >= before && now <= kblockdbcluster::hub::now_ms());
+}
+
+#[tokio::test]
+async fn cluster_surfaces_a_peers_observed_ip_when_it_differs_from_its_host() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("yoda.internal:8082", true)]);
+    peers.record_observed_ip("yoda.internal:8082", "192.168.74.1".parse().unwrap());
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"][0]["observed_ip"], json!("192.168.74.1"));
+}
+
+#[tokio::test]
+async fn cluster_omits_a_peers_observed_ip_when_it_matches_its_host() {
+    let (databases, _dir) = test_databases();
+    let peers = peer_set(&[("192.168.74.1:8082", true)]);
+    peers.record_observed_ip("192.168.74.1:8082", "192.168.74.1".parse().unwrap());
+    let state = AppState::new(databases, Arc::new(test_credentials())).with_peers(peers);
+
+    let (status, body) = send(router(state), get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body["peers"][0]["observed_ip"], json!(null));
 }
 
 #[tokio::test]
@@ -565,6 +590,19 @@ async fn cluster_reports_no_seq_when_unclustered() {
     let (status, body) = send(test_app().0, get("/rest/cluster")).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["seq"], json!(null));
+}
+
+#[tokio::test]
+async fn cluster_reports_this_instances_own_local_ip_when_detectable() {
+    let (status, body) = send(test_app().0, get("/rest/cluster")).await;
+    assert_eq!(status, StatusCode::OK);
+    // Same "if it found something, it must be useful" check as
+    // `primary_local_ip_is_never_a_useless_answer` -- this test
+    // environment may or may not have an outbound route.
+    if let Some(ip) = body["local_ip"].as_str() {
+        assert_ne!(ip, "127.0.0.1");
+        assert_ne!(ip, "0.0.0.0");
+    }
 }
 
 #[tokio::test]
@@ -3137,23 +3175,18 @@ fn primary_local_ip_is_never_a_useless_answer() {
 
 #[test]
 fn advertised_host_prefers_an_explicit_override() {
-    // Deterministic regardless of this machine's actual network state --
-    // an explicit config value always wins over auto-detection.
     assert_eq!(
-        crate::advertised_host(Some("configured.example")),
+        crate::advertised_host(Some("configured.example"), "my-hostname"),
         Some("configured.example".to_string())
     );
 }
 
 #[test]
-fn advertised_host_falls_back_to_the_auto_detected_ip() {
-    // Same "if it found something, it must be useful" check as
-    // `primary_local_ip_is_never_a_useless_answer` -- this test
-    // environment may or may not have an outbound route.
-    if let Some(host) = crate::advertised_host(None) {
-        assert_ne!(host, "127.0.0.1");
-        assert_ne!(host, "0.0.0.0");
-    }
+fn advertised_host_falls_back_to_the_hostname() {
+    assert_eq!(
+        crate::advertised_host(None, "my-hostname"),
+        Some("my-hostname".to_string())
+    );
 }
 
 #[test]

@@ -240,6 +240,12 @@ async fn handle_connection<S: ReplicationSink>(
         // catches up straight away.
         peers.wake(&dial_back, node_id);
     }
+    // Informational only (see `PeerSet::observed_ip`'s doc comment):
+    // recorded whether or not `advertised_host` was used for `dial_back`
+    // above, so an operator can always see what this connection's real
+    // source address was, even when it differs from what's being dialed
+    // back on.
+    peers.record_observed_ip(&dial_back, remote_ip);
 
     // Ask for everything this server doesn't have yet -- see `peers.rs`'s
     // "Catch-up".
@@ -743,6 +749,42 @@ mod tests {
 
         let expected = format!("127.0.0.1:{UNREACHABLE_PEER_PORT}");
         wait_until(|| peers.snapshot().iter().any(|(a, _)| *a == expected)).await;
+    }
+
+    #[tokio::test]
+    async fn the_observed_ip_is_recorded_alongside_the_dial_back_address() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        hello(&mut stream, CLUSTER_SECRET).await;
+
+        let expected = format!("127.0.0.1:{UNREACHABLE_PEER_PORT}");
+        wait_until(|| peers.observed_ip(&expected) == Some("127.0.0.1".parse().unwrap())).await;
+    }
+
+    #[tokio::test]
+    async fn the_observed_ip_is_recorded_even_when_dial_back_used_an_advertised_host() {
+        let TestNode { addr, peers, .. } = spawn_node("node-a").await;
+        let mut stream = ClientStream::connect(addr).await.unwrap();
+        crate::wire::write_message(
+            &mut stream,
+            &PeerMessage::Hello {
+                secret: CLUSTER_SECRET.to_string(),
+                server_id: "test-peer".to_string(),
+                peer_port: UNREACHABLE_PEER_PORT,
+                node_id: TEST_CLIENT_NODE_ID,
+                protocol_version: crate::wire::PEER_PROTOCOL_VERSION,
+                advertised_host: Some("gateway.invalid".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            crate::wire::read_message(&mut stream).await.unwrap(),
+            Some(PeerMessage::HelloOk { .. })
+        ));
+
+        let learned = format!("gateway.invalid:{UNREACHABLE_PEER_PORT}");
+        wait_until(|| peers.observed_ip(&learned) == Some("127.0.0.1".parse().unwrap())).await;
     }
 
     #[tokio::test]

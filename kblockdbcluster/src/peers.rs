@@ -58,6 +58,7 @@ use crate::vector::VectorStore;
 use kblockdblib::{legacy_origin, Stamp, VersionVector};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
+use std::net::IpAddr;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -90,6 +91,15 @@ struct Entry {
     status: ConnectionStatus,
     /// From the embedder's config (`add_configured`) -- never pruned.
     configured: bool,
+    /// The real TCP source address this peer's connection *to* this
+    /// process was last observed arriving from (see `server::
+    /// handle_connection`) -- `None` for a peer this process has only
+    /// ever dialed *out* to, or one that hasn't connected in yet. Purely
+    /// informational, for an embedder to show an operator alongside the
+    /// peer's known `address` (itself built from the peer's own
+    /// `advertised_host`, or this same observed IP when it had none) --
+    /// never itself used to decide where to dial back.
+    observed_ip: Option<IpAddr>,
 }
 
 #[derive(Default)]
@@ -241,6 +251,7 @@ impl PeerSet {
                 Entry {
                     status: status.clone(),
                     configured,
+                    observed_ip: None,
                 },
             );
             status
@@ -259,6 +270,7 @@ impl PeerSet {
             Entry {
                 status,
                 configured: false,
+                observed_ip: None,
             },
         );
     }
@@ -342,6 +354,27 @@ impl PeerSet {
             .iter()
             .map(|(address, entry)| (address.clone(), entry.status.is_connected()))
             .collect()
+    }
+
+    /// `address`'s real TCP source address, as last observed when it
+    /// connected *in* -- see `Entry::observed_ip`'s doc comment on why
+    /// this is informational only, never itself an addressing decision.
+    /// `None` for an unknown address, or one this process has only ever
+    /// dialed out to.
+    pub fn observed_ip(&self, address: &str) -> Option<IpAddr> {
+        self.inner.lock().unwrap().known.get(address)?.observed_ip
+    }
+
+    /// Records `address`'s connection as last observed arriving from
+    /// `ip` -- called once per accepted `Hello` (see `server::
+    /// handle_connection`), right after `add`/`wake` have made sure
+    /// `address` is known (a no-op if it somehow isn't). Also `pub` for
+    /// an embedder's own tests, alongside `insert`/`insert_claim`, to
+    /// fake a peer's observed address without a real connection.
+    pub fn record_observed_ip(&self, address: &str, ip: IpAddr) {
+        if let Some(entry) = self.inner.lock().unwrap().known.get_mut(address) {
+            entry.observed_ip = Some(ip);
+        }
     }
 
     /// What to gossip over the link to `destination`: every peer currently
@@ -491,6 +524,31 @@ mod tests {
                 ("10.0.0.3:8082".to_string(), false),
             ]
         );
+    }
+
+    #[test]
+    fn observed_ip_is_none_until_recorded() {
+        let peers = peer_set();
+        peers.insert("10.0.0.2:8082".to_string(), ConnectionStatus::new());
+        assert_eq!(peers.observed_ip("10.0.0.2:8082"), None);
+    }
+
+    #[test]
+    fn record_observed_ip_is_readable_back() {
+        let peers = peer_set();
+        peers.insert("10.0.0.2:8082".to_string(), ConnectionStatus::new());
+        peers.record_observed_ip("10.0.0.2:8082", "192.168.1.5".parse().unwrap());
+        assert_eq!(
+            peers.observed_ip("10.0.0.2:8082"),
+            Some("192.168.1.5".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn record_observed_ip_on_an_unknown_address_is_a_harmless_no_op() {
+        let peers = peer_set();
+        peers.record_observed_ip("never-added:8082", "192.168.1.5".parse().unwrap());
+        assert_eq!(peers.observed_ip("never-added:8082"), None);
     }
 
     #[test]

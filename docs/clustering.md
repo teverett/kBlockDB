@@ -20,10 +20,10 @@ cluster_secret = "a-shared-secret-only-this-clusters-nodes-know"
 peer_port = 8082
 
 # This instance's own host (IP or DNS name, no port) for a peer to dial
-# back on. Optional -- auto-detected (this host's own best-guess outbound
-# IP) when unset, which is already correct on an ordinary LAN. Set this
-# explicitly only when auto-detection picks the wrong address for your
-# topology (see "Peer addresses" below).
+# back on. Optional -- defaults to this instance's own reported hostname
+# (see "Peer addresses" below) when unset, so peers need to be able to
+# resolve that name. Set this explicitly (an IP, or a different name) when
+# that doesn't hold in your deployment.
 advertised_host = "10.0.0.2"
 
 # How long a peer learned at runtime (it connected in, or was gossiped)
@@ -75,25 +75,32 @@ The "`<source IP>`" above is whatever address the accepting side's TCP
 stack reports the connection arrived from -- correct on an ordinary LAN
 or direct-routed network, where that's genuinely the connecting server's
 own address. It's wrong whenever something sits between the two and
-rewrites the source address, most commonly a NAT gateway or a site-to-
-site VPN: every peer then sees connections arriving from the gateway's
-own address, not the connecting server's, and learns that (unreachable,
-or reaching the wrong host) address instead.
+rewrites the source address (a NAT gateway or a site-to-site VPN), or
+simply *different* across several valid paths on a multi-homed host
+(several NICs, a VPN interface alongside a direct one) -- either way,
+every peer could end up knowing this server by a different address
+depending on which connection happened to reach it, which is confusing
+even when every address involved is individually reachable.
 
-`advertised_host` fixes this at the source: every server sends a host in
+`advertised_host` fixes this: every server sends one consistent host in
 its own `Hello` (`wire::PeerMessage::Hello`'s `advertised_host` field),
 and every peer it connects to dials back on
-`<advertised_host>:<peer_port>` instead of the observed source IP. By
-default that host is auto-detected -- this server's own best-guess
-outbound IP (`main.rs`'s `primary_local_ip`, the same mechanism that
-already picks what address to print for the HTTP/data-browser URL when
-bound to a wildcard address), which is already correct on an ordinary
-LAN and so changes nothing there. Set `[cluster].advertised_host`
-explicitly only when auto-detection itself picks the wrong address for
-your topology -- most commonly a host with more than one active network
-path, where the one the OS picks as "primary" isn't the one that
-actually reaches a given peer. Check a peer's `/rest/cluster`
-`peers[].host` to see what it ended up learning.
+`<advertised_host>:<peer_port>` instead of the observed source IP, so
+every peer knows this server by the same name rather than by whichever
+path a given connection took. By default that host is this server's own
+reported *hostname* (the OS hostname, or `[hostname]`'s override --
+same name `/rest/health`'s `hostname` reports), relying on every peer
+being able to resolve it (DNS, or each host's own hosts file). Set
+`[cluster].advertised_host` explicitly to a specific IP or a different
+name instead when that resolution doesn't hold in your deployment.
+
+The actual, concrete address a connection arrived from is never hidden,
+only kept separate from the name used to dial back: `GET /rest/cluster`
+reports it as `peers[].observed_ip` (`null` when it's identical to
+`host`, or hasn't connected in), and this instance's own best-guess
+outbound IP as the top-level `local_ip`, purely for an operator's own
+reference -- see [kblockdbserver.md](kblockdbserver.md). The Cluster tab
+in the data browser renders both together as `name (ip)`.
 
 ### Gossip
 

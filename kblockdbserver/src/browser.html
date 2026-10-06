@@ -429,6 +429,16 @@
     }
   }
 
+  // `name`, or `"name (ip)"` when `ip` is given -- the Host column's
+  // consistent "who, and what address it's actually reachable at right
+  // now" format, for every row alike (this server's own row uses its
+  // hostname and `local_ip`; a peer row uses its known `host` and
+  // `observed_ip` -- see routes.rs's `ClusterPeer`/`ClusterResponse`
+  // doc comments for what each one means).
+  function hostLabel(name, ip) {
+    return ip ? name + " (" + ip + ")" : name;
+  }
+
   // One row of the Cluster tab. `peer` is a `/rest/cluster` peer, or
   // null for this server's own row (`self` = that response); `seq` is the
   // node's own sequence number, or null if not known yet.
@@ -586,10 +596,19 @@
       }
 
       const rows = [
-        clusterRow(data.hostname + " (this server)", data.node_id, data.seq, true, null, data),
+        clusterRow(
+          hostLabel(data.hostname, data.local_ip) + " (this server)",
+          data.node_id,
+          data.seq,
+          true,
+          null,
+          data
+        ),
       ];
       (data.peers || []).forEach(function (p) {
-        rows.push(clusterRow(p.host, p.node_id, p.seq, p.connected, p, data));
+        rows.push(
+          clusterRow(hostLabel(p.host, p.observed_ip), p.node_id, p.seq, p.connected, p, data)
+        );
       });
       clusterRowsBody.replaceChildren.apply(clusterRowsBody, rows);
 

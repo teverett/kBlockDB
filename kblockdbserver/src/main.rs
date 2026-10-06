@@ -418,7 +418,10 @@ async fn main() {
                     .local_addr()
                     .map(|a| a.port())
                     .unwrap_or(peer_addr.port()),
-                advertised_host: advertised_host(config.cluster.advertised_host.as_deref()),
+                advertised_host: advertised_host(
+                    config.cluster.advertised_host.as_deref(),
+                    &state.hostname,
+                ),
             },
             hub.clone(),
         )
@@ -541,25 +544,22 @@ fn primary_local_ip() -> Option<IpAddr> {
 /// What this process sends as `Hello`'s `advertised_host` (see
 /// `kblockdbcluster::peers::LocalIdentity`): `configured` (the
 /// `[cluster].advertised_host` config value) if the operator set one,
-/// otherwise this host's own best-guess outbound IP (`primary_local_ip`)
-/// -- same address `reachable_addr` already picks for the printed
-/// HTTP/data-browser URL when bound to a wildcard address, reused here
-/// so a peer dials back on an address that's actually reachable even
-/// when the connection it observed arrived through something that
-/// rewrote the source IP (a NAT/VPN gateway, most commonly -- see
-/// docs/clustering.md's "Peer addresses"). On a plain, unrouted network
-/// this is the same address the peer would've observed anyway, so
-/// sending it changes nothing there.
+/// otherwise `hostname` (this instance's own reported name -- the OS
+/// hostname, or `[hostname]`'s override, see `state::AppState::
+/// with_hostname`). Every peer then identifies this process by one
+/// consistent name rather than whatever address a given connection
+/// happened to arrive on -- a single server reachable at several
+/// addresses (several NICs, a NAT/VPN path alongside a direct one) would
+/// otherwise show up differently depending on which path a given peer's
+/// connection took.
 ///
-/// `None` only when there's no configured override and this host has no
-/// detectable outbound route at all (same case `primary_local_ip`
-/// itself returns `None` for) -- the peer then falls back to dialing
-/// back on whatever source IP it itself observed, exactly like before
-/// this existed.
-fn advertised_host(configured: Option<&str>) -> Option<String> {
-    configured
-        .map(str::to_string)
-        .or_else(|| primary_local_ip().map(|ip| ip.to_string()))
+/// This relies on every peer being able to resolve that name to a
+/// reachable address (DNS, or each host's own hosts file) -- set
+/// `advertised_host` explicitly to a specific IP instead when that
+/// doesn't hold in your deployment (see docs/clustering.md's "Peer
+/// addresses").
+fn advertised_host(configured: Option<&str>, hostname: &str) -> Option<String> {
+    Some(configured.unwrap_or(hostname).to_string())
 }
 
 /// An address a listener is bound to, rewritten into one a client can
